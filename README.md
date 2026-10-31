@@ -82,4 +82,6 @@ $dll = (Resolve-Path .\build-Win32\Release\dshow_bypass_timing.dll).Path
 
 不具合、改善案、検証結果は[このリポジトリのIssues](https://github.com/yshdsnd/mc-hires-bridge/issues)で管理します。OS・アプリのバージョン、対象形式、操作手順、期待した結果と実際の結果を記載してください。
 
-MinHook v1.3.4（commit `c3fcafdc10146beb5919319d0683e44e3c30d537`）を`vendor/minhook`に同梱しています。第三者ライセンスは同ディレクトリの`LICENSE.txt`を参照してください。本プロジェクト独自部分のライセンスは未設定です。
+本プロジェクト独自部分は[BSD 2-Clause License](LICENSE)で公開しています。
+
+MinHook v1.3.4（commit `c3fcafdc10146beb5919319d0683e44e3c30d537`）を`vendor/minhook`に同梱しています。第三者ライセンスは同ディレクトリの`LICENSE.txt`を参照してください。
