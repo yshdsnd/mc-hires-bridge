@@ -10,7 +10,9 @@ Sonyとは関係のない非公式プロジェクトです。対象アプリの�
 
 その後の調査では、標準のWASAPI排他出力なら迂回なしで96kHz/有効24bitと高域を確認できました。本ツールの迂回機能は、共有出力を使いながら高域を保ちたい場合を対象とします。[排他モードの検証結果](docs/wasapi-exclusive-investigation.md)も参照してください。
 
-## 仕組み
+96kHz/24bit FLACについては、sourceへの16bit指定だけを24bitへ変更すると、Music Center自身がSeamless・EQを通る96kHz/24bit共有出力を構築することも確認できました。[共有24bit化の試験結果](docs/shared-24bit-investigation.md)と実験用`flac24_override`を追加しています。対応範囲は限定されています。
+
+## 従来の16bit迂回方式
 
 確認した環境では、96kHz FLACの再生中にSonyのDSEEフィルターの出力が44.1kHzとなっていました。DSEE、Seamless、EQを完全に外すと96kHz再生はできましたが、経過時間表示が停止しました。
 
@@ -64,13 +66,14 @@ $dll = (Resolve-Path .\build-Win32\Release\dshow_bypass_timing.dll).Path
 - 先頭20秒のPCMが旧迂回版とバイト単位で一致し、FFTで24–40kHzの成分を確認。
 - 最終ソースのフィルター種類確認ガードはビルド検証済み。実再生試験はガード追加直前の同じ接続処理で実施。
 
-24bit出力への改善ではありません。全形式、ギャップレス、長時間安定性、出力デバイス変更、枝間の厳密な同期は未検証です。無音のSony経路も動作するため追加負荷があります。一般利用向けのGUIや自動適用機能はまだありません。
+従来の`dshow_bypass_timing`単体は24bit出力への改善ではありません。全形式、ギャップレス、長時間安定性、出力デバイス変更、枝間の厳密な同期は未検証です。無音のSony経路も動作するため追加負荷があります。一般利用向けのGUIや自動適用機能はまだありません。
 
 ## 診断用ソース
 
 | ターゲット / ファイル | 役割 |
 | --- | --- |
 | `dshow_bypass_timing` | 位置管理を維持する修正版 |
+| `flac24_override` | 確認済み96kHz/24bit FLACの事前16bit指定を24へ変更する実験版（x86のみ） |
 | `dshow_bypass` | 旧迂回版。経過時間が停止する比較用 |
 | `dshow_probe` | DirectShowグラフ・接続形式の観測 |
 | `probe` | DirectSound / WASAPIの形式観測 |
