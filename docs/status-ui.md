@@ -5,14 +5,14 @@
 | 表示 | 意味 |
 | --- | --- |
 | `HR-BR RDY` | フック初期化済み。読み込み後の再生開始を待っている |
-| `HR-BR ON` | 今回のsourceへ24bit設定を適用し、DirectSoundレンダラーの96kHz/24bit/2ch接続と再生開始の受理を確認 |
+| `HR-BR ON` | 今回のsourceへ24bit設定を適用し、DirectSoundレンダラーの48kHzまたは96kHz/24bit/2ch接続と再生開始の受理を確認 |
 | `HR-BR OFF` | 対象外音源、排他などの別出力モード、適用失敗、または条件を確認できない |
 
 一時停止中は、その再生グラフの適用状態を保持する。ONはDACの測定やビットパーフェクトの保証を意味しない。RDYは、ロード前にすでに再生していた曲への適用を保証する表示ではない。
 
 ## 判定
 
-16→24の変更は、既存の確認済みバイナリ・呼び出し元・96kHz/24bit/stereo FLAC条件に加え、保存されたMusic Centerの出力モードがDirectSound（`default`）の場合に限定する。設定ファイルは読み取り専用。読み取り不能・対象プロパティ不明・別モードの場合は介入しない。44.1kHz/16bit FLACでは16bit指定をそのまま渡す。
+16→24の変更は、既存の確認済みバイナリ・呼び出し元・48kHzまたは96kHz/24bit/stereo FLAC条件に加え、保存されたMusic Centerの出力モードがDirectSound（`default`）の場合に限定する。設定ファイルは読み取り専用。読み取り不能・対象プロパティ不明・別モードの場合は介入しない。44.1kHz/16bit FLACでは16bit指定をそのまま渡す。
 
 表示はIMediaControl/IMediaFilterのRunが返った時点でグラフを調べて更新する。次の曲のsourceを先読みしても現在のsourceの適用記録を消さないよう、sourceごとに記録する。出力モードを変更した際は保存設定の再確認でもOFFへ更新する（最大約1秒＋設定保存までの時間）。
 
@@ -50,3 +50,5 @@ cmake --build build-Win32 --config Release --target bridge_status_tests
 ```
 
 個人の実測ログ・音源情報・スクリーンショットは公開リポジトリに含めない。
+
+48kHz対応追加後の実再生・PCM・曲間の検証は[48kHz/24bitの記録](shared-48k-24bit.md)を参照。
