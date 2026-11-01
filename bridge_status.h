@@ -39,7 +39,7 @@ inline void layout() {
     if(!IsWindow(owner)||!IsWindow(badge))return;
     auto context=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(owner));
     UINT dpi=GetDpiForWindow(owner);if(!dpi)dpi=96;
-    if(dpi!=currentDpi){if(font)DeleteObject(font);font=CreateFontW(-MulDiv(12,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");currentDpi=dpi;InvalidateRect(badge,nullptr,TRUE);}
+    if(dpi!=currentDpi){if(font)DeleteObject(font);font=CreateFontW(-MulDiv(12,dpi,96),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");currentDpi=dpi;InvalidateRect(badge,nullptr,TRUE);}
     RECT r;GetClientRect(owner,&r);
     int x=max(0,r.right-MulDiv(380,dpi,96)),y=MulDiv(48,dpi,96),width=MulDiv(92,dpi,96),height=MulDiv(23,dpi,96);
     RECT existing;GetWindowRect(badge,&existing);MapWindowPoints(HWND_DESKTOP,owner,reinterpret_cast<POINT*>(&existing),2);
