@@ -1,12 +1,14 @@
 # MC HiRes Bridge
 
-[Wune](https://github.com/yshdsnd/wune)の開発によって再生中の音声の周波数成分を確認できるようになり、Music Center for PCでハイレゾ音源を再生しても、約22kHzを上限として、それ以上の周波数成分が出力されていないことに気付きました。同じ音源をfoobar2000で再生すると高域まで確認できたことが、このツールを開発するきっかけです。
+[Wune](https://github.com/yshdsnd/wune)の開発によって再生中の音声の周波数成分を確認できるようになり、Music Center for PCのDirectSound出力でハイレゾ音源を再生しても、約22kHzを上限として、それ以上の周波数成分が出力されていないことに気付きました。同じ音源をfoobar2000で再生すると高域まで確認できたことが、このツールを開発するきっかけです。
 
 MC HiRes Bridgeは、Music Center for PC本体のファイルを改変することなく、Music Center使用時に音源の高域を保ったハイレゾ出力ができるようにすることを目的としています。
 
 Windows上のMusic Center for PCの再生経路を調査し、経過時間表示を維持しながら96kHz音声の44.1kHz変換を迂回する、実験段階のC++ツールです。
 
 Sonyとは関係のない非公式プロジェクトです。対象アプリのインストール済みバイナリや音源ファイルは変更しません。実行中のプロセスにDLLをロードし、一時的にDirectShowの接続を変更します。
+
+その後の調査では、標準のWASAPI排他出力なら迂回なしで96kHz/有効24bitと高域を確認できました。本ツールの迂回機能は、共有出力を使いながら高域を保ちたい場合を対象とします。[排他モードの検証結果](docs/wasapi-exclusive-investigation.md)も参照してください。
 
 ## 仕組み
 
@@ -75,6 +77,7 @@ $dll = (Resolve-Path .\build-Win32\Release\dshow_bypass_timing.dll).Path
 | `position_probe` | 標準位置取得APIの観測 |
 | `negotiation_probe` | 接続前の形式交渉とSony FLACの出力設定の観測（検証済みx86用） |
 | `pcm_tap` | DirectSound PCMをストリームごと最大20秒取得 |
+| `wasapi_pcm_probe` | WASAPI形式の観測と出力直前PCMの取得（最大20秒、通常の`probe`とは併用不可） |
 | `inject` | 同じアーキテクチャのDLLを対象プロセスへロード |
 | `smoke`, `dshow_smoke`, `bypass_test` | 診断・接続試験 |
 | `analyze-pcm.mjs` | PCMのFFT解析（Node.js） |

@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 export function analyze(file,rate=96000,bits=24,channels=2){
+  if(![16,24,32].includes(bits)||!Number.isInteger(channels)||channels<1||!Number.isFinite(rate)||rate<=0)throw new Error('Expected integer PCM: 16/24/32 bits, positive rate and channel count');
   const b=fs.readFileSync(file),width=bits/8,frames=Math.floor(b.length/(width*channels));
   const n=65536,hop=32768,re=new Float64Array(n),im=new Float64Array(n),power=new Float64Array(n/2);
-  const sample=i=>bits===24?b.readIntLE(i*channels*width,3)/8388608:b.readInt16LE(i*channels*width)/32768;
+  const sample=i=>bits===32?b.readInt32LE(i*channels*width)/2147483648:bits===24?b.readIntLE(i*channels*width,3)/8388608:b.readInt16LE(i*channels*width)/32768;
   let count=0,nonzero=0,peak=0;for(let i=0;i<frames;i++){const s=sample(i);if(s)nonzero++;peak=Math.max(peak,Math.abs(s));}
   for(let start=Math.floor(rate*0.8);start+n<=frames;start+=hop){
     for(let i=0;i<n;i++){re[i]=sample(start+i)*(0.5-0.5*Math.cos(2*Math.PI*i/(n-1)));im[i]=0;}

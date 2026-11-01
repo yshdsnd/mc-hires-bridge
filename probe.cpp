@@ -21,6 +21,9 @@ static void log(const char* api, HRESULT hr, const WAVEFORMATEX* f, DWORD flags=
     int n=sprintf_s(line,"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\t%lu\t%lu\t%u\t%s\t0x%08lx\t%p\t%lu\t%d\t0x%08lx\t%d\t%u\t%lu\t%u\t%u\t%u\t%lu\t%u\t%u\t0x%x\t%s\t%ls\r\n",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,GetCurrentProcessId(),GetCurrentThreadId(),unsigned(sizeof(void*)*8),api,ULONG(hr),object,bytes,mode,flags,f?1:0,f?f->wFormatTag:0,f?f->nSamplesPerSec:0,f?f->wBitsPerSample:0,f?f->nChannels:0,f?f->nBlockAlign:0,f?f->nAvgBytesPerSec:0,f?f->cbSize:0,valid,mask,sub,module);
     AcquireSRWLockExclusive(&lock); DWORD written; if(n>0 && logFile!=INVALID_HANDLE_VALUE) WriteFile(logFile,line,n,&written,nullptr); ReleaseSRWLockExclusive(&lock);
 }
+#ifdef ENABLE_WASAPI_PCM_CAPTURE
+#include "wasapi_capture.h"
+#endif
 using Create = HRESULT (WINAPI*)(IDirectSound*,LPCDSBUFFERDESC,LPDIRECTSOUNDBUFFER*,LPUNKNOWN);
 using Format = HRESULT (WINAPI*)(IDirectSoundBuffer*,LPCWAVEFORMATEX);
 using Init = HRESULT (WINAPI*)(IAudioClient*,AUDCLNT_SHAREMODE,DWORD,REFERENCE_TIME,REFERENCE_TIME,const WAVEFORMATEX*,LPCGUID);
@@ -30,8 +33,16 @@ static HRESULT WINAPI createHook(IDirectSound* s,LPCDSBUFFERDESC d,LPDIRECTSOUND
     auto hr=originalCreate(s,d,b,u); log("IDirectSound::CreateSoundBuffer",hr,d?d->lpwfxFormat:nullptr,d?d->dwFlags:0,-1,_ReturnAddress(),SUCCEEDED(hr)&&b?*b:nullptr,d?d->dwBufferBytes:0); return hr;
 }
 static HRESULT WINAPI formatHook(IDirectSoundBuffer* s,LPCWAVEFORMATEX f) { auto hr=originalFormat(s,f);log("IDirectSoundBuffer::SetFormat",hr,f,0,-1,_ReturnAddress(),s);return hr; }
-static HRESULT WINAPI initHook(IAudioClient* s,AUDCLNT_SHAREMODE mode,DWORD flags,REFERENCE_TIME duration,REFERENCE_TIME period,const WAVEFORMATEX* f,LPCGUID guid) { auto hr=originalInit(s,mode,flags,duration,period,f,guid);log("IAudioClient::Initialize",hr,f,flags,mode,_ReturnAddress(),s);return hr; }
-static HRESULT WINAPI init3Hook(IAudioClient3* s,DWORD flags,UINT32 period,const WAVEFORMATEX* f,LPCGUID guid) { auto hr=originalInit3(s,flags,period,f,guid);log("IAudioClient3::InitializeSharedAudioStream",hr,f,flags,0,_ReturnAddress(),s);return hr; }
+static HRESULT WINAPI initHook(IAudioClient* s,AUDCLNT_SHAREMODE mode,DWORD flags,REFERENCE_TIME duration,REFERENCE_TIME period,const WAVEFORMATEX* f,LPCGUID guid) { auto hr=originalInit(s,mode,flags,duration,period,f,guid);log("IAudioClient::Initialize",hr,f,flags,mode,_ReturnAddress(),s);
+#ifdef ENABLE_WASAPI_PCM_CAPTURE
+    capture::remember(s,f,mode,hr);
+#endif
+    return hr; }
+static HRESULT WINAPI init3Hook(IAudioClient3* s,DWORD flags,UINT32 period,const WAVEFORMATEX* f,LPCGUID guid) { auto hr=originalInit3(s,flags,period,f,guid);log("IAudioClient3::InitializeSharedAudioStream",hr,f,flags,0,_ReturnAddress(),s);
+#ifdef ENABLE_WASAPI_PCM_CAPTURE
+    capture::remember(s,f,0,hr);
+#endif
+    return hr; }
 template<class T> static bool hook(void* object,int slot,void* detour,T* original,const char* name) {
     auto status=MH_CreateHook((*reinterpret_cast<void***>(object))[slot],detour,reinterpret_cast<void**>(original));
     log(name,HRESULT(status),nullptr); return status==MH_OK;
@@ -60,7 +71,11 @@ static DWORD WINAPI worker(void*) {
     log("setup.IAudioClient",hr,nullptr);
     if(audio) {
         wasOK=hook(audio,3,reinterpret_cast<void*>(initHook),&originalInit,"hook.Initialize");
-        IAudioClient3* a3=nullptr;if(SUCCEEDED(audio->QueryInterface(IID_PPV_ARGS(&a3)))) {hook(a3,20,reinterpret_cast<void*>(init3Hook),&originalInit3,"hook.InitializeSharedAudioStream");a3->Release();} audio->Release();
+        IAudioClient3* a3=nullptr;if(SUCCEEDED(audio->QueryInterface(IID_PPV_ARGS(&a3)))) {hook(a3,20,reinterpret_cast<void*>(init3Hook),&originalInit3,"hook.InitializeSharedAudioStream");a3->Release();}
+#ifdef ENABLE_WASAPI_PCM_CAPTURE
+        wasOK=capture::setup(audio)&&wasOK;
+#endif
+        audio->Release();
     }
     if(device) device->Release();if(enumerator) enumerator->Release();if(SUCCEEDED(co)) CoUninitialize();
     auto status=MH_EnableHook(MH_ALL_HOOKS);log("hooks.enable",HRESULT(status),nullptr);

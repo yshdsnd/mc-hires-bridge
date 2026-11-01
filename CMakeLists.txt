@@ -35,3 +35,6 @@ target_compile_definitions(dshow_bypass_timing PRIVATE UNICODE _UNICODE ENABLE_D
 add_library(negotiation_probe SHARED negotiation_probe.cpp)
 target_link_libraries(negotiation_probe PRIVATE minhook ole32 strmiids uuid)
 target_compile_definitions(negotiation_probe PRIVATE UNICODE _UNICODE)
+add_library(wasapi_pcm_probe SHARED probe.cpp)
+target_link_libraries(wasapi_pcm_probe PRIVATE minhook dsound dxguid ole32 uuid winmm)
+target_compile_definitions(wasapi_pcm_probe PRIVATE UNICODE _UNICODE ENABLE_WASAPI_PCM_CAPTURE)
