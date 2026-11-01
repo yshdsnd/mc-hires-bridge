@@ -12,6 +12,8 @@ Sonyとは関係のない非公式プロジェクトです。対象アプリの�
 
 96kHz/24bit FLACについては、sourceへの16bit指定だけを24bitへ変更すると、Music Center自身がSeamless・EQを通る96kHz/24bit共有出力を構築することも確認できました。[共有24bit化の試験結果](docs/shared-24bit-investigation.md)と実験用`flac24_override`を追加しています。対応範囲は限定されています。
 
+`flac24_override`には、DSEE HX左側の文字表示 **HR-BR RDY / ON / OFF** を追加しています。44.1kHz/16bitなど対象外の音源は設定を変更せずOFFと表示します。[状態表示の使い方と検証](docs/status-ui.md)を参照してください。状態表示付き版は従来のグラフ観測・迂回DLLと併用しないでください。
+
 ## 従来の16bit迂回方式
 
 確認した環境では、96kHz FLACの再生中にSonyのDSEEフィルターの出力が44.1kHzとなっていました。DSEE、Seamless、EQを完全に外すと96kHz再生はできましたが、経過時間表示が停止しました。
