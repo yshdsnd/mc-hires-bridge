@@ -6,3 +6,4 @@
 *.log
 *.user
 /package/
+/dist/

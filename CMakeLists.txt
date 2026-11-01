@@ -50,7 +50,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
   set_target_properties(mc_hires_bridge PROPERTIES OUTPUT_NAME "MC HiRes Bridge")
   add_dependencies(mc_hires_bridge flac24_override)
   install(FILES LICENSE DESTINATION .)
-  install(FILES docs/launcher.md DESTINATION . RENAME README.md)
+  install(FILES docs/package-readme.md DESTINATION . RENAME README.md)
   install(FILES vendor/minhook/LICENSE.txt DESTINATION licenses RENAME MinHook.txt)
   # Sony filter factories used by this diagnostic are x86 only.
   add_library(end_probe SHARED end_probe.cpp)

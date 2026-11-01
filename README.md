@@ -22,6 +22,12 @@ Sonyとは関係のない非公式プロジェクトです。対象アプリの�
 
 Music Centerが起動済みなら、そのプロセスへ適用します。ロード済みなら二重にロードしません。EXEと`flac24_override.dll`は同じフォルダーに置いてください。[ランチャーの使い方・ビルド方法](docs/launcher.md)を参照してください。
 
+## GitHub Actionsの配布ZIP
+
+[ActionsのBuild Windows ZIP](https://github.com/yshdsnd/mc-hires-bridge/actions/workflows/build-windows.yml)で、成功した実行のArtifactsから`mc-hires-bridge-windows-x86.zip`を取得できます。mainへのpush・Pull Request・Run workflowによる手動実行に対応します。成果物の保存期間は30日です。
+
+ZIPは展開用の1フォルダーにREADME、ランチャーEXE、ブリッジDLL、BSDライセンス、MinHookライセンスだけを含みます。診断ツール・ソース・PDB・別途のアイコン画像は含みません。配布用READMEは短い使い方に絞っています。
+
 ## 従来の16bit迂回方式
 
 確認した環境では、96kHz FLACの再生中にSonyのDSEEフィルターの出力が44.1kHzとなっていました。DSEE、Seamless、EQを完全に外すと96kHz再生はできましたが、経過時間表示が停止しました。

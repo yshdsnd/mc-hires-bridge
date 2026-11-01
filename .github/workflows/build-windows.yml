@@ -1,0 +1,62 @@
+name: Build Windows ZIP
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Win32
+        run: cmake -S . -B build-Win32 -G "Visual Studio 17 2022" -A Win32
+
+      - name: Build launcher and tests
+        run: cmake --build build-Win32 --config Release --target mc_hires_bridge bridge_status_tests
+
+      - name: Check output-mode parser and labels
+        run: ./build-Win32/Release/bridge_status_tests.exe
+
+      - name: Create minimal distribution ZIP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake --install build-Win32 --config Release --prefix 'package/MC HiRes Bridge'
+          $root = (Resolve-Path 'package/MC HiRes Bridge').Path
+          $expected = @('README.md', 'MC HiRes Bridge.exe', 'flac24_override.dll', 'LICENSE', 'licenses/MinHook.txt')
+          $actual = @(Get-ChildItem -LiteralPath $root -File -Recurse | ForEach-Object {
+            [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+          })
+          if (Compare-Object $expected $actual) { throw 'Unexpected distribution contents' }
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -LiteralPath $root -DestinationPath 'dist/mc-hires-bridge-windows-x86.zip' -CompressionLevel Optimal -Force
+
+      - name: Upload distribution ZIP
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/mc-hires-bridge-windows-x86.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Link ZIP in run summary
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          "[Download mc-hires-bridge-windows-x86.zip]($env:ARTIFACT_URL)" >> $env:GITHUB_STEP_SUMMARY
