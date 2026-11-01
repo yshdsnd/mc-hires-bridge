@@ -5,3 +5,4 @@
 *.tsv
 *.log
 *.user
+/package/
