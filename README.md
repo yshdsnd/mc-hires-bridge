@@ -73,12 +73,15 @@ $dll = (Resolve-Path .\build-Win32\Release\dshow_bypass_timing.dll).Path
 | `dshow_probe` | DirectShowグラフ・接続形式の観測 |
 | `probe` | DirectSound / WASAPIの形式観測 |
 | `position_probe` | 標準位置取得APIの観測 |
+| `negotiation_probe` | 接続前の形式交渉とSony FLACの出力設定の観測（検証済みx86用） |
 | `pcm_tap` | DirectSound PCMをストリームごと最大20秒取得 |
 | `inject` | 同じアーキテクチャのDLLを対象プロセスへロード |
 | `smoke`, `dshow_smoke`, `bypass_test` | 診断・接続試験 |
 | `analyze-pcm.mjs` | PCMのFFT解析（Node.js） |
 
 `observe.ps1`は従来の`bin/x86`・`bin/x64`配置を前提とする形式観測用補助スクリプトです。通常のCMakeビルドでは、生成されたReleaseディレクトリ内のinjectとprobeを直接指定できます。
+
+24bit音源が16bitになる箇所については、Music Centerの`OpcFlac.dll`が接続前にSony FLACフィルターへ16を指定する呼び出しを捕捉しました。[形式交渉の調査結果](docs/bit-depth-investigation.md)を参照してください。これは原因の切り分けであり、24bit出力への修正ではありません。`negotiation_probe.dll`も他の観測版・迂回版と同時にロードしないでください。
 
 ログにはファイルパスや音源名が含まれる場合があります。PCM取得ツールは音声データを保存します。Issueへ添付する前に個人情報と共有範囲を確認してください。このリポジトリには個人の実測ログや音声データを含めていません。
 
