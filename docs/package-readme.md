@@ -16,7 +16,9 @@ Music Centerが起動済みなら、そのプロセスへロードします。�
 
 ## 対応範囲・エラー
 
-Windows 11、Music Center for PC 2.7.4（32bit、標準インストール先）、DirectSound共有出力。48kHzまたは96kHz／24bit／ステレオFLACが対象です。44.1kHz／16bitなどは変更しません。
+Windows 11、Music Center for PC 2.7.4（32bit、標準インストール先）、DirectSound共有出力。48・96・192kHz／24bit／ステレオFLACが対象です。44.1kHz／16bitなどは変更しません。192kHzは1ファイルで検証しています。WAV・DSDへの対応はこの配布版には含みません。
+
+音源のサンプルレートをWindows共有出力まで維持するには、Windows側のオーディオデバイス設定と機器もそのレートに対応している必要があります。
 
 通常の権限で起動してください。失敗したときだけ理由とエラー番号を表示します。旧版がロード済みの場合はMusic Centerを完全終了して再実行してください。Music Center本体や音源ファイルは変更しません。
 

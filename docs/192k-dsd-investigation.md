@@ -1,6 +1,6 @@
 # 192kHz音源とDSD共有再生の調査結果
 
-後続の192kHz WAV試験では、試験版による実再生とPCM一致を確認した。[実再生検証](192k-wav-playback.md)を参照。以下は最初の調査時点の結果であり、DSDと192kHz FLACは引き続き別の検証が必要。
+後続の192kHz WAV試験では、試験版による実再生とPCM一致を確認した。[実再生検証](192k-wav-playback.md)を参照。さらに192kHz FLACを通常版へ追加し、実再生とPCM一致を確認した。[192kHz FLACの追加検証](shared-192k-24bit.md)を参照。以下は最初の調査時点の記録。DSDは引き続き別の検証が必要。
 
 調査日：2026-11-03。Windows 11 / Music Center for PC 2.7.4 x86。
 

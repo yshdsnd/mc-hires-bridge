@@ -12,6 +12,8 @@ Sonyとは関係のない非公式プロジェクトです。対象アプリの�
 
 48kHzおよび96kHz/24bit FLACについては、sourceへの16bit指定だけを24bitへ変更すると、Music Center自身がSeamless・EQを通る元のサンプルレートの24bit共有出力を構築することも確認できました。[共有24bit化の試験結果](docs/shared-24bit-investigation.md)と実験用`flac24_override`を追加しています。[48kHz/24bitの追加検証](docs/shared-48k-24bit.md)も参照してください。対応範囲は限定されています。
 
+192kHz/24bit・ステレオFLACも通常版の対象に追加しました。1ファイルでDirectSoundの192kHz/24bit出力、レンダラー入力PCMと原音の一致、時間表示・シーク・曲末・繰り返し・同一ファイルの自動次曲を確認しています。[192kHz FLACの検証結果](docs/shared-192k-24bit.md)を参照してください。Windows共有出力も192kHzに設定した環境での結果です。WAVは別の試験版、DSDは引き続き調査対象です。
+
 `flac24_override`には、DSEE HX左側の文字表示 **HR-BR RDY / ON / OFF** を追加しています。44.1kHz/16bitなど対象外の音源は設定を変更せずOFFと表示します。[状態表示の使い方と検証](docs/status-ui.md)を参照してください。状態表示付き版は従来のグラフ観測・迂回DLLと併用しないでください。
 
 曲末が数秒欠ける問題は、次曲先読み用の16bit指定が変更対象から漏れていたことが原因でした。適用漏れを修正し、同一形式の曲間で出力が継続することを確認しました。[曲末の調査結果](docs/track-tail-investigation.md)を参照してください。
@@ -89,7 +91,7 @@ $dll = (Resolve-Path .\build-Win32\Release\dshow_bypass_timing.dll).Path
 | ターゲット / ファイル | 役割 |
 | --- | --- |
 | `dshow_bypass_timing` | 位置管理を維持する修正版 |
-| `flac24_override` | 確認済み48kHz・96kHz/24bit FLACの事前16bit指定を24へ変更する実験版（x86のみ） |
+| `flac24_override` | 確認済み48・96・192kHz/24bit FLACの事前16bit指定を24へ変更（x86のみ） |
 | `dshow_bypass` | 旧迂回版。経過時間が停止する比較用 |
 | `dshow_probe` | DirectShowグラフ・接続形式の観測 |
 | `probe` | DirectSound / WASAPIの形式観測 |

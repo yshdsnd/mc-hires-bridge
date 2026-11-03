@@ -20,7 +20,7 @@ Music Centerがすでに起動している場合は、そのプロセスへロ�
 
 ## 対応範囲
 
-Windows 11 / Music Center for PC 2.7.4 x86。DirectSound共有出力の48kHzまたは96kHz・24bit・ステレオFLACがブリッジの対象です。44.1kHz/16bitなど対象外の音源ではOFFです。RDYやONはDAC出力のビット単位一致を保証するものではありません。
+Windows 11 / Music Center for PC 2.7.4 x86。DirectSound共有出力の48・96・192kHz・24bit・ステレオFLACがブリッジの対象です。192kHzは1ファイルでの[実再生検証](shared-192k-24bit.md)に基づきます。44.1kHz/16bitなど対象外の音源ではOFFです。WAVは別の試験ターゲットで、通常配布には含めません。RDYやONはDAC出力のビット単位一致を保証するものではありません。Windows側の共有出力設定と機器も音源のサンプルレートに対応させてください。
 
 ## ソースからビルド
 
