@@ -50,6 +50,8 @@ cmake --install build-Win32 --config Release --prefix "package/MC HiRes Bridge"
 
 ## アイコン
 
-箱から音符が飛び出す承認済み画像をEXEへ埋め込んでいる。元画像はassets/launcher.png、Windows用はassets/launcher.ico。ICOを同梱しているため、通常のビルドで画像変換ソフトは不要。元画像を変更した場合はWindowsのPowerShellで .\tools\make-icon.ps1 を実行してからビルドする。16・24・32・48・64・128・256pxを収録し、透明度を保持する。
+石造りの二連アーチ橋をパステルの八分音符が左から右へ跳ねて渡る承認済み画像をEXEへ埋め込んでいる。元画像はassets/launcher.png、Windows用はassets/launcher.ico。ICOを同梱しているため、通常のビルドで画像変換ソフトは不要。元画像を変更した場合はWindowsのPowerShellで .\tools\make-icon.ps1 を実行してからビルドする。16・24・32・48・64・128・256pxを収録し、透明度を保持する。
 
-Win32ビルド後にEXEからアイコンを取り出し、箱と音符の画像が埋め込まれていることを確認した。
+Win32ビルド後にEXEからアイコンを取り出し、採用した画像が埋め込まれていることを確認した。
+
+以前の箱と音符の画像はassets/launcher-box.pngとassets/launcher-box.icoにそのまま保存している。新画像のICO化は縦横比を保って透過の正方形に収め、旧画像は配布ZIPには追加しない。

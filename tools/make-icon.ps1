@@ -16,7 +16,14 @@ try {
             $graphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
             $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
             $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-            $graphics.DrawImage($source, [System.Drawing.Rectangle]::new(0, 0, $size, $size))
+            # Fit non-square artwork without stretching its bridge or note shapes.
+            $scale = [Math]::Min($size / $source.Width, $size / $source.Height)
+            $width = [Math]::Max(1, [int][Math]::Round($source.Width * $scale))
+            $height = [Math]::Max(1, [int][Math]::Round($source.Height * $scale))
+            $left = [int][Math]::Floor(($size - $width) / 2)
+            $top = [int][Math]::Floor(($size - $height) / 2)
+            $graphics.Clear([System.Drawing.Color]::Transparent)
+            $graphics.DrawImage($source, [System.Drawing.Rectangle]::new($left, $top, $width, $height))
             $bitmap.Save($memory, [System.Drawing.Imaging.ImageFormat]::Png)
             $images += ,$memory.ToArray()
         } finally {
