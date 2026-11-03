@@ -1,4 +1,4 @@
-#include "../bridge_status.h"
+#include "bridge_status.h"
 #include <cstdio>
 int main(){
     struct Case{const char* json;bool expected;};

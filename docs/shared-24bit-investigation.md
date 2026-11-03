@@ -29,7 +29,7 @@ DSEEはグラフに残るが未接続。source→DSEEの接続は`0x80040217`で
 
 ## 試験用実装
 
-`flac24_override.cpp`、Win32専用ターゲット`flac24_override`を追加。インストール済みファイルや音源を変更せず、実行中の呼び出し引数を変更する。
+`src/bridge/flac24_override.cpp`、Win32専用ターゲット`flac24_override`を追加。インストール済みファイルや音源を変更せず、実行中の呼び出し引数を変更する。
 
 適用条件は、確認済みOmgFlacSrc.axのPEタイムスタンプ`0x63EB12C3`とslot 7のRVA `0x1860`、呼び出し元OpcFlac.dllのタイムスタンプ`0x63EB12E0`と戻り先RVA `0x32A85`（通常開始）または`0x31E7A`（次曲先読み）、元指定値16、設定直前のsource候補が96kHz/24bit/2chの整数PCMであること。
 
@@ -38,7 +38,7 @@ DSEEはグラフに残るが未接続。source→DSEEの接続は`0x80040217`で
 この調査時点のDLLは出力モードを独立には判定していなかった。その後の[状態表示付き版](status-ui.md)では、保存設定がDirectSoundの場合だけ変更する条件を追加した。
 
 ```powershell
-cmake -S . -B build-Win32 -A Win32
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
 cmake --build build-Win32 --config Release --target flac24_override inject
 # DirectSoundを選択し、完全終了・再起動後、初回再生前に実際のPIDを指定
 $targetPid = 1234

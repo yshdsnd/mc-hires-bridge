@@ -1,12 +1,13 @@
 param(
     [Parameter(Mandatory=$true)][int]$TargetPid,
-    [Parameter(Mandatory=$true)][ValidateSet('x86','x64')][string]$Architecture
+    [Parameter(Mandatory=$true)][ValidateSet('x86','x64')][string]$Architecture,
+    [string]$BinPath
 )
 $ErrorActionPreference = 'Stop'
 $targetProcess = Get-Process -Id $TargetPid
 $logPath = Join-Path $env:TEMP "AudioFormatProbe-$TargetPid.tsv"
 if (Test-Path -LiteralPath $logPath) { throw "Log already exists: $logPath. Check whether already attached. Restart the target for a fresh capture; preserve old logs first." }
-$binPath = Join-Path $PSScriptRoot "bin/$Architecture"
+if (!$BinPath) { $buildDirectory = if ($Architecture -eq 'x86') { 'build-Win32' } else { 'build-x64' }; $BinPath = Join-Path $PSScriptRoot "../$buildDirectory/Release" }
 & "$binPath/inject.exe" $TargetPid "$binPath/probe.dll"
 if ($LASTEXITCODE) { throw 'Injection failed' }
 $ready = $false

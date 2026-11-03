@@ -8,13 +8,13 @@
 - SonyWavParser2.axのCLSIDとx86 PE timestamp `0x63EB12BE`、またはQUARTZ.dll実装の標準WAVパーサーCLSIDを照合。Seamlessを使う場合はtimestamp `0x63EB12BA`も照合。
 - パーサーの出力候補が192kHz/24bit/2chの通常整数PCM、block align 6、毎秒1,152,000バイト。
 - 同じグラフに対象パーサーが1個あり、音声経路がパーサー→［DSEE］→Seamless→［EQ］→DirectSoundの形に限る。標準WAVパーサーの場合だけ、Seamlessを含まない形も扱う。
-- FLACの既存適用範囲は48/96kHzのまま。DSDや192kHz FLACはこの実験の対象外。
+- FLACの処理は通常版と共有し、現在は48/96/192kHzを対象とする。この文書のWAV実験とは別の[192kHz FLAC検証](shared-192k-24bit.md)を参照。DSDは対象外。
 
 ## 変更内容
 
 先にDSEEの形式設定を補正する。OmgDseeHxFilter.ax timestamp `0x63EB12C1`、独自IID `{6AF76DBE-8634-4FD3-93ED-982EDE1BFDD5}` のslot 3（RVA `0x36CA`、9 DWORDを値渡し）に限定する。呼び出し元は静的に確認したOpcWavEx.dll timestamp `0x63EB12E7`、戻り先RVA `0x33E47`に限定。mode 0/1・2ch・入力192kHz/24bit・要求出力44.1kHz/16bit・format 16の場合だけ、mode 0・出力192kHz/24bit・format 24へ変更する。他のフィールドは保持し、設定失敗時は元の要求へ戻す。この補正はSeamlessに低い形式を確定させないための準備であり、DSEEを経路に残して再生する機能ではない。
 
-`wav192_route.h`で接続と形式・現在位置を保存してから接続を解除し、パーサー→Seamless→DirectSoundへつなぐ。パーサーの形式候補を複製してsubtypeをMEDIASUBTYPE_PCMにする。音声バッファーを変換せず、各フィルターオブジェクトも削除・置換しない。EQとDSEEは音声経路から外れる。
+`experiments/wav192/wav192_route.h`で接続と形式・現在位置を保存してから接続を解除し、パーサー→Seamless→DirectSoundへつなぐ。パーサーの形式候補を複製してsubtypeをMEDIASUBTYPE_PCMにする。音声バッファーを変換せず、各フィルターオブジェクトも削除・置換しない。EQとDSEEは音声経路から外れる。
 
 接続後にSeamless入力とDirectSound入力の形式を確認し、位置を復元する。失敗した場合は保存した形式で元の全接続を戻す。復元にも失敗した場合はRunを進めずエラーにする。再適用と再生中の変更は避ける。Seamless独自通知の抑制、EC_COMPLETEの偽装、固定時間待ちは行わない。
 
@@ -23,7 +23,7 @@
 ## ビルドと独立検証
 
 ```powershell
-cmake -S . -B build-Win32 -A Win32
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_EXPERIMENTS=ON
 cmake --build build-Win32 --config Release --target flac24_wav192_experiment wav192_route_probe wav192_dsee_probe
 # Sonyフィルターを検査プロセス自身にロードする。注入は行わない。
 & .\build-Win32\Release\wav192_route_probe.exe '対象192kHz24bit.wav'

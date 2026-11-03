@@ -23,7 +23,7 @@
 ビルド・ロード方法は従来と同じ。追加のUI用プログラムは不要。
 
 ```powershell
-cmake -S . -B build-Win32 -A Win32
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
 cmake --build build-Win32 --config Release --target flac24_override inject
 $targetPid = 1234 # 再起動後の実際のMusic Center PID
 & .\build-Win32\Release\inject.exe $targetPid (Resolve-Path .\build-Win32\Release\flac24_override.dll).Path

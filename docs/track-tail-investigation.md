@@ -32,6 +32,7 @@ OpcFlac.dll（PE timestamp `0x63EB12E0`）が同じSony FLAC独自slot 7を呼�
 `end_probe`は観測専用。IPinのEndOfStream/BeginFlush/NewSegment、IMemInputPin::Receive、グラフのIMediaEventSink::Notify、DirectSound Stopを記録する。サンプル時刻、形式、サイズ、最後の非ゼロフレームの時刻、Stop時のカーソルを記録し、PCMファイルは保存しない。時刻はGetTickCount64のミリ秒値で、異なるPC間の比較用ではない。
 
 ```powershell
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
 cmake --build build-Win32 --config Release --target end_probe
 # 初回再生前に、実際のPIDへロードする。再起動で解除。
 & .\build-Win32\Release\inject.exe $targetPid (Resolve-Path .\build-Win32\Release\end_probe.dll).Path

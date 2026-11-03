@@ -38,7 +38,7 @@
 
 ## 監視の実装
 
-`negotiation_probe.cpp`、CMakeターゲット`negotiation_probe`を追加した。音声経路の変更、形式引数の書き換え、独自setterの試験呼び出しは行わず、元の呼び出しへ同じ引数を渡し、同じ結果を返す。
+`diagnostics/negotiation_probe.cpp`、CMakeターゲット`negotiation_probe`を追加した。音声経路の変更、形式引数の書き換え、独自setterの試験呼び出しは行わず、元の呼び出しへ同じ引数を渡し、同じ結果を返す。
 
 - `IFileSourceFilter::Load`の引数と、終了直後の出力候補。
 - `IPin::Connect`、`ReceiveConnection`、`QueryAccept`、`EnumMediaTypes`、`IEnumMediaTypes::Next`。
@@ -53,7 +53,7 @@
 ## 再現方法
 
 ```powershell
-cmake -S . -B build-Win32 -A Win32
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
 cmake --build build-Win32 --config Release --target negotiation_probe inject
 # Music Centerを完全終了して再起動し、初回再生前に実際のPIDを指定
 $targetPid = 1234

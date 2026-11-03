@@ -1,0 +1,4 @@
+add_executable(bridge_status_tests EXCLUDE_FROM_ALL bridge_status_tests.cpp)
+target_include_directories(bridge_status_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/bridge")
+target_link_libraries(bridge_status_tests PRIVATE user32 gdi32 shell32)
+target_compile_definitions(bridge_status_tests PRIVATE UNICODE _UNICODE)

@@ -52,10 +52,10 @@
 
 ## 実装と再現
 
-`wasapi_pcm_probe`を追加。従来の`probe.cpp`に`ENABLE_WASAPI_PCM_CAPTURE`を指定した診断用ターゲットで、`wasapi_capture.h`によるPCM取得を追加する。通常の`probe`はPCMを取得しない。
+`wasapi_pcm_probe`を追加。従来の`diagnostics/probe.cpp`に`ENABLE_WASAPI_PCM_CAPTURE`を指定した診断用ターゲットで、`diagnostics/wasapi_capture.h`によるPCM取得を追加する。通常の`probe`はPCMを取得しない。
 
 ```powershell
-cmake -S . -B build-Win32 -A Win32
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
 cmake --build build-Win32 --config Release --target wasapi_pcm_probe negotiation_probe inject
 # Music Centerを完全終了して再起動。再生前に実際のPIDを指定する。
 $targetPid = 1234

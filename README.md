@@ -30,6 +30,23 @@ Music Centerが起動済みなら、そのプロセスへ適用します。ロ�
 
 ZIPは展開用の1フォルダーにREADME、ランチャーEXE、ブリッジDLL、BSDライセンス、MinHookライセンスだけを含みます。診断ツール・ソース・PDB・別途のアイコン画像は含みません。配布用READMEは短い使い方に絞っています。
 
+## ソースの配置
+
+| ディレクトリ | 用途 |
+| --- | --- |
+| `src/bridge/` | 配布するブリッジDLLと状態表示 |
+| `src/launcher/` | 配布するランチャーEXE・リソース |
+| `src/common/` | DLLとランチャーで共有する起動通知 |
+| `tests/` | 通常版の状態表示・設定解析の確認 |
+| `diagnostics/` | API・形式・PCM・曲末の観測、手動ロード、解析補助 |
+| `diagnostics/tests/` | 診断ツールの動作確認 |
+| `experiments/legacy/` | 従来の16bit迂回方式の接続試験 |
+| `experiments/wav192/` | WAV 192kHz試験用処理と独立検証 |
+| `assets/`, `tools/` | アイコン素材とアイコン生成スクリプト |
+| `docs/`, `vendor/` | 調査記録・説明書、第三者ライブラリー |
+
+通常のビルドは配布用DLLとランチャーだけを生成します。診断・実験用は下記のオプションで明示的に有効化します。WAV試験DLLは通常版FLAC処理のソースを再利用し、実験用マクロを指定した別ターゲットとしてビルドします。旧迂回DLLも診断用DirectShowソースを再利用します。
+
 ## 従来の16bit迂回方式
 
 確認した環境では、96kHz FLACの再生中にSonyのDSEEフィルターの出力が44.1kHzとなっていました。DSEE、Seamless、EQを完全に外すと96kHz再生はできましたが、経過時間表示が停止しました。
@@ -56,9 +73,21 @@ cmake --build build-Win32 --config Release
 Music Center for PCは検証したバージョンでは32bitなので、Win32版DLLとインジェクターを使用します。x64対象の診断には別ビルドを使用します。
 
 ```powershell
-cmake -S . -B build-x64 -A x64
+cmake -S . -B build-x64 -A x64 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
 cmake --build build-x64 --config Release
 ```
+
+診断ツールと実験ターゲットも使う場合は次を実行します。EXE・DLLの出力先とターゲット名は従来どおりです。配布ZIPには通常版だけが入ります。
+
+```powershell
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON -DMC_BRIDGE_BUILD_EXPERIMENTS=ON
+cmake --build build-Win32 --config Release
+# 通常版の確認は必要なときだけ実行
+cmake --build build-Win32 --config Release --target bridge_status_tests
+./build-Win32/Release/bridge_status_tests.exe
+```
+
+WAV試験用ターゲットはオプションを有効にしたうえで個別指定します。[試験版のビルド手順](docs/wav192-experiment.md)を参照してください。
 
 ## 試験適用
 
@@ -101,9 +130,9 @@ $dll = (Resolve-Path .\build-Win32\Release\dshow_bypass_timing.dll).Path
 | `wasapi_pcm_probe` | WASAPI形式の観測と出力直前PCMの取得（最大20秒、通常の`probe`とは併用不可） |
 | `inject` | 同じアーキテクチャのDLLを対象プロセスへロード |
 | `smoke`, `dshow_smoke`, `bypass_test` | 診断・接続試験 |
-| `analyze-pcm.mjs` | PCMのFFT解析（Node.js） |
+| `diagnostics/analyze-pcm.mjs` | PCMのFFT解析（Node.js） |
 
-`observe.ps1`は従来の`bin/x86`・`bin/x64`配置を前提とする形式観測用補助スクリプトです。通常のCMakeビルドでは、生成されたReleaseディレクトリ内のinjectとprobeを直接指定できます。
+`diagnostics/observe.ps1`は形式観測用の補助スクリプトです。既定では`build-Win32/Release`または`build-x64/Release`のinjectとprobeを使い、`-BinPath`で別の出力先も指定できます。診断ツールのビルドには`MC_BRIDGE_BUILD_DIAGNOSTICS=ON`が必要です。
 
 24bit音源が16bitになる箇所については、Music Centerの`OpcFlac.dll`が接続前にSony FLACフィルターへ16を指定する呼び出しを捕捉しました。[形式交渉の調査結果](docs/bit-depth-investigation.md)を参照してください。これは原因の切り分けであり、24bit出力への修正ではありません。`negotiation_probe.dll`も他の観測版・迂回版と同時にロードしないでください。
 
