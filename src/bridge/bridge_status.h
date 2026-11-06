@@ -50,6 +50,26 @@ inline void layout() {
 inline void CALLBACK ownerLocation(HWINEVENTHOOK,DWORD,HWND w,LONG object,LONG child,DWORD,DWORD) {
     if(w==owner&&object==OBJID_WINDOW&&child==CHILDID_SELF)layout();
 }
+inline bool seekTooltipMayOverlap(ULONGLONG now, ULONGLONG& hideUntil) {
+    // Music Center 2.7.4 renders the tooltip in Chromium, below the native badge.
+    // Its seek track is centered near y=89 and the tooltip extends right of the cursor.
+    auto context = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(owner));
+    POINT cursor{};
+    RECT badgeRect{};
+    if (GetCursorPos(&cursor) && GetAncestor(WindowFromPoint(cursor), GA_ROOT) == owner &&
+        GetWindowRect(badge, &badgeRect) && ScreenToClient(owner, &cursor)) {
+        MapWindowPoints(HWND_DESKTOP, owner, reinterpret_cast<POINT*>(&badgeRect), 2);
+        const UINT dpi = currentDpi ? currentDpi : 96;
+        if (cursor.y >= MulDiv(81, dpi, 96) && cursor.y < MulDiv(96, dpi, 96)) {
+            const bool overlaps = cursor.x >= badgeRect.left - MulDiv(80, dpi, 96) &&
+                                  cursor.x < badgeRect.right;
+            // Keep the badge clear while the tooltip fades after leaving the track.
+            hideUntil = overlaps ? now + 200 : 0;
+        }
+    }
+    if (context) SetThreadDpiAwarenessContext(context);
+    return now < hideUntil;
+}
 inline LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_PAINT){PAINTSTRUCT ps;auto dc=BeginPaint(w,&ps);RECT r;GetClientRect(w,&r);FillRect(dc,&r,reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));auto old=SelectObject(dc,font?font:GetStockObject(DEFAULT_GUI_FONT));SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(70,70,70));DrawTextW(dc,label(state.load()),-1,&r,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,old);EndPaint(w,&ps);return 0;}
     if(msg==WM_NCHITTEST)return HTTRANSPARENT;
@@ -62,7 +82,9 @@ inline void runUi(HINSTANCE instance) {
     WNDCLASSW wc{};wc.lpfnWndProc=windowProc;wc.hInstance=instance;wc.lpszClassName=L"MC_HiRes_Bridge_Status";wc.hbrBackground=reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));RegisterClassW(&wc);
     // Out-of-context callbacks run on this UI thread; never query the audio graph here.
     auto locationHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,ownerLocation,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
-    State last=State::Off;unsigned ticks=0;auto timer=SetTimer(nullptr,0,250,nullptr);MSG msg;
+    State last=State::Off;
+    ULONGLONG nextModeCheck=0, hideUntil=0;
+    auto timer=SetTimer(nullptr,0,30,nullptr);MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)>0){
         if(msg.message==WM_TIMER&&msg.wParam==timer){
             if(!IsWindow(owner)){owner=nullptr;EnumWindows(findOwner,reinterpret_cast<LPARAM>(&owner));if(!owner)continue;}
@@ -75,9 +97,15 @@ inline void runUi(HINSTANCE instance) {
             }
             if(!badge)continue;
             if(!locationHook)layout(); // Fallback for resize only; parent movement remains automatic.
-            if(++ticks%4==0&&!directSoundSelected())state.store(State::Off);
+            const auto nowTick=GetTickCount64();
+            if(nowTick>=nextModeCheck){
+                if(!directSoundSelected())state.store(State::Off);
+                nextModeCheck=nowTick+1000;
+            }
             // Parent movement/visibility/minimization are automatic for WS_CHILD.
-            ShowWindow(badge,IsWindowEnabled(owner)?SW_SHOWNOACTIVATE:SW_HIDE);
+            const bool show=IsWindowEnabled(owner)&&!seekTooltipMayOverlap(nowTick,hideUntil);
+            const bool visible=(GetWindowLongPtrW(badge,GWL_STYLE)&WS_VISIBLE)!=0;
+            if(show!=visible)ShowWindow(badge,show?SW_SHOWNOACTIVATE:SW_HIDE);
             auto now=state.load();if(now!=last){SetWindowTextW(badge,label(now));InvalidateRect(badge,nullptr,TRUE);last=now;}
         }
         TranslateMessage(&msg);DispatchMessageW(&msg);
