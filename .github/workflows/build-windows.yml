@@ -2,7 +2,7 @@ name: Build Windows ZIP
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev/dsee-hx]
     tags: ['v*']
   pull_request:
     branches: [main]
