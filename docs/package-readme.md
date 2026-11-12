@@ -26,7 +26,7 @@ Windows 11、Music Center for PC 2.7.4（32bit、標準インストール先）�
 
 ## DSEE HXの試聴（開発版）
 
-Music CenterでDirectSound出力を選び、DSEE HXをオンにしてから曲を再生してください。試聴した範囲は44.1 kHzのステレオ音源で、16 bit WAV／FLACと96 kbps AAC／MP3です。設定の切り替えは、曲を選び直すなどして再生経路が作り直されたときに反映されます。EQを外した経路を使用します。
+Music CenterでDirectSound出力を選び、DSEE HXをオンにしてから曲を再生してください。試聴した範囲は44.1 kHzのステレオ音源で、16 bit WAV／FLAC、96 kbps AAC、96／192／320 kbps MP3です。設定の切り替えは、曲を選び直すなどして再生経路が作り直されたときに反映されます。EQを外した経路を使用します。
 
 対応曲ではDirectSoundに176.4 kHz／24 bitのPCMを書き込みます。Windows共有出力の形式はデバイスの設定に従います。DSEEをオフにするとCD品質・圧縮音源は通常経路で再生されます。ハイレゾFLACの24 bit処理はDSEE設定に関係なく有効です。
 

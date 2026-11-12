@@ -30,7 +30,8 @@ static bool eligibleDsee(const SharedDseeConfig& c) {
     if(c.mode!=1 || c.channels!=2 || c.inputRate!=44100 || c.inputBits!=16 ||
        c.outputRate!=44100 || c.outputBits!=16)return false;
     if(c.unknown==1)return (c.format==3 && c.quality==96) || (c.format==101 && c.quality==0);
-    return c.unknown==0 && ((c.format==2 && c.quality==96) || (c.format==16 && c.quality==0));
+    const bool mp3=c.format==2 && (c.quality==96 || c.quality==192 || c.quality==320);
+    return c.unknown==0 && (mp3 || (c.format==16 && c.quality==0));
 }
 static HRESULT STDMETHODCALLTYPE sharedDseeSetter(IUnknown* object,SharedDseeConfig c) {
     ComPtr<IBaseFilter> filter;
@@ -45,6 +46,7 @@ static HRESULT STDMETHODCALLTYPE sharedDseeSetter(IUnknown* object,SharedDseeCon
     adjusted.outputRate=c.format==3?96000:176400;
     adjusted.outputBits=24;
     const auto hr=originalDsee(object,adjusted);
+    if(c.format==2)record("DSEE_MP3_QUALITY",c.quality,c.quality,hr);
     record("DSEE_SET",c.format,adjusted.outputRate,hr);
     if(FAILED(hr))return originalDsee(object,c);
     AcquireSRWLockExclusive(&dseeLock);
