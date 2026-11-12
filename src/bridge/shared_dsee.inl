@@ -29,7 +29,9 @@ static bool configuredDsee(IBaseFilter* filter) {
 static bool eligibleDsee(const SharedDseeConfig& c) {
     if(c.mode!=1 || c.channels!=2 || c.inputRate!=44100 || c.inputBits!=16 ||
        c.outputRate!=44100 || c.outputBits!=16)return false;
-    if(c.unknown==1)return (c.format==3 && c.quality==96) || (c.format==101 && c.quality==0);
+    // Music Center reports AAC as 3 and both FLAC and ALAC as 101.
+    // The quality field can vary per file. Preserve it in the setter call.
+    if(c.unknown==1)return c.format==3 || c.format==101;
     const bool mp3=c.format==2 && (c.quality==96 || c.quality==192 || c.quality==320);
     return c.unknown==0 && (mp3 || (c.format==16 && c.quality==0));
 }
