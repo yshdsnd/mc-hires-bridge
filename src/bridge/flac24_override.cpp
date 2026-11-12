@@ -54,18 +54,97 @@ static bool supportedOutputRate(DWORD rate){return supportedFlacRate(rate);}
 #else
 #include "shared_dsee.inl"
 #endif
+static bridgeStatus::Format pcmFormat(const AM_MEDIA_TYPE& type) {
+    if(type.majortype!=MEDIATYPE_Audio || type.formattype!=FORMAT_WaveFormatEx ||
+       type.cbFormat<16 || !type.pbFormat)return {};
+    WAVEFORMATEX wave{};
+    memcpy(&wave,type.pbFormat,min(size_t(type.cbFormat),sizeof(wave)));
+    return {wave.nSamplesPerSec,wave.wBitsPerSample,wave.nChannels};
+}
+static void freeMediaType(AM_MEDIA_TYPE& type) {
+    CoTaskMemFree(type.pbFormat);
+    if(type.pUnk)type.pUnk->Release();
+}
+static const wchar_t* fileCodec(IBaseFilter* filter) {
+    Microsoft::WRL::ComPtr<IFileSourceFilter> source;
+    if(FAILED(filter->QueryInterface(IID_PPV_ARGS(&source))))return L"";
+    LPOLESTR path=nullptr;
+    AM_MEDIA_TYPE type{};
+    const auto hr=source->GetCurFile(&path,&type);
+    const wchar_t* codec=L"";
+    if(SUCCEEDED(hr) && path) {
+        if(const auto ext=wcsrchr(path,L'.')) {
+            if(!_wcsicmp(ext,L".flac"))codec=L"FLAC";
+            else if(!_wcsicmp(ext,L".wav"))codec=L"WAV";
+            else if(!_wcsicmp(ext,L".mp3"))codec=L"MP3";
+            else if(!_wcsicmp(ext,L".aac"))codec=L"AAC";
+            else if(!_wcsicmp(ext,L".alac"))codec=L"ALAC";
+            else if(!_wcsicmp(ext,L".m4a") || !_wcsicmp(ext,L".mp4"))codec=L"M4A";
+        }
+    }
+    CoTaskMemFree(path);
+    freeMediaType(type);
+    return codec;
+}
 static void updateStatus(IUnknown* object,HRESULT result) {
-    bool source=false,output24=false,dseeActive=false;IFilterGraph* graph=nullptr;
-    if(SUCCEEDED(result)&&bridgeStatus::directSoundSelected()&&SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&graph)))){
-        IEnumFilters* filters=nullptr;if(SUCCEEDED(graph->EnumFilters(&filters))){IBaseFilter* f=nullptr;while(filters->Next(1,&f,nullptr)==S_OK){CLSID cls{};f->GetClassID(&cls);if(sourceApplied(f))source=true;
-            if(cls==CLSID_DSoundRender){IEnumPins* pins=nullptr;if(SUCCEEDED(f->EnumPins(&pins))){IPin* p=nullptr;while(pins->Next(1,&p,nullptr)==S_OK){AM_MEDIA_TYPE mt{};if(SUCCEEDED(p->ConnectionMediaType(&mt))&&mt.formattype==FORMAT_WaveFormatEx&&mt.cbFormat>=16&&mt.pbFormat){WAVEFORMATEX wave{};memcpy(&wave,mt.pbFormat,min(size_t(mt.cbFormat),sizeof(wave)));if(supportedOutputRate(wave.nSamplesPerSec)&&wave.wBitsPerSample==24&&wave.nChannels==2)output24=true;}
+    using Microsoft::WRL::ComPtr;
+    bridgeStatus::Playback playback;
+    bool source=false, output24=false, dseeActive=false;
+    ComPtr<IFilterGraph> graph;
+    ComPtr<IEnumFilters> filters;
+    if(SUCCEEDED(result) && bridgeStatus::directSoundSelected() &&
+       SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&graph))) && SUCCEEDED(graph->EnumFilters(&filters))) {
+        playback.route=bridgeStatus::Route::Normal;
+        ComPtr<IBaseFilter> filter;
+        DWORD inputCodec=0;
+        while(filters->Next(1,filter.ReleaseAndGetAddressOf(),nullptr)==S_OK) {
+            CLSID cls{};
+            if(FAILED(filter->GetClassID(&cls)))continue;
+            if(sourceApplied(filter.Get()))source=true;
+            if(!*playback.codec)playback.codec=fileCodec(filter.Get());
 #ifndef EXPERIMENT_WAV192
-            if(dseeFeedsRenderer(p,mt))dseeActive=true;
+            if(cls==dsee) {
+                const auto config=dseeSnapshot(filter.Get()).input;
+                if(config.inputRate && config.inputBits && config.channels) {
+                    inputCodec=config.format;
+                    playback.input={config.inputRate,WORD(config.inputBits),WORD(config.channels)};
+                }
+            }
 #endif
-            if(mt.cbFormat)CoTaskMemFree(mt.pbFormat);if(mt.pUnk)mt.pUnk->Release();p->Release();}pins->Release();}}
-            f->Release();}filters->Release();}graph->Release();}
-    auto next=((source&&output24)||dseeActive)?bridgeStatus::State::On:bridgeStatus::State::Off;
-    bridgeStatus::state.store(next);record(next==bridgeStatus::State::On?"STATUS_ON":"STATUS_OFF",0,0,result);
+            if(cls!=CLSID_DSoundRender)continue;
+            ComPtr<IEnumPins> pins;
+            if(FAILED(filter->EnumPins(&pins)))continue;
+            ComPtr<IPin> pin;
+            while(pins->Next(1,pin.ReleaseAndGetAddressOf(),nullptr)==S_OK) {
+                AM_MEDIA_TYPE type{};
+                if(FAILED(pin->ConnectionMediaType(&type)))continue;
+                playback.output=pcmFormat(type);
+                const auto format=playback.output;
+                output24=supportedOutputRate(format.rate) && format.bits==24 && format.channels==2;
+#ifndef EXPERIMENT_WAV192
+                dseeActive=dseeFeedsRenderer(pin.Get(),type);
+#endif
+                freeMediaType(type);
+            }
+        }
+        if(inputCodec==2)playback.codec=L"MP3";
+        else if(inputCodec==3)playback.codec=L"AAC";
+        else if(inputCodec==16)playback.codec=L"WAV";
+        else if(inputCodec==101) {
+            if(wcscmp(playback.codec,L"M4A")==0)playback.codec=L"ALAC";
+            else if(!*playback.codec)playback.codec=L"FLAC / ALAC";
+        }
+        if(dseeActive)playback.route=bridgeStatus::Route::Dsee;
+        else if(source && output24) {
+            playback.route=bridgeStatus::Route::Flac24;
+            if(!*playback.codec)playback.codec=L"FLAC";
+            playback.input=playback.output;
+        }
+    }
+    bridgeStatus::publish(playback);
+    const auto next=((source&&output24)||dseeActive)?bridgeStatus::State::On:bridgeStatus::State::Off;
+    bridgeStatus::state.store(next);
+    record(next==bridgeStatus::State::On?"STATUS_ON":"STATUS_OFF",0,0,result);
 }
 static HRESULT STDMETHODCALLTYPE runHook(IMediaControl* self){
 #ifdef EXPERIMENT_WAV192

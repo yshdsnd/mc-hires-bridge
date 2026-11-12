@@ -29,5 +29,11 @@ int main(){
             return 3;
         }
     }
-    puts("Output-mode, DSEE preference, and status label checks passed");return 0;
+    const auto details=bridgeStatus::tooltipText({
+        L"ALAC",{44100,16,2},{176400,24,2},bridgeStatus::Route::Dsee
+    });
+    if(details.find(L"ALAC  44.1 kHz / 16 bit / 2 ch")==std::wstring::npos ||
+       details.find(L"DirectSound  176.4 kHz / 24 bit / 2 ch")==std::wstring::npos ||
+       bridgeStatus::formatText({48000,24,2})!=L"48 kHz / 24 bit / 2 ch")return 4;
+    puts("Output-mode, DSEE preference, status label, and tooltip checks passed");return 0;
 }

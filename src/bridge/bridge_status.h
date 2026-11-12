@@ -10,6 +10,55 @@ enum class State { Ready, On, Off };
 inline std::atomic<State> state{State::Ready};
 inline const wchar_t* label(State s) { return s==State::Ready?L"HR-BR RDY":s==State::On?L"HR-BR ON":L"HR-BR OFF"; }
 
+struct Format { DWORD rate=0; WORD bits=0, channels=0; };
+enum class Route { Unknown, Normal, Dsee, Flac24 };
+struct Playback {
+    const wchar_t* codec=L"";
+    Format input{}, output{};
+    Route route=Route::Unknown;
+};
+inline SRWLOCK playbackLock=SRWLOCK_INIT;
+inline Playback playback;
+inline void publish(Playback value) {
+    AcquireSRWLockExclusive(&playbackLock);
+    playback=value;
+    ReleaseSRWLockExclusive(&playbackLock);
+}
+inline Playback snapshot() {
+    AcquireSRWLockShared(&playbackLock);
+    const auto value=playback;
+    ReleaseSRWLockShared(&playbackLock);
+    return value;
+}
+inline std::wstring formatText(Format f) {
+    if(!f.rate || !f.bits || !f.channels)return L"\u4e0d\u660e";
+    wchar_t text[80];
+    if(f.rate%1000==0)
+        swprintf_s(text,L"%lu kHz / %u bit / %u ch",f.rate/1000,unsigned(f.bits),unsigned(f.channels));
+    else
+        swprintf_s(text,L"%lu.%03lu kHz / %u bit / %u ch",f.rate/1000,f.rate%1000,unsigned(f.bits),unsigned(f.channels));
+    std::wstring result=text;
+    if(const auto dot=result.find(L'.');dot!=std::wstring::npos) {
+        auto end=result.find(L' ',dot);
+        while(end>dot+1 && result[end-1]==L'0')result.erase(--end,1);
+    }
+    return result;
+}
+inline std::wstring tooltipText(Playback p) {
+    if(p.route==Route::Unknown)return L"\u518d\u751f\u60c5\u5831\u3092\u5f85\u6a5f\u4e2d";
+    const wchar_t* route=L"Music Center \u306e\u901a\u5e38\u7d4c\u8def";
+    if(p.route==Route::Dsee)route=L"DSEE HX \u2192 DirectSound";
+    if(p.route==Route::Flac24)route=L"FLAC 24 bit \u7dad\u6301";
+    std::wstring text=L"\u5165\u529b  ";
+    if(*p.codec){text+=p.codec;text+=L"  ";}
+    text+=formatText(p.input);
+    text+=L"\r\n\u51e6\u7406  ";
+    text+=route;
+    text+=L"\r\nDirectSound  ";
+    text+=formatText(p.output);
+    return text;
+}
+
 // Read only the saved output-mode property. Missing/invalid configuration is OFF.
 // Bound both input size and nesting; do not search for an unrelated "mode" key.
 inline size_t space(std::string_view s,size_t p) { while(p<s.size()&&(s[p]==' '||s[p]=='\r'||s[p]=='\n'||s[p]=='\t'))++p;return p; }
@@ -85,10 +134,67 @@ inline LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_DESTROY){PostQuitMessage(0);return 0;}
     return DefWindowProcW(w,msg,wp,lp);
 }
+struct HoverTip {
+    HWND window=nullptr;
+    std::wstring content;
+    ULONGLONG entered=0;
+    ~HoverTip(){if(IsWindow(window))DestroyWindow(window);}
+    void update(HINSTANCE instance, bool enabled, ULONGLONG now) {
+        POINT cursor{};
+        RECT rect{};
+        const auto context=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(owner));
+        const bool hover=enabled && IsWindowVisible(badge) && GetCursorPos(&cursor) &&
+            GetWindowRect(badge,&rect) && PtInRect(&rect,cursor) &&
+            GetAncestor(WindowFromPoint(cursor),GA_ROOT)==owner;
+        if(!hover) {
+            if(IsWindowVisible(window))ShowWindow(window,SW_HIDE);
+            entered=0;
+        } else {
+            if(!entered)entered=now;
+            if(now-entered>=450)show(instance,rect);
+        }
+        if(context)SetThreadDpiAwarenessContext(context);
+    }
+    void show(HINSTANCE instance, RECT anchor) {
+        if(!window) {
+            window=CreateWindowExW(WS_EX_TRANSPARENT|WS_EX_NOPARENTNOTIFY,L"STATIC",nullptr,
+                WS_CHILD|WS_BORDER|SS_LEFT|SS_NOPREFIX,0,0,0,0,owner,nullptr,instance,nullptr);
+            if(!window)return;
+            SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),FALSE);
+        }
+        auto next=tooltipText(snapshot());
+        if(content!=next){
+            content=std::move(next);
+            SetWindowTextW(window,content.c_str());
+        }
+        RECT size{};
+        auto dc=GetDC(window);
+        if(!dc)return;
+        auto old=SelectObject(dc,GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc,content.c_str(),-1,&size,DT_CALCRECT|DT_NOPREFIX);
+        SelectObject(dc,old);
+        ReleaseDC(window,dc);
+
+        MapWindowPoints(HWND_DESKTOP,owner,reinterpret_cast<POINT*>(&anchor),2);
+        RECT client{}, previous{};
+        GetClientRect(owner,&client);
+        const int width=size.right+MulDiv(16,currentDpi,96);
+        const int height=size.bottom+MulDiv(8,currentDpi,96);
+        const int x=max(0,min(anchor.left,client.right-width));
+        // Stay below the seek bar, and hide as soon as the pointer leaves the badge.
+        const int y=anchor.bottom+MulDiv(27,currentDpi,96);
+        GetWindowRect(window,&previous);
+        MapWindowPoints(HWND_DESKTOP,owner,reinterpret_cast<POINT*>(&previous),2);
+        if(!IsWindowVisible(window) || previous.left!=x || previous.top!=y ||
+           previous.right-previous.left!=width || previous.bottom-previous.top!=height)
+            SetWindowPos(window,HWND_TOP,x,y,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    }
+};
 inline void runUi(HINSTANCE instance) {
     WNDCLASSW wc{};wc.lpfnWndProc=windowProc;wc.hInstance=instance;wc.lpszClassName=L"MC_HiRes_Bridge_Status";wc.hbrBackground=reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));RegisterClassW(&wc);
     // Out-of-context callbacks run on this UI thread; never query the audio graph here.
     auto locationHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,ownerLocation,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
+    HoverTip tip;
     State last=State::Off;
     ULONGLONG nextModeCheck=0, hideUntil=0;
     auto timer=SetTimer(nullptr,0,30,nullptr);MSG msg;
@@ -106,13 +212,14 @@ inline void runUi(HINSTANCE instance) {
             if(!locationHook)layout(); // Fallback for resize only; parent movement remains automatic.
             const auto nowTick=GetTickCount64();
             if(nowTick>=nextModeCheck){
-                if(!directSoundSelected())state.store(State::Off);
+                if(!directSoundSelected()){state.store(State::Off);publish({});}
                 nextModeCheck=nowTick+1000;
             }
             // Parent movement/visibility/minimization are automatic for WS_CHILD.
             const bool show=IsWindowEnabled(owner)&&!seekTooltipMayOverlap(nowTick,hideUntil);
             const bool visible=(GetWindowLongPtrW(badge,GWL_STYLE)&WS_VISIBLE)!=0;
             if(show!=visible)ShowWindow(badge,show?SW_SHOWNOACTIVATE:SW_HIDE);
+            tip.update(instance,show,nowTick);
             auto now=state.load();if(now!=last){SetWindowTextW(badge,label(now));InvalidateRect(badge,nullptr,TRUE);last=now;}
         }
         TranslateMessage(&msg);DispatchMessageW(&msg);

@@ -16,6 +16,8 @@ EXEと`flac24_override.dll`は同じフォルダーのまま使用してくだ�
 
 Music Centerが起動済みなら、そのプロセスへロードします。ロード前から再生中の曲へは遡って適用しません。次曲または曲を選び直したときから適用されます。更新時はMusic Centerを完全終了してからファイルを入れ替えてください。
 
+HR-BRにマウスを置くと、取得できた入力形式、処理経路、DirectSoundの接続形式を表示します。DirectSound欄はWindows共有ミキサーに入る前の形式です。
+
 ## 対応範囲・エラー
 
 Windows 11、Music Center for PC 2.7.4（32bit、標準インストール先）、DirectSound共有出力。48・96・192 kHz／24 bitのステレオFLACが対象です。DSDとハイレゾWAVは対象外です。

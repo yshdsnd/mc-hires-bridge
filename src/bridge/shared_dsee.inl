@@ -18,13 +18,18 @@ struct DseeScope {
 static const CLSID dsee={0xa481d160,0xab4d,0x4b97,{0x93,0xfe,0xc1,0xf4,0xb4,0xb7,0x81,0xdf}};
 static const CLSID seamless={0x6af73f1f,0x1266,0x46e6,{0x9a,0x36,0xee,0x75,0xe4,0xba,0x10,0xbb}};
 static SRWLOCK dseeLock=SRWLOCK_INIT;
-static std::map<IBaseFilter*,bool> dseeConfigured;
+struct DseePlayback { SharedDseeConfig input; bool applied; };
+static std::map<IBaseFilter*,DseePlayback> dseePlayback;
+static DseePlayback dseeSnapshot(IBaseFilter* filter) {
+    AcquireSRWLockShared(&dseeLock);
+    const auto entry=dseePlayback.find(filter);
+    const auto value=entry==dseePlayback.end()?DseePlayback{}:entry->second;
+    ReleaseSRWLockShared(&dseeLock);
+    return value;
+}
 
 static bool configuredDsee(IBaseFilter* filter) {
-    AcquireSRWLockShared(&dseeLock);
-    const bool found=dseeConfigured.count(filter)!=0;
-    ReleaseSRWLockShared(&dseeLock);
-    return found;
+    return dseeSnapshot(filter).applied;
 }
 static bool eligibleDsee(const SharedDseeConfig& c) {
     if(c.mode!=1 || c.channels!=2 || c.inputRate!=44100 || c.inputBits!=16 ||
@@ -39,21 +44,21 @@ static HRESULT STDMETHODCALLTYPE sharedDseeSetter(IUnknown* object,SharedDseeCon
     ComPtr<IBaseFilter> filter;
     if(FAILED(object->QueryInterface(IID_PPV_ARGS(&filter))))return originalDsee(object,c);
 
+    bool applied=false;
+    HRESULT hr;
+    if(eligibleDsee(c) && bridgeStatus::dseeSharedRequested()) {
+        auto adjusted=c;
+        adjusted.outputRate=c.format==3?96000:176400;
+        adjusted.outputBits=24;
+        hr=originalDsee(object,adjusted);
+        if(c.format==2)record("DSEE_MP3_QUALITY",c.quality,c.quality,hr);
+        record("DSEE_SET",c.format,adjusted.outputRate,hr);
+        applied=SUCCEEDED(hr);
+    }
+    if(!applied)hr=originalDsee(object,c);
     AcquireSRWLockExclusive(&dseeLock);
-    dseeConfigured.erase(filter.Get());
-    ReleaseSRWLockExclusive(&dseeLock);
-    if(!eligibleDsee(c) || !bridgeStatus::dseeSharedRequested())return originalDsee(object,c);
-
-    auto adjusted=c;
-    adjusted.outputRate=c.format==3?96000:176400;
-    adjusted.outputBits=24;
-    const auto hr=originalDsee(object,adjusted);
-    if(c.format==2)record("DSEE_MP3_QUALITY",c.quality,c.quality,hr);
-    record("DSEE_SET",c.format,adjusted.outputRate,hr);
-    if(FAILED(hr))return originalDsee(object,c);
-    AcquireSRWLockExclusive(&dseeLock);
-    if(dseeConfigured.size()>=64)dseeConfigured.erase(dseeConfigured.begin());
-    dseeConfigured.emplace(filter.Get(),true);
+    if(dseePlayback.size()>=64 && !dseePlayback.count(filter.Get()))dseePlayback.erase(dseePlayback.begin());
+    dseePlayback[filter.Get()]={SUCCEEDED(hr)?c:SharedDseeConfig{},applied};
     ReleaseSRWLockExclusive(&dseeLock);
     return hr;
 }
