@@ -87,7 +87,7 @@ inline bool dseeSharedEnabled(std::string_view data) {
 }
 
 inline bool dseeSharedRequested() { return dseeSharedEnabled(savedConfiguration()); }
-inline HWND owner=nullptr,badge=nullptr;inline HFONT font=nullptr;inline UINT currentDpi=0;
+inline HWND owner=nullptr,badge=nullptr;inline HFONT font=nullptr, tipFont=nullptr;inline UINT currentDpi=0;
 inline BOOL CALLBACK findOwner(HWND w,LPARAM result) {DWORD pid=0;GetWindowThreadProcessId(w,&pid);wchar_t name[128];GetClassNameW(w,name,128);if(pid==GetCurrentProcessId()&&IsWindowVisible(w)&&!GetWindow(w,GW_OWNER)&&wcscmp(name,L"Chrome_WidgetWin_1")==0){*reinterpret_cast<HWND*>(result)=w;return FALSE;}return TRUE;}
 // Child coordinates stay relative to the parent. Moving the main window never
 // requires a timer tick, screen-coordinate conversion, or a separate popup move.
@@ -95,7 +95,7 @@ inline void layout() {
     if(!IsWindow(owner)||!IsWindow(badge))return;
     auto context=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(owner));
     UINT dpi=GetDpiForWindow(owner);if(!dpi)dpi=96;
-    if(dpi!=currentDpi){if(font)DeleteObject(font);font=CreateFontW(-MulDiv(12,dpi,96),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");currentDpi=dpi;InvalidateRect(badge,nullptr,TRUE);}
+    if(dpi!=currentDpi){if(font)DeleteObject(font);font=CreateFontW(-MulDiv(12,dpi,96),0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");if(tipFont)DeleteObject(tipFont);tipFont=CreateFontW(-MulDiv(14,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");currentDpi=dpi;InvalidateRect(badge,nullptr,TRUE);}
     RECT r;GetClientRect(owner,&r);
     int x=max(0,r.right-MulDiv(380,dpi,96)),y=MulDiv(48,dpi,96),width=MulDiv(92,dpi,96),height=MulDiv(23,dpi,96);
     RECT existing;GetWindowRect(badge,&existing);MapWindowPoints(HWND_DESKTOP,owner,reinterpret_cast<POINT*>(&existing),2);
@@ -134,6 +134,31 @@ inline LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_DESTROY){PostQuitMessage(0);return 0;}
     return DefWindowProcW(w,msg,wp,lp);
 }
+inline LRESULT CALLBACK tooltipProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
+    switch(msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        auto dc=BeginPaint(w,&paint);
+        RECT rect{};
+        GetClientRect(w,&rect);
+        FillRect(dc,&rect,GetSysColorBrush(COLOR_INFOBK));
+        FrameRect(dc,&rect,GetSysColorBrush(COLOR_INFOTEXT));
+        InflateRect(&rect,-MulDiv(8,currentDpi,96),-MulDiv(4,currentDpi,96));
+        wchar_t text[512]{};
+        GetWindowTextW(w,text,_countof(text));
+        auto old=SelectObject(dc,tipFont?tipFont:GetStockObject(DEFAULT_GUI_FONT));
+        SetBkMode(dc,TRANSPARENT);
+        SetTextColor(dc,GetSysColor(COLOR_INFOTEXT));
+        DrawTextW(dc,text,-1,&rect,DT_NOPREFIX);
+        SelectObject(dc,old);
+        EndPaint(w,&paint);
+        return 0;
+    }
+    case WM_NCHITTEST:return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE:return MA_NOACTIVATE;
+    }
+    return DefWindowProcW(w,msg,wp,lp);
+}
 struct HoverTip {
     HWND window=nullptr;
     std::wstring content;
@@ -157,20 +182,21 @@ struct HoverTip {
     }
     void show(HINSTANCE instance, RECT anchor) {
         if(!window) {
-            window=CreateWindowExW(WS_EX_TRANSPARENT|WS_EX_NOPARENTNOTIFY,L"STATIC",nullptr,
-                WS_CHILD|WS_BORDER|SS_LEFT|SS_NOPREFIX,0,0,0,0,owner,nullptr,instance,nullptr);
+            window=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_NOPARENTNOTIFY,L"MC_HiRes_Bridge_Tooltip",nullptr,
+                WS_CHILD|WS_CLIPSIBLINGS,0,0,0,0,owner,nullptr,instance,nullptr);
             if(!window)return;
-            SendMessageW(window,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),FALSE);
+            if(!SetLayeredWindowAttributes(window,0,255,LWA_ALPHA)) { DestroyWindow(window); window=nullptr; return; }
         }
         auto next=tooltipText(snapshot());
         if(content!=next){
             content=std::move(next);
             SetWindowTextW(window,content.c_str());
+            InvalidateRect(window,nullptr,FALSE);
         }
         RECT size{};
         auto dc=GetDC(window);
         if(!dc)return;
-        auto old=SelectObject(dc,GetStockObject(DEFAULT_GUI_FONT));
+        auto old=SelectObject(dc,tipFont?tipFont:GetStockObject(DEFAULT_GUI_FONT));
         DrawTextW(dc,content.c_str(),-1,&size,DT_CALCRECT|DT_NOPREFIX);
         SelectObject(dc,old);
         ReleaseDC(window,dc);
@@ -192,6 +218,10 @@ struct HoverTip {
 };
 inline void runUi(HINSTANCE instance) {
     WNDCLASSW wc{};wc.lpfnWndProc=windowProc;wc.hInstance=instance;wc.lpszClassName=L"MC_HiRes_Bridge_Status";wc.hbrBackground=reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));RegisterClassW(&wc);
+    wc.lpfnWndProc=tooltipProc;
+    wc.lpszClassName=L"MC_HiRes_Bridge_Tooltip";
+    RegisterClassW(&wc);
+    wc.lpszClassName=L"MC_HiRes_Bridge_Status";
     // Out-of-context callbacks run on this UI thread; never query the audio graph here.
     auto locationHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,ownerLocation,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);
     HoverTip tip;
@@ -227,6 +257,6 @@ inline void runUi(HINSTANCE instance) {
     if(timer)KillTimer(nullptr,timer);
     if(locationHook)UnhookWinEvent(locationHook);
     if(IsWindow(badge))DestroyWindow(badge);badge=nullptr;
-    if(font){DeleteObject(font);font=nullptr;}currentDpi=0;
+    if(font){DeleteObject(font);font=nullptr;}if(tipFont){DeleteObject(tipFont);tipFont=nullptr;}currentDpi=0;
 }
 }
