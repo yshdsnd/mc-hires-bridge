@@ -51,6 +51,7 @@ git push origin v0.1.0
 | `diagnostics/tests/` | 診断ツールの動作確認 |
 | `experiments/legacy/` | 従来の16bit迂回方式の接続試験 |
 | `experiments/wav192/` | WAV 192kHz試験用処理と独立検証 |
+| `experiments/eos_transition/` | 形式が変わる曲送りのEOS処理試験版と状態遷移テスト |
 | `assets/`, `tools/` | アイコン素材とアイコン生成スクリプト |
 | `docs/`, `vendor/` | 調査記録・説明書、第三者ライブラリー |
 
@@ -96,7 +97,7 @@ cmake --build build-Win32 --config Release --target bridge_status_tests
 ./build-Win32/Release/bridge_status_tests.exe
 ```
 
-WAV試験用ターゲットはオプションを有効にしたうえで個別指定します。[試験版のビルド手順](docs/wav192-experiment.md)を参照してください。
+WAV試験用ターゲットはオプションを有効にしたうえで個別指定します。[試験版のビルド手順](docs/wav192-experiment.md)を参照してください。形式が変わる曲送りのEOS処理試験版（`flac24_eos_experiment` / `eos_transition_tests`）については[形式変更時のEOS処理試験版](docs/eos-transition-experiment.md)を参照してください。
 
 ## 試験適用
 
