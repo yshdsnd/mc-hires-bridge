@@ -163,13 +163,18 @@ static void syncGraphActivationFromPin(IPin* pin, void* key) {
     }
 }
 
+#include <dsound.h>
+
 using PinOneFn = HRESULT(STDMETHODCALLTYPE*)(IPin*);
 using PinSegmentFn = HRESULT(STDMETHODCALLTYPE*)(IPin*, REFERENCE_TIME, REFERENCE_TIME, double);
 using MemReceiveFn = HRESULT(STDMETHODCALLTYPE*)(IMemInputPin*, IMediaSample*);
+using ControlPauseFn = HRESULT(STDMETHODCALLTYPE*)(IMediaControl*);
 using ControlStopFn = HRESULT(STDMETHODCALLTYPE*)(IMediaControl*);
+using FilterPauseFn = HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*);
 using FilterStopFn = HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*);
 using GetPositionFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*);
 using SetPositionsFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*, DWORD, LONGLONG*, DWORD);
+using DsStopFn = HRESULT(WINAPI*)(IDirectSoundBuffer*);
 
 static MemReceiveFn originalSeamlessReceive = nullptr;
 static PinOneFn originalSeamlessEos = nullptr;
@@ -183,11 +188,70 @@ static PinOneFn originalEqBeginFlush = nullptr;
 static PinOneFn originalEqEndFlush = nullptr;
 static PinSegmentFn originalEqNewSegment = nullptr;
 
+static ControlPauseFn originalControlPause = nullptr;
 static ControlStopFn originalControlStop = nullptr;
+static FilterPauseFn originalFilterPause = nullptr;
 static FilterStopFn originalFilterStop = nullptr;
 static GetPositionFn originalGetStopPosition = nullptr;
 static GetPositionFn originalGetCurrentPosition = nullptr;
 static SetPositionsFn originalSetPositions = nullptr;
+static DsStopFn originalDsStop = nullptr;
+
+enum class PauseMode {
+    Defer,
+    Observe
+};
+
+static PauseMode g_pauseMode = PauseMode::Defer;
+
+static void initPauseMode() {
+    wchar_t envBuf[32]{};
+    DWORD n = GetEnvironmentVariableW(L"MC_BRIDGE_PAUSE_MODE", envBuf, 32);
+    if (n > 0 && (_wcsicmp(envBuf, L"observe") == 0 || _wcsicmp(envBuf, L"0") == 0)) {
+        g_pauseMode = PauseMode::Observe;
+    } else {
+        g_pauseMode = PauseMode::Defer;
+    }
+}
+
+#ifdef TESTING_HEADLESS
+static bool g_forceOpcDsPlayPauseCaller = false;
+#endif
+
+static bool isOpcDsPlayPauseCaller(void* returnAddress) {
+#ifdef TESTING_HEADLESS
+    if (g_forceOpcDsPlayPauseCaller) return true;
+#endif
+    if (!returnAddress) return false;
+    HMODULE hMod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(returnAddress), &hMod) || !hMod) {
+        return false;
+    }
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(hMod, path, MAX_PATH);
+    const wchar_t* pName = wcsrchr(path, L'\\');
+    const wchar_t* baseName = pName ? (pName + 1) : path;
+    if (_wcsicmp(baseName, L"OpcDSPlay.dll") != 0) {
+        return false;
+    }
+    auto base = reinterpret_cast<ULONG_PTR>(hMod);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(hMod);
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    auto rva = reinterpret_cast<ULONG_PTR>(returnAddress) - base;
+    // Music Center 2.7.4 x86 timestamp 0x63EB12DD and Pause caller RVA 0xDAC9
+    bool isKnownMc274 = (nt->FileHeader.TimeDateStamp == 0x63EB12DD && rva == 0xDAC9);
+    return isKnownMc274;
+}
+
+static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
+    if (!inEosHook) {
+        DWORD play = 0, write = 0;
+        self->GetCurrentPosition(&play, &write);
+        record("DS_STOP", play, write, S_OK);
+    }
+    return originalDsStop(self);
+}
 
 static HRESULT STDMETHODCALLTYPE originalEqEndOfStream(IPin* pin) {
     return originalEqEos ? originalEqEos(pin) : S_OK;
@@ -394,9 +458,221 @@ static HRESULT STDMETHODCALLTYPE eqNewSegmentHook(IPin* self, REFERENCE_TIME tSt
     return originalEqNewSegment(self, tStart, tStop, rate);
 }
 
+static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self, void* key, void* caller, bool isKnownCaller) {
+    record("PAUSE_DEFERRED_START", isKnownCaller ? 1 : 0, 0, S_OK);
+    AcquireSRWLockExclusive(&eosLock);
+    eosTracker.markFormatChangePauseDeferred(key);
+    ReleaseSRWLockExclusive(&eosLock);
+
+    // 1. Deliver EOS once to EQ if not yet delivered
+    IFilterGraph* graph = nullptr;
+    if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&graph))) && graph) {
+        IPin* eqPin = findEqInputPinFromGraph(graph);
+        if (eqPin) {
+            bool deliverNow = false;
+            AcquireSRWLockExclusive(&eosLock);
+            const auto* g = eosTracker.findGraph(key);
+            deliverNow = g && !g->eosDelivered;
+            if (deliverNow) {
+                eosTracker.onDownstreamEndOfStream(key);
+            }
+            ReleaseSRWLockExclusive(&eosLock);
+            if (deliverNow && originalEqEos) {
+                EosHookScope scope;
+                originalEqEndOfStream(eqPin);
+                record("EOS_DELIVERED_DEFERRED_PAUSE", 0, 1, S_OK);
+            }
+            eqPin->Release();
+        }
+        graph->Release();
+    }
+
+    // 2. Query IMediaSeeking to wait for track end drain
+    IMediaSeeking* seeking = nullptr;
+    self->QueryInterface(IID_PPV_ARGS(&seeking));
+    LONGLONG curPos = 0, stopPos = 0;
+    DWORD remainingMs = 0;
+    if (seeking && SUCCEEDED(seeking->GetCurrentPosition(&curPos)) &&
+        SUCCEEDED(seeking->GetStopPosition(&stopPos)) && stopPos > curPos) {
+        remainingMs = static_cast<DWORD>((stopPos - curPos) / 10000);
+    } else {
+        AcquireSRWLockShared(&eosLock);
+        const auto* g = eosTracker.findGraph(key);
+        if (g && g->targetBytes > g->downstreamBytes && g->sampleRate > 0) {
+            uint64_t diff = g->targetBytes - g->downstreamBytes;
+            uint32_t align = (g->bitsPerSample / 8) * (g->channels > 0 ? g->channels : 2);
+            if (align > 0) {
+                remainingMs = static_cast<DWORD>((diff * 1000ULL) / (g->sampleRate * align));
+            }
+        }
+        ReleaseSRWLockShared(&eosLock);
+    }
+
+    DWORD startTick = GetTickCount();
+    DWORD maxWait = remainingMs > 0 ? (remainingMs + 300) : 3000;
+    if (maxWait > 4500) maxWait = 4500; // safety ceiling: max 4.5s
+
+    eosTransition::PauseDeferralStatus exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
+
+    while (true) {
+        bool stillActive = false;
+        AcquireSRWLockShared(&eosLock);
+        const auto* g = eosTracker.findGraph(key);
+        stillActive = g && g->isPauseDeferralActive();
+        if (!stillActive && g) {
+            exitStatus = g->pauseDeferralStatus;
+        }
+        ReleaseSRWLockShared(&eosLock);
+
+        if (!stillActive) {
+            break;
+        }
+
+        LONGLONG c = 0, s = 0;
+        if (seeking && SUCCEEDED(seeking->GetCurrentPosition(&c)) &&
+            SUCCEEDED(seeking->GetStopPosition(&s))) {
+            if (c >= s && s > 0) {
+                exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
+                break;
+            }
+        }
+
+        if (GetTickCount() - startTick >= maxWait) {
+            exitStatus = eosTransition::PauseDeferralStatus::TimedOut;
+            break;
+        }
+
+        MSG msg;
+        bool quitReceived = false;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                quitReceived = true;
+                PostQuitMessage(static_cast<int>(msg.wParam));
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (quitReceived) {
+            exitStatus = eosTransition::PauseDeferralStatus::CancelledQuit;
+            break;
+        }
+        Sleep(15);
+    }
+    if (seeking) seeking->Release();
+
+    AcquireSRWLockExclusive(&eosLock);
+    if (exitStatus == eosTransition::PauseDeferralStatus::CompletedDrain ||
+        exitStatus == eosTransition::PauseDeferralStatus::TimedOut) {
+        eosTracker.onFormatChangePauseCompleted(key, exitStatus);
+    } else {
+        eosTracker.cancelFormatChangePause(key, exitStatus);
+    }
+    ReleaseSRWLockExclusive(&eosLock);
+
+    record("PAUSE_DEFERRED_RELEASE", static_cast<DWORD>(exitStatus), GetTickCount() - startTick, S_OK);
+    return exitStatus;
+}
+
+static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
+    if (!inEosHook) {
+        void* caller = _ReturnAddress();
+        void* key = graphKeyFromObject(self);
+        bool isKnownCaller = isOpcDsPlayPauseCaller(caller);
+        bool pendingFormatChange = false;
+        bool deferralActive = false;
+        AcquireSRWLockShared(&eosLock);
+        const auto* g = eosTracker.findGraph(key);
+        deferralActive = g && g->isPauseDeferralActive();
+        pendingFormatChange = eosTracker.isFormatChangePending(key);
+        ReleaseSRWLockShared(&eosLock);
+
+        record("CONTROL_PAUSE_ENTER", isKnownCaller ? 1 : 0, pendingFormatChange ? 1 : 0, S_OK);
+
+        if (g_pauseMode == PauseMode::Observe) {
+            record("CONTROL_PAUSE_OBSERVED", isKnownCaller ? 1 : 0, pendingFormatChange ? 1 : 0, S_OK);
+            return originalControlPause(self);
+        }
+
+        // Reentrant manual pause from user while deferral is active
+        if (deferralActive && !isKnownCaller) {
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledManualPause);
+            ReleaseSRWLockExclusive(&eosLock);
+            record("PAUSE_DEFERRED_ABORT_BY_MANUAL_PAUSE", 0, 0, S_OK);
+            return originalControlPause(self);
+        }
+
+        if (isKnownCaller && pendingFormatChange) {
+            auto exitStatus = deferFormatChangePause(self, key, caller, isKnownCaller);
+            if (exitStatus == eosTransition::PauseDeferralStatus::CancelledSeek ||
+                exitStatus == eosTransition::PauseDeferralStatus::CancelledStop ||
+                exitStatus == eosTransition::PauseDeferralStatus::CancelledQuit) {
+                record("CONTROL_PAUSE_BYPASS_CANCEL", static_cast<DWORD>(exitStatus), 0, S_OK);
+                return S_OK;
+            }
+        }
+    }
+    auto hr = originalControlPause(self);
+    record("CONTROL_PAUSE_LEAVE", 0, 0, hr);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE filterPauseHook(IMediaFilter* self) {
+    if (!inEosHook) {
+        void* caller = _ReturnAddress();
+        void* key = graphKeyFromObject(self);
+        bool isKnownCaller = isOpcDsPlayPauseCaller(caller);
+        bool pendingFormatChange = false;
+        bool deferralActive = false;
+        AcquireSRWLockShared(&eosLock);
+        const auto* g = eosTracker.findGraph(key);
+        deferralActive = g && g->isPauseDeferralActive();
+        pendingFormatChange = eosTracker.isFormatChangePending(key);
+        ReleaseSRWLockShared(&eosLock);
+
+        record("FILTER_PAUSE_ENTER", isKnownCaller ? 1 : 0, pendingFormatChange ? 1 : 0, S_OK);
+
+        if (g_pauseMode == PauseMode::Observe) {
+            record("FILTER_PAUSE_OBSERVED", isKnownCaller ? 1 : 0, pendingFormatChange ? 1 : 0, S_OK);
+            return originalFilterPause(self);
+        }
+
+        // Reentrant manual pause from user while deferral is active
+        if (deferralActive && !isKnownCaller) {
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledManualPause);
+            ReleaseSRWLockExclusive(&eosLock);
+            record("PAUSE_DEFERRED_ABORT_BY_MANUAL_PAUSE", 0, 0, S_OK);
+            return originalFilterPause(self);
+        }
+
+        if (isKnownCaller && pendingFormatChange) {
+            auto exitStatus = deferFormatChangePause(self, key, caller, isKnownCaller);
+            if (exitStatus == eosTransition::PauseDeferralStatus::CancelledSeek ||
+                exitStatus == eosTransition::PauseDeferralStatus::CancelledStop ||
+                exitStatus == eosTransition::PauseDeferralStatus::CancelledQuit) {
+                record("FILTER_PAUSE_BYPASS_CANCEL", static_cast<DWORD>(exitStatus), 0, S_OK);
+                return S_OK;
+            }
+        }
+    }
+    auto hr = originalFilterPause(self);
+    record("FILTER_PAUSE_LEAVE", 0, 0, hr);
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE controlStopHook(IMediaControl* self) {
     if (!inEosHook) {
         void* key = graphKeyFromObject(self);
+        AcquireSRWLockExclusive(&eosLock);
+        auto* g = eosTracker.findGraph(key);
+        if (g && g->isPauseDeferralActive()) {
+            eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledStop);
+            record("PAUSE_DEFERRED_ABORT_BY_STOP", 0, 0, S_OK);
+        }
+        ReleaseSRWLockExclusive(&eosLock);
+
         bool pendingFormatChange = false;
         AcquireSRWLockShared(&eosLock);
         pendingFormatChange = eosTracker.isFormatChangePending(key);
@@ -491,6 +767,11 @@ static HRESULT STDMETHODCALLTYPE filterStopHook(IMediaFilter* self) {
     if (!inEosHook) {
         void* key = graphKeyFromObject(self);
         AcquireSRWLockExclusive(&eosLock);
+        auto* g = eosTracker.findGraph(key);
+        if (g && g->isPauseDeferralActive()) {
+            eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledStop);
+            record("PAUSE_DEFERRED_ABORT_BY_FILTER_STOP", 0, 0, S_OK);
+        }
         eosTracker.onStop(key);
         ReleaseSRWLockExclusive(&eosLock);
         record("EOS_RESET_FILTER_STOP", 0, 0, S_OK);
@@ -532,6 +813,11 @@ static HRESULT STDMETHODCALLTYPE setPositionsHook(IMediaSeeking* self, LONGLONG*
             LONGLONG newPos = modifiesCurr ? *pCurrent : -1;
             LONGLONG newStop = modifiesStop ? *pStop : -1;
             AcquireSRWLockExclusive(&eosLock);
+            auto* g = eosTracker.findGraph(key);
+            if (g && g->isPauseDeferralActive()) {
+                eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledSeek);
+                record("PAUSE_DEFERRED_ABORT_BY_SEEK", modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, 0, S_OK);
+            }
             eosTracker.onSeekPositions(key, modifiesCurr, newPos, modifiesStop, newStop);
             ReleaseSRWLockExclusive(&eosLock);
             record("EOS_RESET_SEEK", modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
@@ -599,10 +885,14 @@ static IBaseFilter* createSonyFilterInstance(const wchar_t* dllName, const wchar
 
 static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control, IMediaFilter* mediaFilter) {
     if (!graph || !control || !mediaFilter) return false;
+    initPauseMode();
+    record(g_pauseMode == PauseMode::Observe ? "PAUSE_MODE_OBSERVE" : "PAUSE_MODE_DEFER", 0, 0, S_OK);
     auto controlVtable = *reinterpret_cast<void***>(control);
     auto filterVtable = *reinterpret_cast<void***>(mediaFilter);
-    bool ok = MH_CreateHook(controlVtable[9], reinterpret_cast<void*>(controlStopHook), reinterpret_cast<void**>(&originalControlStop)) == MH_OK &&
-              MH_CreateHook(filterVtable[4], reinterpret_cast<void*>(filterStopHook), reinterpret_cast<void**>(&originalFilterStop)) == MH_OK;
+    bool ok = MH_CreateHook(controlVtable[8], reinterpret_cast<void*>(controlPauseHook), reinterpret_cast<void**>(&originalControlPause)) == MH_OK &&
+              MH_CreateHook(controlVtable[9], reinterpret_cast<void*>(controlStopHook), reinterpret_cast<void**>(&originalControlStop)) == MH_OK &&
+              MH_CreateHook(filterVtable[4], reinterpret_cast<void*>(filterStopHook), reinterpret_cast<void**>(&originalFilterStop)) == MH_OK &&
+              MH_CreateHook(filterVtable[5], reinterpret_cast<void*>(filterPauseHook), reinterpret_cast<void**>(&originalFilterPause)) == MH_OK;
     IMediaSeeking* seeking = nullptr;
     if (ok && SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&seeking)))) {
         auto seekVtable = *reinterpret_cast<void***>(seeking);
@@ -614,6 +904,22 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
         ok = false;
     }
     if (!ok) return false;
+
+    IDirectSound8* ds8 = nullptr;
+    if (SUCCEEDED(DirectSoundCreate8(nullptr, &ds8, nullptr)) && ds8) {
+        WAVEFORMATEX wfx{ WAVE_FORMAT_PCM, 2, 48000, 288000, 6, 24, 0 };
+        DSBUFFERDESC desc{};
+        desc.dwSize = sizeof(desc);
+        desc.dwBufferBytes = 28800;
+        desc.lpwfxFormat = &wfx;
+        IDirectSoundBuffer* buf = nullptr;
+        if (SUCCEEDED(ds8->CreateSoundBuffer(&desc, &buf, nullptr)) && buf) {
+            auto bufV = *reinterpret_cast<void***>(buf);
+            MH_CreateHook(bufV[18], reinterpret_cast<void*>(dsStopHook), reinterpret_cast<void**>(&originalDsStop));
+            buf->Release();
+        }
+        ds8->Release();
+    }
 
     IBaseFilter* seamless = createSonyFilterInstance(L"SeamlessFilter.ax", L"{6AF73F1F-1266-46E6-9A36-EE75E4BA10BB}");
     if (!seamless) return false;

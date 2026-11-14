@@ -14,6 +14,18 @@ enum class PreReadDecision {
     FormatChanged   // Next track differs in bit depth, sample rate, or channel count
 };
 
+enum class PauseDeferralStatus {
+    None,
+    Active,
+    CompletedDrain,
+    CancelledStop,
+    CancelledSeek,
+    CancelledTrackChange,
+    CancelledManualPause,
+    CancelledQuit,
+    TimedOut
+};
+
 enum class ResetReason {
     NewSegment,
     Seek,
@@ -56,11 +68,16 @@ struct GraphState {
     PreReadDecision preReadDecision = PreReadDecision::Unknown;
     bool eosPending = false;
     bool eosDelivered = false;
+    bool formatChangePauseDeferred = false;
+    bool formatChangePauseCompleted = false;
+    PauseDeferralStatus pauseDeferralStatus = PauseDeferralStatus::None;
     bool formatChangeStopDeferred = false;
     bool formatChangeCompleted = false;
     uint32_t downstreamEosDeliveredCount = 0;
     uint32_t seamlessTransitionCount = 0;
     ResetReason lastResetReason = ResetReason::NewSegment;
+
+    bool isPauseDeferralActive() const { return pauseDeferralStatus == PauseDeferralStatus::Active; }
 };
 
 class Tracker {
@@ -249,6 +266,9 @@ public:
     void onSeekPositions(void* graphKey, bool modifiesCurrent, LONGLONG currentPos, bool modifiesStop, LONGLONG stopPos) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
+        if (s.isPauseDeferralActive()) {
+            cancelFormatChangePause(graphKey, PauseDeferralStatus::CancelledSeek);
+        }
         clearSegmentCounters(s, ResetReason::Seek);
         if (modifiesStop && stopPos >= 0) {
             s.stopPosition = stopPos;
@@ -264,8 +284,12 @@ public:
         const auto* s = findGraph(graphKey);
         if (!s) return false;
         if (!s->active24) return false;
-        if (s->preReadDecision != PreReadDecision::FormatChanged) return false;
+        if (s->preReadDecision == PreReadDecision::SameFormat24) return false;
         if (s->upstreamEosCount == 0) return false;
+        if (s->formatChangePauseCompleted || s->formatChangeCompleted) return false;
+        if (s->pauseDeferralStatus != PauseDeferralStatus::None && s->pauseDeferralStatus != PauseDeferralStatus::Active) {
+            return false;
+        }
         if (!s->eosDelivered) return true;
         if (s->hasStopPosition && s->hasCurrentPosition && s->currentPosition < s->stopPosition) {
             return true;
@@ -274,6 +298,30 @@ public:
             return true;
         }
         return false;
+    }
+
+    void markFormatChangePauseDeferred(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.formatChangePauseDeferred = true;
+        s.pauseDeferralStatus = PauseDeferralStatus::Active;
+    }
+
+    void onFormatChangePauseCompleted(void* graphKey, PauseDeferralStatus status = PauseDeferralStatus::CompletedDrain) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.formatChangePauseCompleted = true;
+        s.formatChangePauseDeferred = false;
+        s.pauseDeferralStatus = status;
+        s.eosPending = false;
+    }
+
+    void cancelFormatChangePause(void* graphKey, PauseDeferralStatus status) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.formatChangePauseDeferred = false;
+        s.pauseDeferralStatus = status;
+        s.eosPending = false;
     }
 
     void markFormatChangeStopDeferred(void* graphKey) {
@@ -341,6 +389,25 @@ private:
     }
 
     static void clearSegmentCounters(GraphState& s, ResetReason reason) {
+        if (s.isPauseDeferralActive()) {
+            if (reason == ResetReason::Stop) {
+                s.pauseDeferralStatus = PauseDeferralStatus::CancelledStop;
+            } else if (reason == ResetReason::Seek) {
+                s.pauseDeferralStatus = PauseDeferralStatus::CancelledSeek;
+            } else if (reason == ResetReason::ManualTrackChange) {
+                s.pauseDeferralStatus = PauseDeferralStatus::CancelledTrackChange;
+            } else {
+                s.pauseDeferralStatus = PauseDeferralStatus::None;
+            }
+        } else if (s.pauseDeferralStatus == PauseDeferralStatus::CancelledSeek ||
+                   s.pauseDeferralStatus == PauseDeferralStatus::CancelledStop ||
+                   s.pauseDeferralStatus == PauseDeferralStatus::CancelledTrackChange ||
+                   s.pauseDeferralStatus == PauseDeferralStatus::CancelledManualPause ||
+                   s.pauseDeferralStatus == PauseDeferralStatus::CancelledQuit) {
+            // Preserve explicit cancellation status across segment counter clear
+        } else {
+            s.pauseDeferralStatus = PauseDeferralStatus::None;
+        }
         s.upstreamSamples = 0;
         s.upstreamBytes = 0;
         s.upstreamLastEndTime = -1;
@@ -355,6 +422,8 @@ private:
         s.downstreamHasTimestamp = false;
         s.hasStopPosition = false;
         s.hasCurrentPosition = false;
+        s.formatChangePauseDeferred = false;
+        s.formatChangePauseCompleted = false;
         s.formatChangeStopDeferred = false;
         s.formatChangeCompleted = false;
         s.preReadDecision = PreReadDecision::Unknown;
