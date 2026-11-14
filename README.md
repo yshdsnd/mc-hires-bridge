@@ -92,8 +92,9 @@ cmake --build build-x64 --config Release
 cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON -DMC_BRIDGE_BUILD_EXPERIMENTS=ON
 cmake --build build-Win32 --config Release
 # 通常版の確認は必要なときだけ実行
-cmake --build build-Win32 --config Release --target bridge_status_tests
+cmake --build build-Win32 --config Release --target bridge_status_tests track_tail_tests
 ./build-Win32/Release/bridge_status_tests.exe
+./build-Win32/Release/track_tail_tests.exe
 ```
 
 WAV試験用ターゲットはオプションを有効にしたうえで個別指定します。[試験版のビルド手順](docs/wav192-experiment.md)を参照してください。
