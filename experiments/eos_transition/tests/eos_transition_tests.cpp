@@ -1168,11 +1168,142 @@ void testPlaylistEndDrainWithTrackTailCheck() {
     CHECK(a.nextTrackDetected == false);
 }
 
+// Test 11: IMediaControl::Pause deferral on automatic format change (Issue #23)
+void testPauseDeferralOnFormatChange() {
+    std::printf("[TEST 11] IMediaControl::Pause deferral on format change (OpcDSPlay.dll+0xDAC9)...\n");
+    eosTransition::Tracker tracker;
+    void* graph = reinterpret_cast<void*>(0xBB01);
+    tracker.onGraphActivated(graph, true, 48000, 2, 24);
+
+    const size_t track1Frames = 24000; // 500ms at 48kHz
+    std::vector<uint8_t> pcmStream;
+    trackTail::appendSynthesizedTrack(pcmStream, 48000, 24, track1Frames, false);
+
+    const REFERENCE_TIME segDuration = static_cast<REFERENCE_TIME>((track1Frames * 10000000ULL) / 48000ULL);
+    tracker.onUpstreamNewSegment(graph, 0, segDuration, 1.0);
+    tracker.onStopPositionReported(graph, segDuration);
+
+    const uint32_t chunkBytes = 4800 * 6; // 100ms
+    for (int i = 0; i < 5; ++i) {
+        REFERENCE_TIME sStart = static_cast<REFERENCE_TIME>(i) * 1000000LL;
+        REFERENCE_TIME sEnd = static_cast<REFERENCE_TIME>(i + 1) * 1000000LL;
+        tracker.onUpstreamSamplePreReceive(graph, chunkBytes);
+        tracker.onUpstreamSample(graph, chunkBytes, true, sStart, sEnd);
+    }
+
+    // Upstream FLAC finish -> Event 3841 -> Pre-read failure (FormatChanged)
+    tracker.onUpstreamEndOfStream(graph);
+    tracker.onPreReadDecision(graph, eosTransition::PreReadDecision::FormatChanged);
+    CHECK(tracker.isFormatChangePending(graph) == true);
+
+    // OpcDSPlay.dll calls Pause() ~52ms after 3841: Pause deferral starts!
+    tracker.markFormatChangePauseDeferred(graph);
+    const auto* st = tracker.findGraph(graph);
+    CHECK(st != nullptr && st->formatChangePauseDeferred == true);
+
+    // Audio in pipeline continues draining through EQ (first 4 chunks)
+    for (int i = 0; i < 4; ++i) {
+        REFERENCE_TIME sStart = static_cast<REFERENCE_TIME>(i) * 1000000LL;
+        REFERENCE_TIME sEnd = static_cast<REFERENCE_TIME>(i + 1) * 1000000LL;
+        tracker.onCurrentPositionReported(graph, sEnd);
+        CHECK(!tracker.onDownstreamSample(graph, chunkBytes, true, sStart, sEnd));
+        CHECK(tracker.isFormatChangePending(graph) == true);
+    }
+
+    // Final chunk 4 reaches EQ: triggers EOS delivery once to EQ
+    REFERENCE_TIME finalStart = 4000000LL;
+    REFERENCE_TIME finalEnd = 5000000LL;
+    tracker.onCurrentPositionReported(graph, finalEnd);
+    CHECK(tracker.onDownstreamSample(graph, chunkBytes, true, finalStart, finalEnd));
+    CHECK(st->eosDelivered == true);
+    CHECK(st->downstreamEosDeliveredCount == 1);
+
+    // DirectSound drains to track end (curPos >= stopPos)
+    tracker.onCurrentPositionReported(graph, segDuration);
+    CHECK(tracker.isFormatChangePending(graph) == false);
+
+    // Deferred Pause completes cleanly
+    tracker.onFormatChangePauseCompleted(graph);
+    CHECK(st->formatChangePauseCompleted == true);
+    CHECK(st->formatChangePauseDeferred == false);
+
+    // Verify Track 1 tail completeness using #19 analyzer
+    auto a1 = trackTail::analyzeStream(pcmStream.data(), pcmStream.size(), 48000, 24, track1Frames);
+    CHECK(a1.tailComplete == true);
+    CHECK(a1.missingTailFrames == 0);
+    CHECK(a1.missingTailMs == 0.0);
+    CHECK(a1.approx300msMissing == false);
+    CHECK(a1.track1LastFrame == track1Frames);
+
+    // Subsequent SetPositions and Track 2 open proceed cleanly
+    tracker.onSeekPositions(graph, true, 0, false, -1);
+    const size_t track2Frames = 12000;
+    trackTail::appendSynthesizedTrack(pcmStream, 48000, 16, track2Frames, true);
+
+    auto a2 = trackTail::analyzeStream(pcmStream.data(), track1Frames * 6, 48000, 24, track1Frames);
+    CHECK(a2.tailComplete == true);
+    CHECK(a2.missingTailFrames == 0);
+}
+
+// Test 12: Observation mode vs Deferral mode behavior (Issue #23)
+void testPauseModeSwitching() {
+    std::printf("[TEST 12] Observation mode (MC_BRIDGE_PAUSE_MODE=observe) vs Deferral mode...\n");
+    eosTransition::Tracker tracker;
+    void* graph = reinterpret_cast<void*>(0xBB02);
+    tracker.onGraphActivated(graph, true, 48000, 2, 24);
+    tracker.onUpstreamNewSegment(graph, 0, 230000000LL, 1.0);
+    tracker.onUpstreamSamplePreReceive(graph, 4800 * 6);
+    tracker.onUpstreamSample(graph, 4800 * 6, true, 0, 1000000LL);
+    tracker.onUpstreamEndOfStream(graph);
+    tracker.onPreReadDecision(graph, eosTransition::PreReadDecision::FormatChanged);
+
+    // In Observation mode: format change is detected, but pause is NOT deferred
+    CHECK(tracker.isFormatChangePending(graph) == true);
+    const auto* st = tracker.findGraph(graph);
+    CHECK(st->formatChangePauseDeferred == false);
+
+    // When Deferral mode is active: Pause is explicitly deferred
+    tracker.markFormatChangePauseDeferred(graph);
+    CHECK(st->formatChangePauseDeferred == true);
+
+    tracker.onFormatChangePauseCompleted(graph);
+    CHECK(st->formatChangePauseCompleted == true);
+    CHECK(tracker.isFormatChangePending(graph) == false);
+}
+
+// Test 13: Non-format-change Pause operations are NEVER deferred (Issue #23)
+void testNonFormatChangePauseNeverDeferred() {
+    std::printf("[TEST 13] Non-format-change Pause operations are never deferred...\n");
+    eosTransition::Tracker tracker;
+    void* graph = reinterpret_cast<void*>(0xBB03);
+    tracker.onGraphActivated(graph, true, 48000, 2, 24);
+    tracker.onUpstreamNewSegment(graph, 0, 230000000LL, 1.0);
+
+    // Subcase 13A: Normal playback in progress (upstream hasn't finished, no 3841)
+    tracker.onUpstreamSample(graph, 4800 * 6, true, 0, 1000000LL);
+    CHECK(tracker.isFormatChangePending(graph) == false); // Must NOT defer user pause!
+
+    // Subcase 13B: Same-format pre-read succeeded (48k/24 -> 48k/24)
+    tracker.onUpstreamEndOfStream(graph);
+    tracker.onPreReadDecision(graph, eosTransition::PreReadDecision::SameFormat24);
+    CHECK(tracker.isFormatChangePending(graph) == false); // Must NOT defer same-format pause!
+
+    // Subcase 13C: User manual seek in progress
+    tracker.onSeekPositions(graph, true, 50000000LL, false, -1);
+    CHECK(tracker.isFormatChangePending(graph) == false); // Must NOT defer seek-associated pause!
+
+    // Subcase 13D: 16-bit non-target graph
+    void* graph16 = reinterpret_cast<void*>(0xBB04);
+    tracker.onGraphActivated(graph16, false, 48000, 2, 16);
+    tracker.onUpstreamEndOfStream(graph16);
+    CHECK(tracker.isFormatChangePending(graph16) == false); // Must NOT defer 16-bit graph!
+}
+
 } // namespace
 
 int main() {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    std::printf("=== Issue #20 / #21 Experimental EOS Transition Tests ===\n");
+    std::printf("=== Issue #20 / #21 / #23 Experimental EOS Transition Tests ===\n");
 
     testArbitraryDurationsAndOffsets();
     testDuplicateEosCalls();
@@ -1186,10 +1317,13 @@ int main() {
     testMediaSeekingComVtableHooks();
     testDeferredFormatChangeWithTrackTailCheck();
     testPlaylistEndDrainWithTrackTailCheck();
+    testPauseDeferralOnFormatChange();
+    testPauseModeSwitching();
+    testNonFormatChangePauseNeverDeferred();
 
     if (SUCCEEDED(co)) CoUninitialize();
     if (g_failures == 0) {
-        std::printf("=== ALL ISSUE #20 / #21 EOS TRANSITION TESTS PASSED ===\n");
+        std::printf("=== ALL ISSUE #20 / #21 / #23 EOS TRANSITION TESTS PASSED ===\n");
         return 0;
     }
     std::printf("=== %d TEST ASSERTION(S) FAILED ===\n", g_failures);

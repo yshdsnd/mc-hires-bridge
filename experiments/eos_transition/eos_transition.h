@@ -56,6 +56,8 @@ struct GraphState {
     PreReadDecision preReadDecision = PreReadDecision::Unknown;
     bool eosPending = false;
     bool eosDelivered = false;
+    bool formatChangePauseDeferred = false;
+    bool formatChangePauseCompleted = false;
     bool formatChangeStopDeferred = false;
     bool formatChangeCompleted = false;
     uint32_t downstreamEosDeliveredCount = 0;
@@ -264,8 +266,9 @@ public:
         const auto* s = findGraph(graphKey);
         if (!s) return false;
         if (!s->active24) return false;
-        if (s->preReadDecision != PreReadDecision::FormatChanged) return false;
+        if (s->preReadDecision == PreReadDecision::SameFormat24) return false;
         if (s->upstreamEosCount == 0) return false;
+        if (s->formatChangePauseCompleted || s->formatChangeCompleted) return false;
         if (!s->eosDelivered) return true;
         if (s->hasStopPosition && s->hasCurrentPosition && s->currentPosition < s->stopPosition) {
             return true;
@@ -274,6 +277,20 @@ public:
             return true;
         }
         return false;
+    }
+
+    void markFormatChangePauseDeferred(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.formatChangePauseDeferred = true;
+    }
+
+    void onFormatChangePauseCompleted(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.formatChangePauseCompleted = true;
+        s.formatChangePauseDeferred = false;
+        s.eosPending = false;
     }
 
     void markFormatChangeStopDeferred(void* graphKey) {
@@ -355,6 +372,8 @@ private:
         s.downstreamHasTimestamp = false;
         s.hasStopPosition = false;
         s.hasCurrentPosition = false;
+        s.formatChangePauseDeferred = false;
+        s.formatChangePauseCompleted = false;
         s.formatChangeStopDeferred = false;
         s.formatChangeCompleted = false;
         s.preReadDecision = PreReadDecision::Unknown;
