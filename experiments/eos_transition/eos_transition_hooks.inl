@@ -199,16 +199,16 @@ static DsStopFn originalDsStop = nullptr;
 
 using EnterCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
 using LeaveCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
-using TryEnterCsFn = BOOL(WINAPI*)(LPCRITICAL_SECTION);
 using DispatchMsgFn = LRESULT(WINAPI*)(const MSG*);
 
-static EnterCsFn originalEnterCriticalSection = nullptr;
-static LeaveCsFn originalLeaveCriticalSection = nullptr;
-static TryEnterCsFn originalTryEnterCriticalSection = nullptr;
+static EnterCsFn originalOpcEnterCriticalSection = nullptr;
+static LeaveCsFn originalOpcLeaveCriticalSection = nullptr;
 static DispatchMsgFn originalDispatchMessageW = nullptr;
 
 static thread_local bool inLockHook = false;
 static thread_local bool inMsgHook = false;
+static std::atomic<bool> g_opcLockHooksAttached{false};
+static bool g_lockDiagEnabled = true;
 
 #include "eos_transition_diag.h"
 
@@ -233,6 +233,17 @@ static void initDiagMode() {
 #ifdef EXPERIMENT_PAUSE_DIAGNOSTICS
     g_diagEnabled = true;
 #endif
+
+    g_lockDiagEnabled = g_diagEnabled;
+    DWORD lockVar = GetEnvironmentVariableW(L"MC_BRIDGE_LOCK_DIAG", envBuf, 32);
+    if (lockVar > 0) {
+        if (_wcsicmp(envBuf, L"0") == 0 || _wcsicmp(envBuf, L"off") == 0 || _wcsicmp(envBuf, L"false") == 0) {
+            g_lockDiagEnabled = false;
+        } else if (_wcsicmp(envBuf, L"1") == 0 || _wcsicmp(envBuf, L"on") == 0 || _wcsicmp(envBuf, L"true") == 0) {
+            g_lockDiagEnabled = true;
+        }
+    }
+
     eosDiag::DiagClock::init();
 }
 
@@ -261,27 +272,23 @@ static void recordDiag(const char* event, void* graphKey, void* callerAddr, uint
     ReleaseSRWLockExclusive(&mutex);
 }
 
-static void WINAPI enterCriticalSectionHook(LPCRITICAL_SECTION cs) {
-    if (inLockHook || !g_diagEnabled || !cs) {
-        if (originalEnterCriticalSection) originalEnterCriticalSection(cs);
+// Targeted IAT lock hooks on OpcDSPlay.dll (Issue #28)
+static void WINAPI opcDsPlayEnterCsHook(LPCRITICAL_SECTION cs) {
+    if (!cs || inLockHook || !g_lockDiagEnabled) {
+        if (originalOpcEnterCriticalSection) originalOpcEnterCriticalSection(cs);
         else EnterCriticalSection(cs);
         return;
     }
-    void* caller = _ReturnAddress();
-    const char* mod = eosDiag::getModuleTracker().findModule(caller);
-    if (!mod) {
-        originalEnterCriticalSection(cs);
-        return;
-    }
-
     inLockHook = true;
+    void* caller = _ReturnAddress();
     uint64_t tTry = eosDiag::DiagClock::monotonicMs();
     DWORD tid = GetCurrentThreadId();
     eosDiag::getLockTracker().onTry(cs, caller, tid, tTry);
     recordDiag("ENGINE_LOCK_TRY", cs, caller, reinterpret_cast<uint64_t>(cs), 0, S_OK);
     inLockHook = false;
 
-    originalEnterCriticalSection(cs);
+    if (originalOpcEnterCriticalSection) originalOpcEnterCriticalSection(cs);
+    else EnterCriticalSection(cs);
 
     inLockHook = true;
     uint64_t tAcquired = eosDiag::DiagClock::monotonicMs();
@@ -290,51 +297,49 @@ static void WINAPI enterCriticalSectionHook(LPCRITICAL_SECTION cs) {
     inLockHook = false;
 }
 
-static void WINAPI leaveCriticalSectionHook(LPCRITICAL_SECTION cs) {
-    if (inLockHook || !g_diagEnabled || !cs) {
-        if (originalLeaveCriticalSection) originalLeaveCriticalSection(cs);
+static void WINAPI opcDsPlayLeaveCsHook(LPCRITICAL_SECTION cs) {
+    if (!cs || inLockHook || !g_lockDiagEnabled) {
+        if (originalOpcLeaveCriticalSection) originalOpcLeaveCriticalSection(cs);
         else LeaveCriticalSection(cs);
         return;
     }
-    void* caller = _ReturnAddress();
-    const char* mod = eosDiag::getModuleTracker().findModule(caller);
-    if (!mod) {
-        originalLeaveCriticalSection(cs);
-        return;
-    }
-
     inLockHook = true;
+    void* caller = _ReturnAddress();
     uint64_t tRelease = eosDiag::DiagClock::monotonicMs();
     DWORD tid = GetCurrentThreadId();
     uint64_t heldMs = eosDiag::getLockTracker().onReleased(cs, caller, tid, tRelease);
     recordDiag("ENGINE_LOCK_RELEASED", cs, caller, reinterpret_cast<uint64_t>(cs), heldMs, S_OK);
     inLockHook = false;
 
-    originalLeaveCriticalSection(cs);
+    if (originalOpcLeaveCriticalSection) originalOpcLeaveCriticalSection(cs);
+    else LeaveCriticalSection(cs);
 }
 
-static BOOL WINAPI tryEnterCriticalSectionHook(LPCRITICAL_SECTION cs) {
-    if (inLockHook || !g_diagEnabled || !cs) {
-        return originalTryEnterCriticalSection ? originalTryEnterCriticalSection(cs) : TryEnterCriticalSection(cs);
+static bool tryAttachOpcDsPlayLockHooks() {
+    if (!g_lockDiagEnabled || g_opcLockHooksAttached.load()) return g_opcLockHooksAttached.load();
+    HMODULE hOpc = GetModuleHandleW(L"OpcDSPlay.dll");
+    if (!hOpc) {
+        eosDiag::getHookStatusReporter().report("Engine.OpcDSPlay.IAT.EnterCriticalSection", "PENDING_MODULE_LOAD", S_FALSE);
+        return false;
     }
-    void* caller = _ReturnAddress();
-    const char* mod = eosDiag::getModuleTracker().findModule(caller);
-    if (!mod) {
-        return originalTryEnterCriticalSection(cs);
-    }
-
-    inLockHook = true;
-    uint64_t tTry = eosDiag::DiagClock::monotonicMs();
-    DWORD tid = GetCurrentThreadId();
-    BOOL ok = originalTryEnterCriticalSection(cs);
-    if (ok) {
-        eosDiag::getLockTracker().onAcquired(cs, caller, tid, tTry);
-        recordDiag("ENGINE_LOCK_TRY_SUCCEEDED", cs, caller, reinterpret_cast<uint64_t>(cs), 0, S_OK);
+    bool okEnter = eosDiag::hookIat(hOpc, "KERNEL32.dll", "EnterCriticalSection",
+                                    reinterpret_cast<void*>(opcDsPlayEnterCsHook),
+                                    reinterpret_cast<void**>(&originalOpcEnterCriticalSection));
+    bool okLeave = eosDiag::hookIat(hOpc, "KERNEL32.dll", "LeaveCriticalSection",
+                                    reinterpret_cast<void*>(opcDsPlayLeaveCsHook),
+                                    reinterpret_cast<void**>(&originalOpcLeaveCriticalSection));
+    if (okEnter && okLeave) {
+        g_opcLockHooksAttached.store(true);
+        eosDiag::getHookStatusReporter().report("Engine.OpcDSPlay.IAT.EnterCriticalSection", "OK", S_OK);
+        eosDiag::getHookStatusReporter().report("Engine.OpcDSPlay.IAT.LeaveCriticalSection", "OK", S_OK);
+        recordDiag("DIAG_HOOK_STATUS", hOpc, nullptr, 1, 1, S_OK);
+        return true;
     } else {
-        recordDiag("ENGINE_LOCK_TRY_FAILED", cs, caller, reinterpret_cast<uint64_t>(cs), 0, S_OK);
+        eosDiag::getHookStatusReporter().report("Engine.OpcDSPlay.IAT.EnterCriticalSection", okEnter ? "OK" : "FAILED", okEnter ? S_OK : E_FAIL);
+        eosDiag::getHookStatusReporter().report("Engine.OpcDSPlay.IAT.LeaveCriticalSection", okLeave ? "OK" : "FAILED", okLeave ? S_OK : E_FAIL);
+        recordDiag("DIAG_HOOK_STATUS", hOpc, nullptr, okEnter ? 1 : 0, okLeave ? 1 : 0, E_FAIL);
+        return false;
     }
-    inLockHook = false;
-    return ok;
 }
 
 static LRESULT WINAPI dispatchMessageWHook(const MSG* lpMsg) {
@@ -753,6 +758,7 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
 
 static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
     if (!inEosHook) {
+        tryAttachOpcDsPlayLockHooks();
         void* caller = _ReturnAddress();
         void* key = graphKeyFromObject(self);
         bool isKnownCaller = isOpcDsPlayPauseCaller(caller);
@@ -849,6 +855,7 @@ static HRESULT STDMETHODCALLTYPE filterPauseHook(IMediaFilter* self) {
 
 static HRESULT STDMETHODCALLTYPE controlStopHook(IMediaControl* self) {
     if (!inEosHook) {
+        tryAttachOpcDsPlayLockHooks();
         void* caller = _ReturnAddress();
         void* key = graphKeyFromObject(self);
         recordDiag("BOUNDARY_CONTROL_STOP_ENTER", key, caller, 0, 0, S_OK);
@@ -1103,41 +1110,38 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
               MH_CreateHook(filterVtable[4], reinterpret_cast<void*>(filterStopHook), reinterpret_cast<void**>(&originalFilterStop)) == MH_OK &&
               MH_CreateHook(filterVtable[5], reinterpret_cast<void*>(filterPauseHook), reinterpret_cast<void**>(&originalFilterPause)) == MH_OK;
     IMediaSeeking* seeking = nullptr;
+    bool seekingOk = false;
     if (ok && SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&seeking)))) {
         auto seekVtable = *reinterpret_cast<void***>(seeking);
-        ok = MH_CreateHook(seekVtable[11], reinterpret_cast<void*>(getStopPositionHook), reinterpret_cast<void**>(&originalGetStopPosition)) == MH_OK &&
-             MH_CreateHook(seekVtable[12], reinterpret_cast<void*>(getCurrentPositionHook), reinterpret_cast<void**>(&originalGetCurrentPosition)) == MH_OK &&
-             MH_CreateHook(seekVtable[14], reinterpret_cast<void*>(setPositionsHook), reinterpret_cast<void**>(&originalSetPositions)) == MH_OK;
+        seekingOk = MH_CreateHook(seekVtable[11], reinterpret_cast<void*>(getStopPositionHook), reinterpret_cast<void**>(&originalGetStopPosition)) == MH_OK &&
+                    MH_CreateHook(seekVtable[12], reinterpret_cast<void*>(getCurrentPositionHook), reinterpret_cast<void**>(&originalGetCurrentPosition)) == MH_OK &&
+                    MH_CreateHook(seekVtable[14], reinterpret_cast<void*>(setPositionsHook), reinterpret_cast<void**>(&originalSetPositions)) == MH_OK;
         seeking->Release();
-    } else {
-        ok = false;
     }
-    if (!ok) return false;
+    if (!ok || !seekingOk) return false;
+
+    eosDiag::getHookStatusReporter().report("DirectShow.ControlPause", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
+    eosDiag::getHookStatusReporter().report("DirectShow.ControlStop", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
+    eosDiag::getHookStatusReporter().report("DirectShow.FilterPause", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
+    eosDiag::getHookStatusReporter().report("DirectShow.FilterStop", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
+    eosDiag::getHookStatusReporter().report("DirectShow.Seeking", seekingOk ? "OK" : "FAILED", seekingOk ? S_OK : E_FAIL);
 
     if (g_diagEnabled) {
         eosDiag::getModuleTracker().refresh();
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32) {
-            auto pEnter = GetProcAddress(hKernel32, "EnterCriticalSection");
-            auto pLeave = GetProcAddress(hKernel32, "LeaveCriticalSection");
-            auto pTry = GetProcAddress(hKernel32, "TryEnterCriticalSection");
-            if (pEnter && !originalEnterCriticalSection) {
-                MH_CreateHook(pEnter, reinterpret_cast<void*>(enterCriticalSectionHook), reinterpret_cast<void**>(&originalEnterCriticalSection));
-            }
-            if (pLeave && !originalLeaveCriticalSection) {
-                MH_CreateHook(pLeave, reinterpret_cast<void*>(leaveCriticalSectionHook), reinterpret_cast<void**>(&originalLeaveCriticalSection));
-            }
-            if (pTry && !originalTryEnterCriticalSection) {
-                MH_CreateHook(pTry, reinterpret_cast<void*>(tryEnterCriticalSectionHook), reinterpret_cast<void**>(&originalTryEnterCriticalSection));
-            }
-        }
         HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
         if (!hUser32) hUser32 = LoadLibraryW(L"user32.dll");
         if (hUser32) {
             auto pDisp = GetProcAddress(hUser32, "DispatchMessageW");
             if (pDisp && !originalDispatchMessageW) {
-                MH_CreateHook(pDisp, reinterpret_cast<void*>(dispatchMessageWHook), reinterpret_cast<void**>(&originalDispatchMessageW));
+                auto mhDisp = MH_CreateHook(pDisp, reinterpret_cast<void*>(dispatchMessageWHook), reinterpret_cast<void**>(&originalDispatchMessageW));
+                eosDiag::getHookStatusReporter().report("User32.DispatchMessageW", mhDisp == MH_OK ? "OK" : "FAILED", mhDisp == MH_OK ? S_OK : E_FAIL);
             }
+        }
+        if (g_lockDiagEnabled) {
+            tryAttachOpcDsPlayLockHooks();
+        } else {
+            eosDiag::getHookStatusReporter().report("Engine.OpcDSPlay.IAT.EnterCriticalSection", "DISABLED_BY_CONFIG", S_OK);
+            eosDiag::getHookStatusReporter().report("Engine.OpcDSPlay.IAT.LeaveCriticalSection", "DISABLED_BY_CONFIG", S_OK);
         }
     }
 

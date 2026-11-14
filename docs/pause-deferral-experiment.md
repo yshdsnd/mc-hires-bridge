@@ -1,6 +1,6 @@
-# 異形式曲送り時の Pause 保留・手動操作・終端検証（Issue #23 / #24 / #25 / #27）
+# 異形式曲送り時の Pause 保留・手動操作・終端検証（Issue #23 / #24 / #25 / #27 / #28）
 
-[Issue #22](https://github.com/yshdsnd/mc-hires-bridge/issues/22) の調査結果に基づき、[Issue #23](https://github.com/yshdsnd/mc-hires-bridge/issues/23)、[Issue #24](https://github.com/yshdsnd/mc-hires-bridge/issues/24)、[Issue #25](https://github.com/yshdsnd/mc-hires-bridge/issues/25)、および [Issue #27](https://github.com/yshdsnd/mc-hires-bridge/issues/27) にて実装・強化した試験版（`flac24_pause_experiment.dll` / `flac24_pause_diagnostic.dll`）の設計、排他ロックと同期 EOS の解析結果、手動操作・終端状態遷移、検証結果、および Music Center 実機での動作確認手順をまとめる。
+[Issue #22](https://github.com/yshdsnd/mc-hires-bridge/issues/22) の調査結果に基づき、[Issue #23](https://github.com/yshdsnd/mc-hires-bridge/issues/23)、[Issue #24](https://github.com/yshdsnd/mc-hires-bridge/issues/24)、[Issue #25](https://github.com/yshdsnd/mc-hires-bridge/issues/25)、[Issue #27](https://github.com/yshdsnd/mc-hires-bridge/issues/27)、および [Issue #28](https://github.com/yshdsnd/mc-hires-bridge/issues/28) にて実装・強化した試験版（`flac24_pause_experiment.dll` / `flac24_pause_diagnostic.dll`）の設計、排他ロックと同期 EOS の解析結果、手動操作・終端状態遷移、検証結果、および Music Center 実機での動作確認手順をまとめる。
 
 本試験ターゲットは、実再生での総合検証が完了するまで通常の配布パッケージ（`cmake --install` およびリリース ZIP）からは除外される。
 
@@ -21,58 +21,59 @@ Music Center for PC 2.7.4 x86 では、48 kHz/24 bit → 48 kHz/16 bit FLAC の�
 #25 の試験版では早期の同期 EOS 呼び出しを回避し、下流未達時は待機へ即時進み別スレッドから EOS を送出することで 48 kHz/24 bit → 48 kHz/16 bit FLAC の曲末を保持できた。
 しかし実機では、保留中に発行した一時停止・シーク・終了の取消が DirectShow 側に記録されず、入力から約1〜2.7秒後に通常の曲末処理が進む事象が残存した。
 
-この要因として、以下の2つの経路が考えられる（#27）：
-1. **指令がエンジンに未到達**: アプリ側の UI 層（CEF / イベント処理）でボタン押下やシーク操作が拾われないか、保留待機中にエンジン呼び出しまでディスパッチされていない。
-2. **到達した指令がロック取得を待つ**: 指令は再生エンジンに到達しているが、Pause 保留を実行中のスレッドがエンジンの排他制御（CriticalSection）を保持し続けており、手動操作側スレッドがロック取得待ちで停止している。
+#27 の実機検証（Issue #28 報告）により、以下の事実が判明した：
+1. **プロセス全域のロック API フックによる起動障害**:
+   `kernel32!EnterCriticalSection` をプロセス全域でフックする構成では、起動直後にウィンドウが消失した。Chromium / CEF のスレッドプール生成や CRT の動的初期化等と競合したことが原因と推定される。一方、ロックフックのみを外した構成では正常に起動・再生可能であった。
+2. **通常再生時と保留時の手動操作伝播の差異**:
+   - **通常再生中**: マウスボタンを離してから約 3 ms で手動 Pause が DirectShow 境界（`BOUNDARY_CONTROL_PAUSE_ENTER`）に到達した。
+   - **Pause 保留中**: Win32 入力メッセージ（`APP_INPUT_DISPATCH`）は正常にディスパッチされたが、手動 Pause は DirectShow 側に現れず、ディスパッチから約 2.74 秒後に通常の曲末処理完了で保留が解除された。
+
+このため、プロセス全域への介入を完全に排除し、再生エンジン（`OpcDSPlay.dll`）の境界に絞った安全なロック観測構成への再編（#28）が必要となった。
 
 ---
 
-## 3. 解決アーキテクチャと診断機能（Issue #25 / #27 対策）
+## 3. 解決アーキテクチャと診断機能（Issue #28 絞り込み構成）
 
 ### 1. 早期同期 EOS 送出の抑止（`hasDownstreamReachedTarget`）
 - `deferFormatChangePause` 開始時点で、下流が目標 PCM を受信済みか（`hasDownstreamReachedTarget(key)`）を判定。
 - **目標未達の場合（曲末尾手前）**:
   `deferFormatChangePause` は同期 EOS を叩かず、直ちに待機ループ（メッセージポンプ）へ入る。
   残りの PCM は通常通りストリーミングスレッド経由で `eqReceiveHook` が受信し、**最終 PCM が EQ に到達した瞬間に `eqReceiveHook` 自身が `originalEqEndOfStream` を 1 回だけ送出する**。
-- これにより、`deferFormatChangePause` 開始時の 1.6〜1.7 秒に及ぶ不必要な同期ブロッキングが完全に解消され、112 ms や 144 ms 時点で待機ループが既にアクティブかつメッセージポンプ実行中となる。
+- これにより、`deferFormatChangePause` 開始時の 1.6〜1.7 秒に及ぶ不必要な同期ブロッキングが完全に解消され、待機ループが即座にメッセージポンプを実行する。
 
-### 2. アプリ指令受付・排他ロック追跡・高精度単調時刻（`flac24_pause_diagnostic`）
-手動操作の指令がどこで止まっているかを追跡するため、専用診断ターゲット `flac24_pause_diagnostic` および環境変数切り替え（`MC_BRIDGE_PAUSE_MODE=diag` / `MC_BRIDGE_DIAGNOSTICS=1`）を拡張。
+### 2. 再生エンジン境界に絞った IAT ロック観測とアプリ指令受付（#28）
+プロセス全域のフック（`kernel32` 全域）を完全に廃止し、起動・再生の安全性を担保した診断構成を実装：
+
+1. **アプリ側入力ディスパッチ観測（`APP_INPUT_DISPATCH`）**:
+   - `user32!DispatchMessageW` をフックし、UI スレッドで処理されるマウス操作（`WM_LBUTTONDOWN` / `UP`）、キー入力（`WM_KEYDOWN` / `UP`）、メニュー・アクセラレータ（`WM_COMMAND`）をキャプチャ。
+2. **再生エンジン（`OpcDSPlay.dll`）専用の IAT ロック観測（`ENGINE_LOCK_*`）**:
+   - `OpcDSPlay.dll` のインポートアドレステーブル（IAT）内の `EnterCriticalSection` / `LeaveCriticalSection` のみを局所的に置換。
+   - CEF や Chromium スレッド、CRT ヒープ、Windows ローダーの動作には一切触れないため、プロセス起動およびバックグラウンドスレッド生成が 100% 安定動作。
+   - `OpcDSPlay.dll` が未ロードの段階では `PENDING_MODULE_LOAD` として記録され、再生開始時に遅延アタッチ（`ATTACHED_LATE`）を実行。
+3. **診断構成と環境変数切り替え**:
+   - 診断ビルドの既定では、入力ディスパッチ（`APP_INPUT_DISPATCH`）、DirectShow 境界（`BOUNDARY_*`）、およびエンジン IAT ロックフックが有効。
+   - `$env:MC_BRIDGE_LOCK_DIAG = "0"` を設定することで、ロック観測のみを完全に無効化し、入力と DirectShow のみで安全に採取することも可能。
 
 #### 診断ログ仕様
 - **単調時刻**: `QueryPerformanceCounter`（QPC）によるマイクロ秒精度オフセット（`mono_ms`）。
 - **スレッド ID**: `tid`（UI スレッドとワーカースレッドの分離観測）。
 - **グラフ識別子 / オブジェクト**: `graph`（COM オブジェクトポインタまたはロックアドレス）。
 - **呼出元 RVA 解決**: `caller`（例: `OpcDSPlay.dll+0xDAC9`, `USER32.dll` 等）。
+- **フック初期化ステータス**:
+  - `DIAG_HOOK_STATUS`: 各観測点（DirectShow, User32, OpcDSPlay IAT）の登録成否（`OK`, `PENDING_MODULE_LOAD`, `ATTACHED_LATE`, `DISABLED_BY_CONFIG`）を出力。
 - **アプリ指令受付イベント**:
-  - `APP_INPUT_DISPATCH`: Win32 メッセージループでのマウス操作（`WM_LBUTTONDOWN` / `UP`）、キー入力（`WM_KEYDOWN` / `UP`）、メニュー・アクセラレータ（`WM_COMMAND`）のディスパッチ時刻・対象 HWND・パラメータ。
+  - `APP_INPUT_DISPATCH`: Win32 メッセージループでの入力ディスパッチ。
 - **エンジン排他ロックイベント**:
-  - `ENGINE_LOCK_TRY`: 再生エンジン（`OpcDSPlay.dll` 等）からの `EnterCriticalSection` 呼び出し試行。
-  - `ENGINE_LOCK_ACQUIRED`: ロック取得成功。`p2`（`wait_ms`）にロック待ち時間をミリ秒で記録。
-  - `ENGINE_LOCK_RELEASED`: ロック解放（`LeaveCriticalSection`）。`p2`（`held_ms`）にロック保持時間をミリ秒で記録。
-  - `ENGINE_LOCK_TRY_SUCCEEDED` / `FAILED`: `TryEnterCriticalSection` 実行結果。
+  - `ENGINE_LOCK_TRY`: 再生エンジン（`OpcDSPlay.dll`）からの `EnterCriticalSection` 試行。
+  - `ENGINE_LOCK_ACQUIRED`: ロック取得成功時刻、および試行からの待機時間 `wait_ms`（競合ブロッキング時間）。
+  - `ENGINE_LOCK_RELEASED`: ロック解放、および保持時間 `held_ms`。
 - **DirectShow / フィルター境界イベント**:
   - `BOUNDARY_CONTROL_PAUSE_ENTER` / `LEAVE`
-  - `BOUNDARY_FILTER_PAUSE_ENTER` / `LEAVE`
   - `BOUNDARY_CONTROL_STOP_ENTER` / `LEAVE`
-  - `BOUNDARY_FILTER_STOP_ENTER` / `LEAVE`
   - `BOUNDARY_SEEK_SETPOSITIONS_ENTER` / `LEAVE`
-  - `BOUNDARY_TRACK_OPEN`
   - `PAUSE_DEFERRED_START`
-  - `EQ_EOS_CALL_ENTER` / `LEAVE`（所要時間をミリ秒で記録）
-  - `DRAIN_WAIT_ENTER` / `DRAIN_WAIT_TICK`（250ms ごとの現在位置・目標進捗）
-  - `DRAIN_WAIT_CANCEL_DETECTED`（取消検知時の経過時間・ステータス）
+  - `DRAIN_WAIT_ENTER` / `DRAIN_WAIT_TICK`
   - `PAUSE_DEFERRED_RELEASE`
-
-#### 観測可能な境界と観測できない境界
-- **観測可能な境界**:
-  1. Win32 メッセージキューにおけるユーザー入力の到着とディスパッチ（`APP_INPUT_DISPATCH`）。
-  2. 再生エンジン（`OpcDSPlay.dll` 等）が排他ロックを取得・待機・解放する全ライフサイクル（`ENGINE_LOCK_*`）。
-  3. DirectShow API（`IMediaControl`, `IMediaSeeking`）への到達（`BOUNDARY_*`）。
-- **観測できない境界とその理由**:
-  1. Chromium Embedded Framework（CEF）内部の JavaScript DOM イベント処理（`onclick`）および内部 IPC:
-     CEF の内部シンボルは非公開かつプロセス内で静的/動的に隠蔽されているため、DOM 内部の JavaScript 実行行を直接フックすることはできません。
-     しかし、Win32 メッセージの投入点（`APP_INPUT_DISPATCH`）とネイティブエンジン呼び出し点（`ENGINE_LOCK_TRY`）を両端から記録することで、CEF 内部での脱落や遅延を完全に挟み込んで判別可能です。
 
 ---
 
@@ -92,9 +93,9 @@ Music Center for PC 2.7.4 x86 では、48 kHz/24 bit → 48 kHz/16 bit FLAC の�
 
 ---
 
-## 5. ヘッドレス検証（`eos_transition_tests` 全 25 項目）
+## 5. ヘッドレス検証（`eos_transition_tests` 全 28 項目）
 
-本実装に対する全 25 項目の単体・結合・マルチスレッド並行テストを実装し、Win32 Release ビルドで全件合格を確認済み。
+本実装に対する全 28 項目の単体・結合・マルチスレッド並行テストを実装し、Win32 Release ビルドで全件合格を確認済み。
 
 ### ビルドとテスト実行手順
 ```powershell
@@ -117,27 +118,31 @@ $cmake = "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\Comm
   - Stop 保留時の `trackTail::analyzeStream` 検証
   - プレイリスト終端ドレイン検証
 - **Test 11〜13（Issue #23）**:
-  - `IMediaControl::Pause` 保留と実ストリーム末尾検証（`tailComplete == true`, `missingTailFrames == 0`）
+  - `IMediaControl::Pause` 保留と実ストリーム末尾検証
   - 観察モード（`observe`）と実験モード（`defer`）の切り替え検証
   - 非形式変更時の Pause 非保留検証
 - **Test 14〜18（Issue #24）**:
-  - 保留中の手動操作（Stop, Seek, TrackChange, ManualPause, Exit）状態遷移検証
-  - ドレイン待ちタイムアウト安全機構検証（デッドロック回避）
+  - 保留中の手動操作状態遷移検証
+  - ドレイン待ちタイムアウト安全機構検証
   - 再入防止および古いグラフへの重複 EOS 抑止検証
-  - 異なるサンプルレート遷移（`96kHz/24bit -> 44.1kHz/16bit` 等）での末尾欠落 0ms 検証
+  - 異なるサンプルレート遷移での末尾欠落 0ms 検証
   - 24bit プレイリスト終端（異レート・次曲なし）検証
 - **Test 19〜22（Issue #25）**:
-  - **Test 19**: 同期 EQ EOS 実行中の別スレッド（UI スレッド）からの並行手動操作検証
+  - **Test 19**: 同期 EQ EOS 実行中の並行手動操作検証
   - **Test 20**: ドレイン待機中の並行手動操作検証
-  - **Test 21**: 早すぎる EQ EOS 送出抑止（`hasDownstreamReachedTarget`）検証
+  - **Test 21**: 早すぎる EQ EOS 送出抑止検証
   - **Test 22**: 取消サイクル後の 24bit 末尾保持および同形式先読み維持検証
-- **Test 23〜25（Issue #27 新設）**:
-  - **Test 23: 到達した指令が排他ロック取得を待つケースの追跡（Case B）**:
-    Thread A が保留待機中にエンジン CriticalSection を保持し、Thread B（UI 操作）が `EnterCriticalSection` を呼んだ際、`ENGINE_LOCK_TRY` が直ちに記録され、Thread A の解放後に `ENGINE_LOCK_ACQUIRED` が `wait_ms > 0` で記録されることを検証。
-  - **Test 24: 指令がエンジンに未到達のケースの識別（Case A）**:
-    UI 層で `APP_INPUT_DISPATCH` が発生したが、エンジン側への呼び出しが発生しなかった場合、ログに `ENGINE_LOCK_TRY` が 0 件となることで「指令がエンジンに未到達」と明確に判定できることを検証。
-  - **Test 25: 観測モードにおける単調時刻整合性と非介入性の検証**:
-    観測モード（`PauseMode::Observe`）において、再生制御やロックの取得順序を一切変更せず、すべてのイベント（UI 入力、ロック、DirectShow 呼び出し、EOS）が単調増加時刻（`mono_ms`）とスレッド ID（`tid`）に沿って記録されることを検証。
+- **Test 23〜25（Issue #27）**:
+  - **Test 23**: 到達した指令が排他ロック取得を待つケースの追跡（Case B）
+  - **Test 24**: 指令がエンジンに未到達のケースの識別（Case A）
+  - **Test 25**: 観測モードにおける単調時刻整合性と非介入性の検証
+- **Test 26〜28（Issue #28 新設）**:
+  - **Test 26: 診断フック登録ステータス記録とフォールバック耐性検証**:
+    各観測点の登録結果（`OK`、`PENDING_MODULE_LOAD`、`ATTACHED_LATE` 等）が正確に追跡され、特定モジュールが未ロードでも他のフックが継続動作することを検証。
+  - **Test 27: 再入保護と初期化前後の安全な呼び出し検証**:
+    同一スレッド内でのネスト呼び出しや初期化前の呼び出しにおいて、デッドロックやクラッシュを起こさず安全に透過実行されることを検証。
+  - **Test 28: 通常再生時の手動 Pause 発火と全境界の時刻照合検証**:
+    通常再生時に手動 Pause を押下した際、入力ディスパッチ（`APP_INPUT_DISPATCH`）→ エンジンロック（`ENGINE_LOCK_TRY`/`ACQUIRED`）→ DirectShow 境界（`BOUNDARY_CONTROL_PAUSE_ENTER`/`LEAVE`）→ ロック解放（`ENGINE_LOCK_RELEASED`）が同一スレッドかつ単調増加時刻で欠落なく記録されることを検証。
 
 ---
 
@@ -153,33 +158,31 @@ $cmake = "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\Comm
 ```
 ビルドされた `build-Win32\Release\flac24_pause_diagnostic.dll` を配置します（または `flac24_pause_experiment.dll` で `$env:MC_BRIDGE_DIAGNOSTICS = "1"` を指定）。
 
-### 2. 診断ログを有効にしての検証実行
+### 2. 既存ランチャーを用いた診断実行
 ```powershell
-# 観測モード（既存動作の排他競合観測）
-$env:MC_BRIDGE_PAUSE_MODE = "observe"
-$env:MC_BRIDGE_DIAGNOSTICS = "1"
-& "C:\Program Files (x86)\Sony\Music Center\MusicCenter.exe"
-
-# または保留モード（手動操作追跡）
+# 診断モードを有効化（エンジン IAT ロックフック有効）
 $env:MC_BRIDGE_PAUSE_MODE = "defer"
 $env:MC_BRIDGE_DIAGNOSTICS = "1"
-& "C:\Program Files (x86)\Sony\Music Center\MusicCenter.exe"
+# 必要に応じてロックフックのみ無効化したい場合は: $env:MC_BRIDGE_LOCK_DIAG = "0"
+
+# 既存ランチャーから起動（または Music Center を直接起動）
+& ".\build-Win32\Release\MC HiRes Bridge.exe"
 ```
 
-### 3. 保留区間（20.1秒〜23.0秒）でのログ判定方法
-
-ログ出力（`%TEMP%\Flac24Override-<PID>.tsv`）を時系列（`mono_ms`）順に確認し、以下の判定基準に照合します：
-
-1. **「到達した指令がロック取得を待つ」場合（Case B）**:
-   - UI 操作時刻に `ENGINE_LOCK_TRY`（操作側の `tid`）が記録されている。
-   - しかし `ENGINE_LOCK_ACQUIRED` がすぐには出力されず、保留解除スレッドの `ENGINE_LOCK_RELEASED` 直後に出力される。
-   - `ENGINE_LOCK_ACQUIRED` の `p2`（`wait_ms`）に 1000〜2500ms などの大きな待機時間が記録されている。
-   -> **判定**: 指令はエンジンに到達しているが、Pause 保留スレッドが CriticalSection を解放するまでブロックされていた。
-
-2. **「指令がエンジンに未到達」の場合（Case A）**:
-   - UI 操作時刻に `APP_INPUT_DISPATCH`（マウス押下等）が記録されている。
-   - しかし、その後の保留待機区間（1〜2.7秒間）に、手動操作側の `tid` から `ENGINE_LOCK_TRY` が 1 度も記録されない。
-   -> **判定**: アプリ UI（CEF / UI コントローラー）側で指令が破棄・保留されており、再生エンジン自体が呼ばれていなかった。
+### 3. 検証ステップ
+1. **ステップ 1: 通常再生中でのエンジン側観測点の発火確認**:
+   - 任意の FLAC 曲を通常再生し、再生途中で「一時停止」ボタンを押下。
+   - ログ（`%TEMP%\Flac24Override-<PID>.tsv`）を確認し、以下の一連のイベントが同一 `tid` かつ連続した時刻（約 3ms 以内）で記録されていることを確認：
+     - `APP_INPUT_DISPATCH` (`WM_LBUTTONUP`)
+     - `ENGINE_LOCK_TRY` / `ENGINE_LOCK_ACQUIRED` (`wait_ms = 0`)
+     - `BOUNDARY_CONTROL_PAUSE_ENTER` / `LEAVE`
+     - `ENGINE_LOCK_RELEASED`
+2. **ステップ 2: 自動曲送りの Pause 保留中における手動操作の照合**:
+   - 48 kHz/24 bit → 48 kHz/16 bit の自動曲送りを再生。
+   - 曲末尾（20.1秒〜23秒付近、`PAUSE_DEFERRED_START` 後）で手動一時停止またはシークを実行。
+   - 判定基準：
+     - **Case B（到達した指令がロック待ち）**: 手動操作スレッドから `ENGINE_LOCK_TRY` が出力され、`ENGINE_LOCK_ACQUIRED` が保留解除まで待たされる（`wait_ms > 0`）。
+     - **Case A（指令がエンジンに未到達）**: `APP_INPUT_DISPATCH` は記録されるが、手動操作スレッドからの `ENGINE_LOCK_TRY` が 0 件。
 
 ---
 

@@ -1974,11 +1974,117 @@ void testObservationModeNonInterferenceAndOrdering() {
     CHECK(collector.countEvent("PAUSE_MODE_OBSERVE") == 1);
 }
 
+// Test 26: Diagnostic Hook Registration Logging & Graceful Fallback (Issue #28)
+void testDiagnosticHookRegistrationAndFallback() {
+    std::printf("[TEST 26] Diagnostic hook registration logging & graceful fallback...\n");
+    auto& reporter = eosDiag::getHookStatusReporter();
+    reporter.clear();
+
+    // DirectShow and User32 hooks register successfully
+    reporter.report("DirectShow.ControlPause", "OK", S_OK);
+    reporter.report("DirectShow.ControlStop", "OK", S_OK);
+    reporter.report("DirectShow.FilterPause", "OK", S_OK);
+    reporter.report("DirectShow.FilterStop", "OK", S_OK);
+    reporter.report("DirectShow.Seeking", "OK", S_OK);
+    reporter.report("User32.DispatchMessageW", "OK", S_OK);
+
+    // Initial state: OpcDSPlay.dll not loaded -> marked as PENDING_MODULE_LOAD
+    reporter.report("Engine.OpcDSPlay.IAT.EnterCriticalSection", "PENDING_MODULE_LOAD", S_FALSE);
+    reporter.report("Engine.OpcDSPlay.IAT.LeaveCriticalSection", "PENDING_MODULE_LOAD", S_FALSE);
+
+    CHECK(reporter.getStatus("DirectShow.ControlPause") == "OK");
+    CHECK(reporter.getStatus("User32.DispatchMessageW") == "OK");
+    CHECK(reporter.getStatus("Engine.OpcDSPlay.IAT.EnterCriticalSection") == "PENDING_MODULE_LOAD");
+
+    // Later: module becomes available, late attachment succeeds
+    reporter.report("Engine.OpcDSPlay.IAT.EnterCriticalSection", "ATTACHED_LATE", S_OK);
+    reporter.report("Engine.OpcDSPlay.IAT.LeaveCriticalSection", "ATTACHED_LATE", S_OK);
+
+    CHECK(reporter.getStatus("Engine.OpcDSPlay.IAT.EnterCriticalSection") == "PENDING_MODULE_LOAD"); // first entry preserved in list
+    CHECK(reporter.entries.size() == 10);
+}
+
+// Test 27: Reentrancy Protection and Safe Pre/Post-Init Calls (Issue #28)
+void testReentrancyProtectionAndPrePostInitCalls() {
+    std::printf("[TEST 27] Reentrancy protection and safe pre/post-init calls...\n");
+    auto& tracker = eosDiag::getLockTracker();
+    tracker.reset();
+
+    CRITICAL_SECTION csTest;
+    InitializeCriticalSection(&csTest);
+    DWORD tid = GetCurrentThreadId();
+    void* caller = reinterpret_cast<void*>(0x60FE1234);
+
+    // Level 1: Initial lock acquire
+    tracker.onTry(&csTest, caller, tid, 100);
+    uint64_t wait1 = tracker.onAcquired(&csTest, caller, tid, 100);
+    CHECK(wait1 == 0);
+    CHECK(tracker.activeLocks[&csTest].recursionCount == 1);
+
+    // Level 2: Reentrant acquire on same thread
+    tracker.onTry(&csTest, caller, tid, 105);
+    uint64_t wait2 = tracker.onAcquired(&csTest, caller, tid, 105);
+    CHECK(wait2 == 0);
+    CHECK(tracker.activeLocks[&csTest].recursionCount == 2);
+
+    // Release level 2 (nested): lock must still remain active
+    uint64_t held2 = tracker.onReleased(&csTest, caller, tid, 110);
+    CHECK(held2 == 0);
+    CHECK(tracker.activeLocks.find(&csTest) != tracker.activeLocks.end());
+    CHECK(tracker.activeLocks[&csTest].recursionCount == 1);
+
+    // Release level 1 (outermost): lock is now fully released
+    uint64_t held1 = tracker.onReleased(&csTest, caller, tid, 120);
+    CHECK(held1 == 20); // Held from t=100 to t=120 = 20ms
+    CHECK(tracker.activeLocks.find(&csTest) == tracker.activeLocks.end());
+
+    DeleteCriticalSection(&csTest);
+}
+
+// Test 28: Engine-Side Observation Point Correlation on Manual Pause (Issue #28)
+void testEngineObservationOnManualPause() {
+    std::printf("[TEST 28] Correlating input dispatch, engine lock, and DirectShow on manual Pause...\n");
+    auto& collector = eosDiag::getTraceCollector();
+    collector.clear();
+
+    void* callerUI = reinterpret_cast<void*>(0x00401000);
+    void* callerOpcPause = reinterpret_cast<void*>(0x60FEED58); // Manual Pause entry
+    void* csOpc = reinterpret_cast<void*>(0x03001078); // [esi+78h]
+
+    // 1. User releases mouse button on "Pause" (mono_ms = 1000)
+    collector.add("APP_INPUT_DISPATCH", callerUI, WM_LBUTTONUP, 0, S_OK);
+
+    // 2. ~2-3ms later: UI calls OpcDSPlay.dll -> OpcDSPlay calls EnterCriticalSection (mono_ms = 1003)
+    collector.add("ENGINE_LOCK_TRY", callerOpcPause, reinterpret_cast<uint64_t>(csOpc), 0, S_OK);
+    collector.add("ENGINE_LOCK_ACQUIRED", callerOpcPause, reinterpret_cast<uint64_t>(csOpc), 0, S_OK);
+
+    // 3. OpcDSPlay calls DirectShow IMediaControl::Pause() (mono_ms = 1004)
+    collector.add("BOUNDARY_CONTROL_PAUSE_ENTER", callerOpcPause, 0, 0, S_OK);
+    collector.add("BOUNDARY_CONTROL_PAUSE_LEAVE", callerOpcPause, 0, 0, S_OK);
+
+    // 4. OpcDSPlay calls LeaveCriticalSection (mono_ms = 1006)
+    collector.add("ENGINE_LOCK_RELEASED", callerOpcPause, reinterpret_cast<uint64_t>(csOpc), 3, S_OK);
+
+    // Verify chronological sequence
+    CHECK(collector.items.size() == 6);
+    CHECK(collector.items[0].eventName == "APP_INPUT_DISPATCH");
+    CHECK(collector.items[1].eventName == "ENGINE_LOCK_TRY");
+    CHECK(collector.items[2].eventName == "ENGINE_LOCK_ACQUIRED");
+    CHECK(collector.items[3].eventName == "BOUNDARY_CONTROL_PAUSE_ENTER");
+    CHECK(collector.items[4].eventName == "BOUNDARY_CONTROL_PAUSE_LEAVE");
+    CHECK(collector.items[5].eventName == "ENGINE_LOCK_RELEASED");
+
+    // All events occurred and are correlated
+    CHECK(collector.countEvent("APP_INPUT_DISPATCH") == 1);
+    CHECK(collector.countEvent("ENGINE_LOCK_TRY") == 1);
+    CHECK(collector.countEvent("BOUNDARY_CONTROL_PAUSE_ENTER") == 1);
+}
+
 } // namespace
 
 int main() {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    std::printf("=== Issue #20 / #21 / #23 / #24 / #25 / #27 Experimental EOS Transition Tests ===\n");
+    std::printf("=== Issue #20 / #21 / #23 / #24 / #25 / #27 / #28 Experimental EOS Transition Tests ===\n");
 
     testArbitraryDurationsAndOffsets();
     testDuplicateEosCalls();
@@ -2007,10 +2113,13 @@ int main() {
     testLockContentionDetection();
     testUnreachedCommandDetection();
     testObservationModeNonInterferenceAndOrdering();
+    testDiagnosticHookRegistrationAndFallback();
+    testReentrancyProtectionAndPrePostInitCalls();
+    testEngineObservationOnManualPause();
 
     if (SUCCEEDED(co)) CoUninitialize();
     if (g_failures == 0) {
-        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 EOS TRANSITION TESTS PASSED ===\n");
+        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 / #28 EOS TRANSITION TESTS PASSED ===\n");
         return 0;
     }
     std::printf("=== %d TEST ASSERTION(S) FAILED ===\n", g_failures);

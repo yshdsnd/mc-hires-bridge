@@ -59,6 +59,92 @@ static inline void formatCaller(void* ptr, char* buf, size_t maxLen) {
     }
 }
 
+// Safe IAT Hooking targeting a specific PE module without global hooks (Issue #28)
+static inline bool hookIat(HMODULE hMod, const char* importDllName, const char* funcName, void* newFunc, void** origFunc) {
+    if (!hMod || !importDllName || !funcName || !newFunc) return false;
+    auto base = reinterpret_cast<BYTE*>(hMod);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    auto importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!importDir.VirtualAddress || !importDir.Size) return false;
+
+    auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + importDir.VirtualAddress);
+    for (; desc->Name != 0; ++desc) {
+        const char* modName = reinterpret_cast<const char*>(base + desc->Name);
+        if (_stricmp(modName, importDllName) == 0) {
+            auto origThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+            auto thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+            for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++thunk) {
+                if (!(origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
+                    auto importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + origThunk->u1.AddressOfData);
+                    if (strcmp(reinterpret_cast<const char*>(importByName->Name), funcName) == 0) {
+                        DWORD oldProtect = 0;
+                        if (VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                            if (origFunc && !*origFunc) {
+                                *origFunc = reinterpret_cast<void*>(thunk->u1.Function);
+                            }
+                            thunk->u1.Function = reinterpret_cast<ULONG_PTR>(newFunc);
+                            VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &oldProtect);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Hook registration status tracking (Issue #28)
+struct HookStatusEntry {
+    std::string name;
+    std::string status;
+    HRESULT hr = S_OK;
+};
+
+class HookStatusReporter {
+public:
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<HookStatusEntry> entries;
+
+    void report(const char* name, const char* status, HRESULT hr = S_OK) {
+        AcquireSRWLockExclusive(&lock);
+        HookStatusEntry entry;
+        entry.name = name ? name : "";
+        entry.status = status ? status : "";
+        entry.hr = hr;
+        entries.push_back(entry);
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    std::string getStatus(const char* name) {
+        AcquireSRWLockShared(&lock);
+        for (const auto& e : entries) {
+            if (e.name == name) {
+                std::string s = e.status;
+                ReleaseSRWLockShared(&lock);
+                return s;
+            }
+        }
+        ReleaseSRWLockShared(&lock);
+        return "NOT_FOUND";
+    }
+
+    void clear() {
+        AcquireSRWLockExclusive(&lock);
+        entries.clear();
+        ReleaseSRWLockExclusive(&lock);
+    }
+};
+
+static inline HookStatusReporter& getHookStatusReporter() {
+    static HookStatusReporter reporter;
+    return reporter;
+}
+
 // Module range tracking for zero-overhead caller filtering
 struct ModuleRange {
     ULONG_PTR start = 0;

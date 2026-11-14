@@ -85,6 +85,7 @@ static HRESULT STDMETHODCALLTYPE runHook(IMediaControl* self){
 #endif
 #ifdef EXPERIMENT_EOS_TRANSITION
     updateStatus(self,S_OK);
+    tryAttachOpcDsPlayLockHooks();
 #endif
     auto hr=originalRun(self);updateStatus(self,hr);return hr;}
 static HRESULT STDMETHODCALLTYPE filterRunHook(IMediaFilter* self,REFERENCE_TIME time){
@@ -93,6 +94,7 @@ static HRESULT STDMETHODCALLTYPE filterRunHook(IMediaFilter* self,REFERENCE_TIME
 #endif
 #ifdef EXPERIMENT_EOS_TRANSITION
     updateStatus(self,S_OK);
+    tryAttachOpcDsPlayLockHooks();
 #endif
     auto hr=originalFilterRun(self,time);updateStatus(self,hr);return hr;}
 static bool setupRunHooks(){IGraphBuilder* graph=nullptr;if(FAILED(CoCreateInstance(CLSID_FilterGraph,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&graph))))return false;bool ok=false;IMediaControl* c=nullptr;IMediaFilter* f=nullptr;if(SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&c)))&&SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&f)))){auto a=(*reinterpret_cast<void***>(c))[7],b=(*reinterpret_cast<void***>(f))[6];HMODULE pinned=nullptr;GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(a),&pinned);ok=MH_CreateHook(a,reinterpret_cast<void*>(runHook),reinterpret_cast<void**>(&originalRun))==MH_OK&&MH_CreateHook(b,reinterpret_cast<void*>(filterRunHook),reinterpret_cast<void**>(&originalFilterRun))==MH_OK;}
