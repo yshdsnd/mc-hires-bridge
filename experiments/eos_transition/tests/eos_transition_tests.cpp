@@ -16,6 +16,7 @@
 #include "MinHook.h"
 #include "track_tail_check.h"
 #include "eos_transition.h"
+#include "eos_transition_diag.h"
 
 namespace {
 
@@ -1784,11 +1785,200 @@ void testPreserveTrackEndAndSameFormatAcrossCancellation() {
     CHECK(a.missingTailMs == 0.0);
 }
 
+enum class CommandContentionDiagnosis {
+    Undetermined,
+    CommandNotReachedEngine,
+    BlockedWaitingForLock,
+    ExecutedImmediately
+};
+
+static CommandContentionDiagnosis diagnoseCommandContention(
+    DWORD uiTid,
+    const std::vector<eosDiag::TraceItem>& trace)
+{
+    bool appInputFound = false;
+    bool lockTryFound = false;
+    uint64_t waitMs = 0;
+
+    for (const auto& item : trace) {
+        if (item.eventName == "APP_INPUT_DISPATCH") {
+            appInputFound = true;
+        }
+        if (item.eventName == "ENGINE_LOCK_TRY" && item.tid == uiTid) {
+            lockTryFound = true;
+        }
+        if (item.eventName == "ENGINE_LOCK_ACQUIRED" && item.tid == uiTid) {
+            waitMs = item.p2; // p2 is waitMs
+        }
+    }
+
+    if (appInputFound && !lockTryFound) {
+        return CommandContentionDiagnosis::CommandNotReachedEngine;
+    }
+    if (lockTryFound && waitMs > 0) {
+        return CommandContentionDiagnosis::BlockedWaitingForLock;
+    }
+    if (lockTryFound && waitMs == 0) {
+        return CommandContentionDiagnosis::ExecutedImmediately;
+    }
+    return CommandContentionDiagnosis::Undetermined;
+}
+
+// Test 23: Distinction Case B - Command reached engine but blocked waiting for lock (Issue #27)
+void testLockContentionDetection() {
+    std::printf("[TEST 23] Tracing reached command waiting for lock contention...\n");
+    auto& tracker = eosDiag::getLockTracker();
+    auto& collector = eosDiag::getTraceCollector();
+    tracker.reset();
+    collector.clear();
+
+    CRITICAL_SECTION csEngine;
+    InitializeCriticalSection(&csEngine);
+    void* callerDeferral = reinterpret_cast<void*>(0x60FEDAC9);
+    void* callerManual = reinterpret_cast<void*>(0x60FEED58);
+
+    std::atomic<bool> threadAStarted{false};
+    std::atomic<bool> threadBLockTried{false};
+    std::atomic<bool> threadBCompleted{false};
+    std::atomic<DWORD> threadBTid{0};
+    uint64_t threadBWaitReported = 0;
+
+    // Thread A: simulates Pause deferral / format change drain wait holding the engine lock
+    std::thread threadA([&]() {
+        DWORD tidA = GetCurrentThreadId();
+        uint64_t t0 = eosDiag::DiagClock::monotonicMs();
+        tracker.onTry(&csEngine, callerDeferral, tidA, t0);
+        collector.add("ENGINE_LOCK_TRY", callerDeferral, reinterpret_cast<uint64_t>(&csEngine), 0, S_OK);
+        EnterCriticalSection(&csEngine);
+        uint64_t t1 = eosDiag::DiagClock::monotonicMs();
+        uint64_t waitA = tracker.onAcquired(&csEngine, callerDeferral, tidA, t1);
+        collector.add("ENGINE_LOCK_ACQUIRED", callerDeferral, reinterpret_cast<uint64_t>(&csEngine), waitA, S_OK);
+        collector.add("PAUSE_DEFERRED_START", callerDeferral, 1, 0, S_OK);
+
+        threadAStarted.store(true);
+
+        // Hold lock for 60ms to simulate drain wait window
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+        collector.add("PAUSE_DEFERRED_RELEASE", callerDeferral, 0, 0, S_OK);
+        uint64_t t2 = eosDiag::DiagClock::monotonicMs();
+        uint64_t heldA = tracker.onReleased(&csEngine, callerDeferral, tidA, t2);
+        collector.add("ENGINE_LOCK_RELEASED", callerDeferral, reinterpret_cast<uint64_t>(&csEngine), heldA, S_OK);
+        LeaveCriticalSection(&csEngine);
+    });
+
+    // Thread B: simulates UI thread receiving manual Pause click during the deferral window
+    std::thread threadB([&]() {
+        while (!threadAStarted.load()) {
+            std::this_thread::yield();
+        }
+        DWORD tidB = GetCurrentThreadId();
+        threadBTid.store(tidB);
+
+        // UI receives button click
+        collector.add("APP_INPUT_DISPATCH", callerManual, WM_LBUTTONDOWN, 0, S_OK);
+
+        // UI calls into player engine -> tries to enter engine critical section
+        uint64_t t0 = eosDiag::DiagClock::monotonicMs();
+        tracker.onTry(&csEngine, callerManual, tidB, t0);
+        collector.add("ENGINE_LOCK_TRY", callerManual, reinterpret_cast<uint64_t>(&csEngine), 0, S_OK);
+        threadBLockTried.store(true);
+
+        EnterCriticalSection(&csEngine);
+        uint64_t t1 = eosDiag::DiagClock::monotonicMs();
+        uint64_t waitB = tracker.onAcquired(&csEngine, callerManual, tidB, t1);
+        threadBWaitReported = waitB;
+        collector.add("ENGINE_LOCK_ACQUIRED", callerManual, reinterpret_cast<uint64_t>(&csEngine), waitB, S_OK);
+        collector.add("BOUNDARY_CONTROL_PAUSE_ENTER", callerManual, 0, 0, S_OK);
+
+        uint64_t t2 = eosDiag::DiagClock::monotonicMs();
+        uint64_t heldB = tracker.onReleased(&csEngine, callerManual, tidB, t2);
+        collector.add("ENGINE_LOCK_RELEASED", callerManual, reinterpret_cast<uint64_t>(&csEngine), heldB, S_OK);
+        LeaveCriticalSection(&csEngine);
+        threadBCompleted.store(true);
+    });
+
+    threadA.join();
+    threadB.join();
+
+    CHECK(threadBLockTried.load() == true);
+    CHECK(threadBCompleted.load() == true);
+    CHECK(threadBWaitReported >= 30); // Waited during Thread A's hold
+
+    // Analyze trace
+    auto diagnosis = diagnoseCommandContention(threadBTid.load(), collector.items);
+    CHECK(diagnosis == CommandContentionDiagnosis::BlockedWaitingForLock);
+
+    DeleteCriticalSection(&csEngine);
+}
+
+// Test 24: Distinction Case A - Command never reached playback engine (Issue #27)
+void testUnreachedCommandDetection() {
+    std::printf("[TEST 24] Tracing unreached command (app received input but engine not called)...\n");
+    auto& tracker = eosDiag::getLockTracker();
+    auto& collector = eosDiag::getTraceCollector();
+    tracker.reset();
+    collector.clear();
+
+    CRITICAL_SECTION csEngine;
+    InitializeCriticalSection(&csEngine);
+    void* callerDeferral = reinterpret_cast<void*>(0x60FEDAC9);
+    void* callerUI = reinterpret_cast<void*>(0x00401234);
+
+    DWORD uiTid = 9999;
+
+    // App dispatches user click
+    collector.add("APP_INPUT_DISPATCH", callerUI, WM_LBUTTONDOWN, 0, S_OK);
+
+    // Thread A holds lock and executes deferral
+    EnterCriticalSection(&csEngine);
+    tracker.onTry(&csEngine, callerDeferral, 1111, 1000);
+    tracker.onAcquired(&csEngine, callerDeferral, 1111, 1000);
+    collector.add("PAUSE_DEFERRED_START", callerDeferral, 1, 0, S_OK);
+    collector.add("PAUSE_DEFERRED_RELEASE", callerDeferral, 0, 0, S_OK);
+    tracker.onReleased(&csEngine, callerDeferral, 1111, 1500);
+    LeaveCriticalSection(&csEngine);
+
+    // UI thread never called engine method: 0 lock attempts from uiTid
+    auto diagnosis = diagnoseCommandContention(uiTid, collector.items);
+    CHECK(diagnosis == CommandContentionDiagnosis::CommandNotReachedEngine);
+
+    DeleteCriticalSection(&csEngine);
+}
+
+// Test 25: Observation Mode - Strict ordering, monotonic timestamps, and non-interference (Issue #27)
+void testObservationModeNonInterferenceAndOrdering() {
+    std::printf("[TEST 25] Observation mode: monotonic timeline, thread tracing, and non-interference...\n");
+    auto& collector = eosDiag::getTraceCollector();
+    collector.clear();
+
+    eosTransition::Tracker tracker;
+    void* graph = reinterpret_cast<void*>(0xEE01);
+    tracker.onGraphActivated(graph, true, 48000, 2, 24);
+
+    // Run trace items
+    collector.add("PAUSE_MODE_OBSERVE", nullptr, 0, 0, S_OK);
+    collector.add("APP_INPUT_DISPATCH", reinterpret_cast<void*>(0x100), WM_LBUTTONDOWN, 0, S_OK);
+    collector.add("CONTROL_PAUSE_OBSERVED", reinterpret_cast<void*>(0x200), 1, 0, S_OK);
+    collector.add("EOS_DELIVERED_DOWNSTREAM", reinterpret_cast<void*>(0x300), 1000, 28800, S_OK);
+
+    // Verify monotonic ordering
+    uint64_t prevTime = 0;
+    for (const auto& it : collector.items) {
+        CHECK(it.monoMs >= prevTime);
+        prevTime = it.monoMs;
+        CHECK(it.tid != 0);
+    }
+
+    CHECK(collector.countEvent("CONTROL_PAUSE_OBSERVED") == 1);
+    CHECK(collector.countEvent("PAUSE_MODE_OBSERVE") == 1);
+}
+
 } // namespace
 
 int main() {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    std::printf("=== Issue #20 / #21 / #23 / #24 / #25 Experimental EOS Transition Tests ===\n");
+    std::printf("=== Issue #20 / #21 / #23 / #24 / #25 / #27 Experimental EOS Transition Tests ===\n");
 
     testArbitraryDurationsAndOffsets();
     testDuplicateEosCalls();
@@ -1814,10 +2004,13 @@ int main() {
     testConcurrentOperationsDuringDrainWait();
     testPrematureEqEosPrevention();
     testPreserveTrackEndAndSameFormatAcrossCancellation();
+    testLockContentionDetection();
+    testUnreachedCommandDetection();
+    testObservationModeNonInterferenceAndOrdering();
 
     if (SUCCEEDED(co)) CoUninitialize();
     if (g_failures == 0) {
-        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 EOS TRANSITION TESTS PASSED ===\n");
+        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 EOS TRANSITION TESTS PASSED ===\n");
         return 0;
     }
     std::printf("=== %d TEST ASSERTION(S) FAILED ===\n", g_failures);

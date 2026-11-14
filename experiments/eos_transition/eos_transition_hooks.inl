@@ -197,6 +197,19 @@ static GetPositionFn originalGetCurrentPosition = nullptr;
 static SetPositionsFn originalSetPositions = nullptr;
 static DsStopFn originalDsStop = nullptr;
 
+using EnterCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
+using LeaveCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
+using TryEnterCsFn = BOOL(WINAPI*)(LPCRITICAL_SECTION);
+using DispatchMsgFn = LRESULT(WINAPI*)(const MSG*);
+
+static EnterCsFn originalEnterCriticalSection = nullptr;
+static LeaveCsFn originalLeaveCriticalSection = nullptr;
+static TryEnterCsFn originalTryEnterCriticalSection = nullptr;
+static DispatchMsgFn originalDispatchMessageW = nullptr;
+
+static thread_local bool inLockHook = false;
+static thread_local bool inMsgHook = false;
+
 #include "eos_transition_diag.h"
 
 enum class PauseMode {
@@ -224,6 +237,7 @@ static void initDiagMode() {
 }
 
 static void recordDiag(const char* event, void* graphKey, void* callerAddr, uint64_t p1 = 0, uint64_t p2 = 0, HRESULT hr = S_OK) {
+    eosDiag::getTraceCollector().add(event, callerAddr, p1, p2, hr);
     if (!g_diagEnabled) {
         record(event, static_cast<DWORD>(p1), static_cast<DWORD>(p2), hr);
         return;
@@ -245,6 +259,98 @@ static void recordDiag(const char* event, void* graphKey, void* callerAddr, uint
         WriteFile(output, line, n, &written, nullptr);
     }
     ReleaseSRWLockExclusive(&mutex);
+}
+
+static void WINAPI enterCriticalSectionHook(LPCRITICAL_SECTION cs) {
+    if (inLockHook || !g_diagEnabled || !cs) {
+        if (originalEnterCriticalSection) originalEnterCriticalSection(cs);
+        else EnterCriticalSection(cs);
+        return;
+    }
+    void* caller = _ReturnAddress();
+    const char* mod = eosDiag::getModuleTracker().findModule(caller);
+    if (!mod) {
+        originalEnterCriticalSection(cs);
+        return;
+    }
+
+    inLockHook = true;
+    uint64_t tTry = eosDiag::DiagClock::monotonicMs();
+    DWORD tid = GetCurrentThreadId();
+    eosDiag::getLockTracker().onTry(cs, caller, tid, tTry);
+    recordDiag("ENGINE_LOCK_TRY", cs, caller, reinterpret_cast<uint64_t>(cs), 0, S_OK);
+    inLockHook = false;
+
+    originalEnterCriticalSection(cs);
+
+    inLockHook = true;
+    uint64_t tAcquired = eosDiag::DiagClock::monotonicMs();
+    uint64_t waitMs = eosDiag::getLockTracker().onAcquired(cs, caller, tid, tAcquired);
+    recordDiag("ENGINE_LOCK_ACQUIRED", cs, caller, reinterpret_cast<uint64_t>(cs), waitMs, S_OK);
+    inLockHook = false;
+}
+
+static void WINAPI leaveCriticalSectionHook(LPCRITICAL_SECTION cs) {
+    if (inLockHook || !g_diagEnabled || !cs) {
+        if (originalLeaveCriticalSection) originalLeaveCriticalSection(cs);
+        else LeaveCriticalSection(cs);
+        return;
+    }
+    void* caller = _ReturnAddress();
+    const char* mod = eosDiag::getModuleTracker().findModule(caller);
+    if (!mod) {
+        originalLeaveCriticalSection(cs);
+        return;
+    }
+
+    inLockHook = true;
+    uint64_t tRelease = eosDiag::DiagClock::monotonicMs();
+    DWORD tid = GetCurrentThreadId();
+    uint64_t heldMs = eosDiag::getLockTracker().onReleased(cs, caller, tid, tRelease);
+    recordDiag("ENGINE_LOCK_RELEASED", cs, caller, reinterpret_cast<uint64_t>(cs), heldMs, S_OK);
+    inLockHook = false;
+
+    originalLeaveCriticalSection(cs);
+}
+
+static BOOL WINAPI tryEnterCriticalSectionHook(LPCRITICAL_SECTION cs) {
+    if (inLockHook || !g_diagEnabled || !cs) {
+        return originalTryEnterCriticalSection ? originalTryEnterCriticalSection(cs) : TryEnterCriticalSection(cs);
+    }
+    void* caller = _ReturnAddress();
+    const char* mod = eosDiag::getModuleTracker().findModule(caller);
+    if (!mod) {
+        return originalTryEnterCriticalSection(cs);
+    }
+
+    inLockHook = true;
+    uint64_t tTry = eosDiag::DiagClock::monotonicMs();
+    DWORD tid = GetCurrentThreadId();
+    BOOL ok = originalTryEnterCriticalSection(cs);
+    if (ok) {
+        eosDiag::getLockTracker().onAcquired(cs, caller, tid, tTry);
+        recordDiag("ENGINE_LOCK_TRY_SUCCEEDED", cs, caller, reinterpret_cast<uint64_t>(cs), 0, S_OK);
+    } else {
+        recordDiag("ENGINE_LOCK_TRY_FAILED", cs, caller, reinterpret_cast<uint64_t>(cs), 0, S_OK);
+    }
+    inLockHook = false;
+    return ok;
+}
+
+static LRESULT WINAPI dispatchMessageWHook(const MSG* lpMsg) {
+    if (!inMsgHook && g_diagEnabled && lpMsg) {
+        UINT msg = lpMsg->message;
+        if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) ||
+            (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
+            msg == WM_COMMAND || msg == WM_SYSCOMMAND || msg == WM_APP ||
+            (msg >= 0x8000 && msg <= 0xBFFF)) {
+            inMsgHook = true;
+            void* caller = _ReturnAddress();
+            recordDiag("APP_INPUT_DISPATCH", reinterpret_cast<void*>(lpMsg->hwnd), caller, msg, lpMsg->wParam, S_OK);
+            inMsgHook = false;
+        }
+    }
+    return originalDispatchMessageW ? originalDispatchMessageW(lpMsg) : DispatchMessageW(lpMsg);
 }
 
 static void initPauseMode() {
@@ -1007,6 +1113,33 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
         ok = false;
     }
     if (!ok) return false;
+
+    if (g_diagEnabled) {
+        eosDiag::getModuleTracker().refresh();
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            auto pEnter = GetProcAddress(hKernel32, "EnterCriticalSection");
+            auto pLeave = GetProcAddress(hKernel32, "LeaveCriticalSection");
+            auto pTry = GetProcAddress(hKernel32, "TryEnterCriticalSection");
+            if (pEnter && !originalEnterCriticalSection) {
+                MH_CreateHook(pEnter, reinterpret_cast<void*>(enterCriticalSectionHook), reinterpret_cast<void**>(&originalEnterCriticalSection));
+            }
+            if (pLeave && !originalLeaveCriticalSection) {
+                MH_CreateHook(pLeave, reinterpret_cast<void*>(leaveCriticalSectionHook), reinterpret_cast<void**>(&originalLeaveCriticalSection));
+            }
+            if (pTry && !originalTryEnterCriticalSection) {
+                MH_CreateHook(pTry, reinterpret_cast<void*>(tryEnterCriticalSectionHook), reinterpret_cast<void**>(&originalTryEnterCriticalSection));
+            }
+        }
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        if (!hUser32) hUser32 = LoadLibraryW(L"user32.dll");
+        if (hUser32) {
+            auto pDisp = GetProcAddress(hUser32, "DispatchMessageW");
+            if (pDisp && !originalDispatchMessageW) {
+                MH_CreateHook(pDisp, reinterpret_cast<void*>(dispatchMessageWHook), reinterpret_cast<void**>(&originalDispatchMessageW));
+            }
+        }
+    }
 
     IDirectSound8* ds8 = nullptr;
     if (SUCCEEDED(DirectSoundCreate8(nullptr, &ds8, nullptr)) && ds8) {
