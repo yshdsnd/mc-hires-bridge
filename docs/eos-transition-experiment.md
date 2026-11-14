@@ -1,64 +1,80 @@
-# 形式が変わる曲送りのEOS処理（試験版）
+# 形式が変わる曲送りのEOS処理・停止保留（試験版）
 
-[Issue #20](https://github.com/yshdsnd/mc-hires-bridge/issues/20) に対応する試験実装。Music Center for PC 2.7.4 x86 での実再生検証（`48kHz/24bit -> 48kHz/16bit`、`96kHz/24bit -> 96kHz/24bit`、`192kHz/24bit`、シーク・手動曲変更）が完了するまで、通常のランチャー・配布ZIP（`flac24_override.dll`）には含めない。
+[Issue #20](https://github.com/yshdsnd/mc-hires-bridge/issues/20) および [Issue #21](https://github.com/yshdsnd/mc-hires-bridge/issues/21) に対応する試験実装。Music Center for PC 2.7.4 x86 での実再生検証（`48kHz/24bit -> 48kHz/16bit`、`96kHz/24bit -> 96kHz/24bit`、`192kHz/24bit`、シーク・手動曲変更）が完了するまで、通常のランチャー・配布ZIP（`flac24_override.dll`）には含めない。
 
-## 背景と原因
+## 背景と問題の根本原因
 
-1. **`OmgEqxlFilter.ax`（EQ）の内部ブロック保持**:
-   - `OmgEqxlFilter.ax`（CLSID `{5C968488-5E35-4CFE-98A1-A51C838797DB}`）は `8,192` フレーム単位（48 kHz で約 `170.67 ms`）で出力し、`IPin::EndOfStream` を受けるまで末尾の未出力フレーム（48 kHz で `10,773`〜`15,232` フレーム＝約 `0.224`〜`0.317` 秒、24.000 秒の音源では `14,400` フレーム＝`0.300` 秒）を内部バッファーに保持し続ける。
-2. **`SeamlessFilter.ax` の EOS 非転送**:
-   - `SeamlessFilter.ax`（CLSID `{6AF73F1F-1266-46E6-9A36-EE75E4BA10BB}`、PE timestamp `0x63EB12BA`）は、上流 `OmgFlacSrc.ax` から `SeamlessInput->EndOfStream()` を再生終端の約 3 秒前に受け取るが、通常のシームレス待機状態では下流（`OmgEqxlFilter.ax`）へ `EndOfStream` をそのまま転送しない。
-   - 同形式の次曲が続く場合は `SeamlessInput` に次曲の `OmgFlacSrc.ax` が接続されて PCM が連続するため問題ないが、`48kHz/24bit -> 48kHz/16bit` のように形式が変わる曲送りでは次曲が `SeamlessFilter.ax` に接続されず、`OmgEqxlFilter.ax` が最終 PCM サンプルを受け取った後も `EndOfStream` が届かないまま再生位置が終端へ達し、最終約 `0.30` 秒が無音（未フラッシュ）になる。
+Music Center 2.7.4 x86 における `48kHz/24bit -> 48kHz/16bit` などの形式変更時、以下の2つの独立した問題が連鎖して発生していた：
 
-## 設計（23秒固定判定の廃止と区間追跡）
+### 1. 終端約 2.9 秒前の早期停止（Early Stop）の逆アセンブラ解析
 
-固定秒数（23 秒など）の判定は一切使わず、`experiments/eos_transition/eos_transition.h` の `eosTransition::Tracker` で DirectShow グラフ（`IFilterGraph*`）ごとに再生区間とストリーム終端を追跡する。
+`OmgFlacSrc.ax` は曲終端の約 2.9〜3.0 秒前にデコードを完了し、`SeamlessInput->EndOfStream()` を呼び出す。これを受けて `SeamlessFilter.ax` の内部ワーカースレッドが DirectShow イベント `0x0F01`（`3841`）を発火する。
 
-1. **上流（`SeamlessFilter.ax` 入力ピン）の追跡**:
-   - `IPin::NewSegment(tStart, tStop, rate)` で区間情報を記録し、新しい区間のカウンタを初期化する（ただし上流 `EndOfStream` 後に Flush/Seek/Stop なしで新しい `NewSegment` が来た場合は同形式のシームレス継続として扱う）。
-   - `IMemInputPin::Receive(pSample)` でサンプル長（`GetActualDataLength()`）と `SeamlessFilter` 通過後のサンプル終端時刻（`GetTime(&sStart, &sEnd)`）を累積する。
-   - `IPin::EndOfStream()` 初回呼び出し時に、その区間の最終到達目標（`targetBytes = upstreamBytes`、`targetEndTime = upstreamLastEndTime`）を確定し、同形式先読みが確定していない限り `eosPending = true` にする。同一区間での重複 `EndOfStream()` 呼び出しは無視し、`eosDelivered` をリセットしない。
-2. **下流（`OmgEqxlFilter.ax` 入力ピン）への最大1回 EOS 送出**:
-   - `IMemInputPin::Receive(pSample)` の元呼び出し成功後に下流の累積バイト数とサンプル終端時刻を更新する。
-   - `active24 && eosPending && !eosDelivered && preReadDecision != SameFormat24` の状態で、下流が上流区間の最終 PCM（`sEnd >= targetEndTime` かつ `downstreamBytes >= targetBytes`、時刻なしサンプルでは `downstreamBytes >= targetBytes`）を受け取った瞬間に、`eosDelivered = true` / `eosPending = false` に遷移して `OmgEqxlFilter.ax` 入力ピンへ `IPin::EndOfStream()` を**1回だけ**送る。
-   - 下流ピンへ直接 `IPin::EndOfStream()` が呼ばれた場合も、`eosDelivered == true` なら重複呼び出しを抑止して最大 1 回を保証する。
+このイベント処理の流れと早期停止のメカニズム：
+1. `OpcDSPlay.dll` が DirectShow イベント `3841` を検知し、上位の `OmgPcMan.dll` へイベント `0x13` として中継する。
+2. `OmgPcMan.dll` は次曲の先読みのため `COpcFlacPlayer::Open(nextTrackPath, flags=1)`（`OpcFlac.dll` RVA `0x33290`）を呼び出す。
+3. `COpcFilterGraphManager::LoadNextSource`（`OpcFlac.dll` RVA `0x35720`）が実行され、次曲（16bit）のピン接続を試みるが、既存グラフ（24bit 出力に構成済み）との形式不一致により `0x80040200`（`VFW_E_INVALIDMEDIATYPE`）で失敗する。
+4. **早期停止の核心（RVA `0x33439`）**:
+   `COpcFlacPlayer::Open` は先読み接続失敗を検知すると、即座に自クラスの `COpcFlacPlayer::Close()`（RVA `0x319E0`）を呼び出す。この `Close()` が `COpcFilterGraphManager::Close()` を経由して `COpcDSPlay::Stop()` -> `IMediaControl::Stop()` を呼び出す。
+5. この結果、DirectSound レンダラーのパイプライン内に約 2.9 秒分（例: 23 秒音源では 20.161 秒時点）の 24bit PCM がまだ再生されずに残っているにもかかわらず、DirectShow グラフ全体が強制停止され、音声が切り捨てられてしまう。
+6. `COpcFlacPlayer::Open` は上位の `OmgPcMan.dll` にエラー `0x8000FFFF`（`E_UNEXPECTED`）を返し、`OmgPcMan.dll` は直ちに非シームレスのフォールバックとして通常再生 `Open(flags=0)` / `Play()` を開始するため、前曲の末尾約 2.9 秒が完全に消失したまま次曲へ切り替わっていた。
 
-## 同形式の先読み維持と、形式変更を判定できない場合の挙動
+### 2. `OmgEqxlFilter.ax`（EQ）の内部ブロック保持（末尾約 0.30 秒の欠落）
 
-### 1. 同形式の先読み（`SameFormat24`）の維持
+仮に早期停止を抑止した場合でも、EQ フィルターによる末尾欠落が発生する：
+1. `OmgEqxlFilter.ax`（CLSID `{5C968488-5E35-4CFE-98A1-A51C838797DB}`）は `8,192` フレーム単位（48 kHz で約 `170.67 ms`）で処理・出力する。
+2. `IPin::EndOfStream` を受け取るまで、内部バッファーに残った未出力フレーム（48 kHz で `10,773`〜`15,232` フレーム＝約 `0.224`〜`0.317` 秒、24.000 秒の音源では `14,400` フレーム＝`0.300` 秒）を出力ピンへフラッシュしない。
+3. `SeamlessFilter.ax` はシームレス待機時に下流へ `EndOfStream` を転送しないため、形式変更時は EQ 内部に約 0.30 秒分の PCM が閉じ込められたまま再生終端に達する。
 
-- `SeamlessFilter.ax` の独自通知 `3841`（`0xF01`、終端約 3 秒前）を抑止しないため、Music Center は通常どおり次曲の先読みを開始できる。
-- 次曲が同じサンプルレート・2ch・24bit FLAC の場合、終端の約 2.95 秒前に `OpcFlac.dll` の先読み呼び出し（RVA `0x31E7A`）で `SET_24` が適用され（`PreReadDecision::SameFormat24`）、続いて次曲の `OmgFlacSrc.ax` から `SeamlessInput->Receive()` へ新しい PCM サンプルが流入する。
-- `eosTransition::Tracker` は以下のいずれかを検知した時点で `eosPending = false` に解除し、曲境界で `OmgEqxlFilter.ax` へ `EndOfStream` を送らない：
-  1. 先読み setter（RVA `0x31E7A`）で現在グラフと同一サンプルレート・2ch・24bit の `SET_24` が成功したとき。
-  2. 上流 `SeamlessInput->EndOfStream()` の後に、Flush/Seek/Stop を挟まず `SeamlessInput` に次曲の新しい PCM サンプルまたは `NewSegment` が到着したとき。
-- これにより、`48kHz/24bit -> 48kHz/24bit` や `96kHz/24bit -> 96kHz/24bit` のシームレス先読み・連続再生をそのまま維持する。
+---
 
-### 2. 形式変更を判定できない場合（`PreReadDecision::Unknown`）の挙動
+## 設計と解決アーキテクチャ
 
-Music Center 2.7.4 x86 では、以下のケースで先読み用の RVA `0x31E7A` が呼ばれないため、setter フックだけでは「次曲が別形式か、再生終了か」を事前に区別できない（`PreReadDecision::Unknown`）：
+本試験版（`flac24_eos_experiment.dll`）では、23 秒固定判定などの決め打ちを一切排除し、DirectShow グラフごとに動的な状態機械（`eosTransition::Tracker`）と COM フック群で協調制御を行う。
 
-1. **`OpcFlac.dll` 内部の FLAC ヘッダー事前比較で弾かれる場合**:
-   `OpcFlac.dll`（RVA `0x33290` 内の `0x33386`〜`0x3340D`）は、2 個目の `OmgFlacSrc.ax` を生成する前に FLAC の `STREAMINFO` ヘッダー（`sample_rate` / `channels` / `bits_per_sample`）を前曲と比較し、1 つでも異なると RVA `0x32360`（`0x31E7A`）を呼ばずに先読み接続を見送る（例：`48kHz/24bit -> 48kHz/16bit`、`96kHz/24bit -> 48kHz/24bit`）。
-2. **次曲が FLAC 以外の形式（WAV / MP3 / AAC / DSD 等）の場合**:
-   別の再生プラグインが使われるため、`OpcFlac.dll` の RVA `0x31E7A` は呼ばれない。
-3. **プレイリスト／アルバムの最終曲で次曲が存在しない場合**:
-   先読み自体が行われないため、RVA `0x31E7A` は呼ばれない。
+### 1. `IMediaSeeking` COM フックの修正と位置追跡（Issue #21）
 
-**本試験版の挙動**:
-- 上流 `SeamlessInput->EndOfStream()` から下流 `OmgEqxlFilter.ax` が最終 PCM を受け取るまでの間（`SeamlessFilter` の出力キュー約 3 秒分のドレイン期間）に、同形式の先読み（RVA `0x31E7A` での同レート `SET_24`、または `SeamlessInput` への次曲サンプル流入）が発生しなかった場合、`PreReadDecision::Unknown` は「現在の `SeamlessFilter` ストリームはこの区間で終了する（シームレス継続しない）」と判定し、下流 `OmgEqxlFilter.ax` が当該区間の最終 PCM を受け取った直後に `IPin::EndOfStream()` を**1回だけ**送る。
-- これにより、RVA `0x31E7A` で `FormatChanged` を検知できるケースだけでなく、`OpcFlac.dll` のヘッダー比較で `0x31E7A` 以前に先読みが見送られる `48kHz/24bit -> 48kHz/16bit` や他形式遷移・最終曲でも、末尾約 `0.30` 秒の EQ 内部保持フレームが確実にフラッシュされる。
+`IMediaSeeking` は COM インターフェース（`IUnknown` から継承）であり、vtable のインデックス配置は以下の通り厳密に定義されている：
+- Index 11: `GetStopPosition(LONGLONG* pStop)`
+- Index 12: `GetCurrentPosition(LONGLONG* pCurrent)`
+- Index 14: `SetPositions(LONGLONG* pCurrent, DWORD dwCurrentFlags, LONGLONG* pStop, DWORD dwStopFlags)`
 
-## 保留EOS状態のクリア条件
+**修正点**:
+- 従来の誤った vtable インデックス 11 へのシークフックを index 14（`SetPositions`）へ修正。
+- `AM_SEEKING_NoPositioning`（`0x00`）フラグの安全な取り扱い：
+  上位から `AM_SEEKING_NoPositioning` で `pCurrent` や `pStop` に nullptr または無効ポインタが渡された場合でも、ポインタを参照せずシークリセットを行わない。
+- Index 11（`GetStopPosition`）および Index 12（`GetCurrentPosition`）をフックし、グラフごとの曲終端位置（`stopPosition`）と現在再生位置（`currentPosition`）を常時追跡する。
 
-以下のいずれかが発生した時点で、対象グラフの `eosPending` / `eosDelivered` / 区間累積カウンタを即座にクリアし、古い区間の目標値による誤発火を防ぐ：
+### 2. 形式変更時の停止保留（Stop Deferral）
 
-- **シーク**: `IMediaSeeking::SetPositions`（位置変更フラグを伴う呼び出し）
+1. `OpcFlac.dll` の先読み接続失敗により `IMediaControl::Stop()` が呼ばれた際、フック `controlStopHook` が `tracker.isFormatChangePending(graph)` を判定する。
+2. 形式変更が保留中（上流 EOS 到達済み、かつ現在位置が終端位置 `stopPos` 未満、または下流受信バイト数が目標未満）の場合：
+   - 即座の `originalControlStop` 呼び出しを保留する。
+   - まだ EQ へ `EndOfStream` を送っていなければ、`OmgEqxlFilter.ax` の入力ピンをグラフから探索し、`IPin::EndOfStream()` を**1回だけ**送出して EQ 内の全 PCM を DirectSound へ吐き出させる。
+   - `PeekMessage` / `MsgWaitForMultipleObjectsEx` によるメッセージポンプを行いながら、DirectSound が前曲の最終 PCM を `stopPos` まで再生し切るのを待機する（最大 4.5 秒の安全上限付き）。
+   - 再生完了後、`originalControlStop` を実行してグラフを正常停止し、次曲への切り替えを完了させる。
+
+### 3. 先読みイベント `3841`（`0x0F01`）と各遷移パターンにおける挙動
+
+- `SeamlessFilter.ax` の独自通知 `3841` は一切抑止せず通常どおり上位へ配送する。
+- **同形式の連続再生（`SameFormat24`）**:
+  先読み setter（RVA `0x31E7A`）で同レート・2ch・24bit が適用されるか、Flush/Seek なしで次曲のサンプルが `SeamlessInput` に流入した瞬間に `eosPending` を解除する。停止保留も発動せず、シームレス連続再生が完全に維持される。
+- **形式変更時（`FormatChanged` / `Unknown`）**:
+  先読み失敗による早期 `Stop()` が保留され、EQ への EOS 送出と DirectSound ドレインを経て、末尾まで欠落なく再生された後に安全に次曲へ遷移する。
+- **プレイリスト終端（次曲なし）**:
+  `OmgPcMan.dll` が `SetEndOfTrack()` を呼ぶか、先読みが発生しないまま終端へ向かう。下流が最終 PCM を受信した時点で EQ へ EOS が送られ、DirectShow の `EC_COMPLETE` まで全フレームが正常出力される。
+
+### 4. 保留状態のクリア条件
+
+以下のいずれかが発生した時点で、対象グラフの保留状態・区間カウンタを即座にリセットし、誤発火を防止する：
+- **シーク**: `IMediaSeeking::SetPositions`（`AM_SEEKING_PositioningBitsMask != AM_SEEKING_NoPositioning`）
 - **Flush**: `SeamlessFilter.ax` または `OmgEqxlFilter.ax` 入力ピンの `IPin::BeginFlush` / `IPin::EndFlush`
-- **停止**: `IMediaControl::Stop` / `IMediaFilter::Stop`
+- **停止完了**: `IMediaControl::Stop` の正規実行後
 - **手動曲変更・新規トラック開始**: `OpcFlac.dll` 通常開始呼び出し（RVA `0x32A85`）
 
-## ビルドとヘッドレス状態遷移テスト
+---
+
+## ビルドとヘッドレス検証テスト
 
 ```powershell
 cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_EXPERIMENTS=ON
@@ -66,37 +82,48 @@ cmake --build build-Win32 --config Release --target flac24_eos_experiment eos_tr
 .\build-Win32\Release\eos_transition_tests.exe
 ```
 
-`eos_transition_tests.exe` は GUI や Music Center 本体の起動を必要とせず、以下を検証する：
+`eos_transition_tests.exe` は以下の全 10 項目をヘッドレス（GUI・本体起動不要）で検証する：
 
-1. 非 23 秒の任意長（`1.0s`、シーク後の `29.016s`、非ブロック境界の `51,733` フレーム＝約 `1.0778s`）および時刻なしサンプルでの最終 PCM 到達後 EOS 発火
-2. 上流・下流の重複 `EndOfStream` 呼び出しに対する最大 1 回送出保証
-3. 同形式 24bit 先読み（`SameFormat24` および次曲サンプル流入）での保留 EOS 解除と連続再生維持
-4. 形式変更（16bit / サンプルレート変更）および形式変更未確定（`Unknown`）時の最終 PCM 到達後 EOS 送出、16bit 非対象グラフでの非干渉
-5. `Seek` / `BeginFlush` / `EndFlush` / `Stop` / `ManualTrackChange` による保留 EOS クリアと再開始
-6. 複数グラフ同時追跡時の独立性
-7. Win32 環境での実 `OmgEqxlFilter.ax` COM インスタンスとの結合テスト（EOS 送出前の `10,773` フレーム内部保持と、最終チャンクでの EOS 1 回送出による全 `51,733` フレーム＋同形式 2 曲連続 `48,000` フレームの出力確認）
+1. **非 23 秒の任意長および時刻なしサンプル**: 短尺 1.0s、シーク後 29.016s、非ブロック境界フレームでの目標到達後 EOS 発火
+2. **重複 EOS 抑止**: 上流・下流からの複数回 `EndOfStream` に対する最大 1 回送出保証
+3. **同形式 24bit 先読み維持**: `SameFormat24` および次曲サンプル流入時の EOS 発火抑止と連続再生維持
+4. **形式変更（16bit / レート変更）および未確定（`Unknown`）時**: 目標到達後の EOS 送出と、16bit グラフへの非干渉
+5. **状態クリア**: `Seek` / `BeginFlush` / `EndFlush` / `Stop` / `ManualTrackChange` による状態リセットと再開始
+6. **複数グラフ同時追跡**: 複数 DirectShow グラフ間の完全な分離独立
+7. **DirectShow 実 EQ フィルター結合**: `OmgEqxlFilter.ax` インスタンスを用いた `10,773` フレーム内部保持と EOS 1 回送出による全 `51,733` フレーム出力検証
+8. **COM vtable フックおよび測位フラグ安全性（Issue #21）**:
+   - `IMediaSeeking` vtable index 11 (`GetStopPosition`)、index 12 (`GetCurrentPosition`)、index 14 (`SetPositions`) のフック動作検証
+   - `AM_SEEKING_NoPositioning` 渡却時の nullptr 安全性、非シーク時の状態保持検証
+   - 実シーク時の位置更新と `ResetReason::Seek` リセット検証
+9. **形式変更時の停止保留と `trackTail::analyzeStream` 検証（Issue #21）**:
+   - 20.161 秒時点の早期 `Stop()` を保留し、`OmgEqxlFilter.ax` へ EOS を 1 回送出後、23.000 秒まで PCM が出力されることを `#19` の末尾解析器で検証（`tailComplete == true`, `missingTailFrames == 0`, `missingTailMs == 0.0`）
+10. **プレイリスト終端ドレインと `trackTail::analyzeStream` 検証（Issue #21）**:
+    - 次曲が存在しないケースで最終サンプル受信時に EOS が送出され、全 PCM が出力されることを検証
 
-## Music Center 本体での試験起動手順
+---
+
+## Music Center 本体での実機検証手順
 
 > [!IMPORTANT]
-> `flac24_eos_experiment.dll` は通常版 `flac24_override.dll` や診断用 `end_probe.dll` と同じ DirectShow / MinHook 対象をフックするため、**絶対に同一プロセスへ重ねてロードしないこと**。切り替える際は必ず Music Center を完全終了して再起動する。
+> `flac24_eos_experiment.dll` は通常版 `flac24_override.dll` と同一の DirectShow 関数をフックするため、**絶対に同一プロセスへ重ねてロードしないこと**。切り替える際は必ず Music Center を完全終了して再起動する。
 
-1. 通常の `MC HiRes Bridge.exe` を使わず、`MusicCenter.exe` を単体で起動し、再生を始める前に対象 PID を確認する。
-2. 診断ツールの `inject.exe` をビルドしていない場合は `-DMC_BRIDGE_BUILD_DIAGNOSTICS=ON` を付けて `inject` をビルドする。
-
+1. `inject.exe` と試験用 DLL をビルドする：
 ```powershell
 cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON -DMC_BRIDGE_BUILD_EXPERIMENTS=ON
 cmake --build build-Win32 --config Release --target inject flac24_eos_experiment
 ```
 
-3. 初回再生前に対象 PID へ `flac24_eos_experiment.dll` をロードする：
-
+2. `MusicCenter.exe` を単体で起動し、再生前に対象 PID へロードする：
 ```powershell
 $targetPid = (Get-Process MusicCenter).Id
 $dll = (Resolve-Path .\build-Win32\Release\flac24_eos_experiment.dll).Path
 & .\build-Win32\Release\inject.exe $targetPid $dll
 ```
 
-4. Music Center 上で `HR-BR RDY` 表示と `%TEMP%\Flac24Override-<PID>.tsv` の `READY` を確認してから再生を開始する。
+3. Music Center の画面右上に `HR-BR RDY` が表示され、`%TEMP%\Flac24Override-<PID>.tsv` に `READY` が出力されたことを確認してから再生を開始する。
+4. 以下の再生パターンの遷移音声をスピーカーまたはループバック録音で確認する：
+   - `48kHz/24bit -> 48kHz/16bit`（末尾約 2.9 秒および 0.30 秒が途切れず自然に次曲へ遷移すること）
+   - `96kHz/24bit -> 96kHz/24bit`（シームレス先読みが維持されギャップレスに再生されること）
+   - 再生中のシーク操作、一時停止、手動曲送りでノイズやフリーズが発生しないこと
    - ログには通常の `SET_24` / `PASS_THROUGH` / `STATUS_ON` に加え、`EOS_NEW_SEGMENT`、`EOS_UPSTREAM`、`EOS_PREREAD_24` / `EOS_PREREAD_DIFF`、`EOS_DELIVERED_DOWNSTREAM`（または `EOS_DELIVERED_IMMEDIATE`）、`EOS_RESET_*` が記録される。
 5. 試験終了時は Music Center を完全終了して再起動すると解除される。

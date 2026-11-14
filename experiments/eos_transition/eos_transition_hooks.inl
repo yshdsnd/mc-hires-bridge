@@ -168,6 +168,7 @@ using PinSegmentFn = HRESULT(STDMETHODCALLTYPE*)(IPin*, REFERENCE_TIME, REFERENC
 using MemReceiveFn = HRESULT(STDMETHODCALLTYPE*)(IMemInputPin*, IMediaSample*);
 using ControlStopFn = HRESULT(STDMETHODCALLTYPE*)(IMediaControl*);
 using FilterStopFn = HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*);
+using GetPositionFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*);
 using SetPositionsFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*, DWORD, LONGLONG*, DWORD);
 
 static MemReceiveFn originalSeamlessReceive = nullptr;
@@ -184,26 +185,21 @@ static PinSegmentFn originalEqNewSegment = nullptr;
 
 static ControlStopFn originalControlStop = nullptr;
 static FilterStopFn originalFilterStop = nullptr;
+static GetPositionFn originalGetStopPosition = nullptr;
+static GetPositionFn originalGetCurrentPosition = nullptr;
 static SetPositionsFn originalSetPositions = nullptr;
 
 static HRESULT STDMETHODCALLTYPE originalEqEndOfStream(IPin* pin) {
     return originalEqEos ? originalEqEos(pin) : S_OK;
 }
 
-static IPin* findEqInputPinInGraph(IPin* seamlessPin) {
-    if (!seamlessPin) return nullptr;
-    PIN_INFO pi{};
-    if (FAILED(seamlessPin->QueryPinInfo(&pi)) || !pi.pFilter) return nullptr;
-    FILTER_INFO fi{};
-    HRESULT hr = pi.pFilter->QueryFilterInfo(&fi);
-    pi.pFilter->Release();
-    if (FAILED(hr) || !fi.pGraph) return nullptr;
-
+static IPin* findEqInputPinFromGraph(IFilterGraph* graph) {
+    if (!graph) return nullptr;
     CLSID eqClsid{};
     CLSIDFromString(L"{5C968488-5E35-4CFE-98A1-A51C838797DB}", &eqClsid);
     IPin* foundPin = nullptr;
     IEnumFilters* filters = nullptr;
-    if (SUCCEEDED(fi.pGraph->EnumFilters(&filters))) {
+    if (SUCCEEDED(graph->EnumFilters(&filters))) {
         IBaseFilter* f = nullptr;
         while (filters->Next(1, &f, nullptr) == S_OK) {
             CLSID cls{};
@@ -227,6 +223,18 @@ static IPin* findEqInputPinInGraph(IPin* seamlessPin) {
         }
         filters->Release();
     }
+    return foundPin;
+}
+
+static IPin* findEqInputPinInGraph(IPin* seamlessPin) {
+    if (!seamlessPin) return nullptr;
+    PIN_INFO pi{};
+    if (FAILED(seamlessPin->QueryPinInfo(&pi)) || !pi.pFilter) return nullptr;
+    FILTER_INFO fi{};
+    HRESULT hr = pi.pFilter->QueryFilterInfo(&fi);
+    pi.pFilter->Release();
+    if (FAILED(hr) || !fi.pGraph) return nullptr;
+    IPin* foundPin = findEqInputPinFromGraph(fi.pGraph);
     fi.pGraph->Release();
     return foundPin;
 }
@@ -389,6 +397,88 @@ static HRESULT STDMETHODCALLTYPE eqNewSegmentHook(IPin* self, REFERENCE_TIME tSt
 static HRESULT STDMETHODCALLTYPE controlStopHook(IMediaControl* self) {
     if (!inEosHook) {
         void* key = graphKeyFromObject(self);
+        bool pendingFormatChange = false;
+        AcquireSRWLockShared(&eosLock);
+        pendingFormatChange = eosTracker.isFormatChangePending(key);
+        ReleaseSRWLockShared(&eosLock);
+
+        if (pendingFormatChange) {
+            record("EOS_STOP_DEFERRED_START", 0, 0, S_OK);
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.markFormatChangeStopDeferred(key);
+            ReleaseSRWLockExclusive(&eosLock);
+
+            // 1. Deliver EOS once to EQ if not yet delivered
+            IFilterGraph* graph = nullptr;
+            if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&graph))) && graph) {
+                IPin* eqPin = findEqInputPinFromGraph(graph);
+                if (eqPin) {
+                    bool deliverNow = false;
+                    AcquireSRWLockExclusive(&eosLock);
+                    const auto* g = eosTracker.findGraph(key);
+                    deliverNow = g && !g->eosDelivered;
+                    if (deliverNow) {
+                        eosTracker.onDownstreamEndOfStream(key);
+                    }
+                    ReleaseSRWLockExclusive(&eosLock);
+                    if (deliverNow && originalEqEos) {
+                        EosHookScope scope;
+                        originalEqEndOfStream(eqPin);
+                        record("EOS_DELIVERED_DEFERRED_STOP", 0, 1, S_OK);
+                    }
+                    eqPin->Release();
+                }
+                graph->Release();
+            }
+
+            // 2. Query IMediaSeeking to wait for track end drain
+            IMediaSeeking* seeking = nullptr;
+            self->QueryInterface(IID_PPV_ARGS(&seeking));
+            LONGLONG curPos = 0, stopPos = 0;
+            DWORD remainingMs = 0;
+            if (seeking && SUCCEEDED(seeking->GetCurrentPosition(&curPos)) &&
+                SUCCEEDED(seeking->GetStopPosition(&stopPos)) && stopPos > curPos) {
+                remainingMs = static_cast<DWORD>((stopPos - curPos) / 10000);
+            } else {
+                AcquireSRWLockShared(&eosLock);
+                const auto* g = eosTracker.findGraph(key);
+                if (g && g->targetBytes > g->downstreamBytes && g->sampleRate > 0) {
+                    uint64_t diff = g->targetBytes - g->downstreamBytes;
+                    uint32_t align = (g->bitsPerSample / 8) * (g->channels > 0 ? g->channels : 2);
+                    if (align > 0) {
+                        remainingMs = static_cast<DWORD>((diff * 1000ULL) / (g->sampleRate * align));
+                    }
+                }
+                ReleaseSRWLockShared(&eosLock);
+            }
+
+            DWORD startTick = GetTickCount();
+            DWORD maxWait = remainingMs > 0 ? (remainingMs + 300) : 3000;
+            if (maxWait > 4500) maxWait = 4500; // safety ceiling: max 4.5s
+
+            while (true) {
+                LONGLONG c = 0, s = 0;
+                if (seeking && SUCCEEDED(seeking->GetCurrentPosition(&c)) &&
+                    SUCCEEDED(seeking->GetStopPosition(&s))) {
+                    if (c >= s && s > 0) break;
+                }
+                if (GetTickCount() - startTick >= maxWait) break;
+
+                MSG msg;
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                Sleep(15);
+            }
+            if (seeking) seeking->Release();
+
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.onFormatChangeCompleted(key);
+            ReleaseSRWLockExclusive(&eosLock);
+            record("EOS_STOP_DEFERRED_COMPLETE", remainingMs, GetTickCount() - startTick, S_OK);
+        }
+
         AcquireSRWLockExclusive(&eosLock);
         eosTracker.onStop(key);
         ReleaseSRWLockExclusive(&eosLock);
@@ -408,17 +498,43 @@ static HRESULT STDMETHODCALLTYPE filterStopHook(IMediaFilter* self) {
     return originalFilterStop(self);
 }
 
+static HRESULT STDMETHODCALLTYPE getStopPositionHook(IMediaSeeking* self, LONGLONG* pStop) {
+    auto hr = originalGetStopPosition(self, pStop);
+    if (!inEosHook && SUCCEEDED(hr) && pStop) {
+        void* key = graphKeyFromObject(self);
+        AcquireSRWLockExclusive(&eosLock);
+        eosTracker.onStopPositionReported(key, *pStop);
+        ReleaseSRWLockExclusive(&eosLock);
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE getCurrentPositionHook(IMediaSeeking* self, LONGLONG* pCurrent) {
+    auto hr = originalGetCurrentPosition(self, pCurrent);
+    if (!inEosHook && SUCCEEDED(hr) && pCurrent) {
+        void* key = graphKeyFromObject(self);
+        AcquireSRWLockExclusive(&eosLock);
+        eosTracker.onCurrentPositionReported(key, *pCurrent);
+        ReleaseSRWLockExclusive(&eosLock);
+    }
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE setPositionsHook(IMediaSeeking* self, LONGLONG* pCurrent, DWORD dwCurrentFlags,
                                                   LONGLONG* pStop, DWORD dwStopFlags) {
     if (!inEosHook) {
-        bool modifiesPos = (dwCurrentFlags & AM_SEEKING_PositioningBitsMask) != AM_SEEKING_NoPositioning ||
-                           (dwStopFlags & AM_SEEKING_PositioningBitsMask) != AM_SEEKING_NoPositioning;
-        if (modifiesPos) {
+        const DWORD currPosBits = dwCurrentFlags & AM_SEEKING_PositioningBitsMask;
+        const DWORD stopPosBits = dwStopFlags & AM_SEEKING_PositioningBitsMask;
+        bool modifiesCurr = (currPosBits != AM_SEEKING_NoPositioning) && (pCurrent != nullptr);
+        bool modifiesStop = (stopPosBits != AM_SEEKING_NoPositioning) && (pStop != nullptr);
+        if (modifiesCurr || modifiesStop) {
             void* key = graphKeyFromObject(self);
+            LONGLONG newPos = modifiesCurr ? *pCurrent : -1;
+            LONGLONG newStop = modifiesStop ? *pStop : -1;
             AcquireSRWLockExclusive(&eosLock);
-            eosTracker.onSeek(key);
+            eosTracker.onSeekPositions(key, modifiesCurr, newPos, modifiesStop, newStop);
             ReleaseSRWLockExclusive(&eosLock);
-            record("EOS_RESET_SEEK", pCurrent ? static_cast<DWORD>(*pCurrent / 10000) : 0, dwCurrentFlags, S_OK);
+            record("EOS_RESET_SEEK", modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
         }
     }
     return originalSetPositions(self, pCurrent, dwCurrentFlags, pStop, dwStopFlags);
@@ -490,7 +606,9 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
     IMediaSeeking* seeking = nullptr;
     if (ok && SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&seeking)))) {
         auto seekVtable = *reinterpret_cast<void***>(seeking);
-        ok = MH_CreateHook(seekVtable[11], reinterpret_cast<void*>(setPositionsHook), reinterpret_cast<void**>(&originalSetPositions)) == MH_OK;
+        ok = MH_CreateHook(seekVtable[11], reinterpret_cast<void*>(getStopPositionHook), reinterpret_cast<void**>(&originalGetStopPosition)) == MH_OK &&
+             MH_CreateHook(seekVtable[12], reinterpret_cast<void*>(getCurrentPositionHook), reinterpret_cast<void**>(&originalGetCurrentPosition)) == MH_OK &&
+             MH_CreateHook(seekVtable[14], reinterpret_cast<void*>(setPositionsHook), reinterpret_cast<void**>(&originalSetPositions)) == MH_OK;
         seeking->Release();
     } else {
         ok = false;

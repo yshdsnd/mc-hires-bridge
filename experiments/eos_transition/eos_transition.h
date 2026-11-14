@@ -48,9 +48,16 @@ struct GraphState {
     REFERENCE_TIME downstreamLastEndTime = -1;
     bool downstreamHasTimestamp = false;
 
+    LONGLONG stopPosition = 0;
+    LONGLONG currentPosition = 0;
+    bool hasStopPosition = false;
+    bool hasCurrentPosition = false;
+
     PreReadDecision preReadDecision = PreReadDecision::Unknown;
     bool eosPending = false;
     bool eosDelivered = false;
+    bool formatChangeStopDeferred = false;
+    bool formatChangeCompleted = false;
     uint32_t downstreamEosDeliveredCount = 0;
     uint32_t seamlessTransitionCount = 0;
     ResetReason lastResetReason = ResetReason::NewSegment;
@@ -225,6 +232,64 @@ public:
         return true;
     }
 
+    void onStopPositionReported(void* graphKey, LONGLONG stopPos) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.stopPosition = stopPos;
+        s.hasStopPosition = true;
+    }
+
+    void onCurrentPositionReported(void* graphKey, LONGLONG currentPos) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.currentPosition = currentPos;
+        s.hasCurrentPosition = true;
+    }
+
+    void onSeekPositions(void* graphKey, bool modifiesCurrent, LONGLONG currentPos, bool modifiesStop, LONGLONG stopPos) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        clearSegmentCounters(s, ResetReason::Seek);
+        if (modifiesStop && stopPos >= 0) {
+            s.stopPosition = stopPos;
+            s.hasStopPosition = true;
+        }
+        if (modifiesCurrent && currentPos >= 0) {
+            s.currentPosition = currentPos;
+            s.hasCurrentPosition = true;
+        }
+    }
+
+    bool isFormatChangePending(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        if (!s) return false;
+        if (!s->active24) return false;
+        if (s->preReadDecision != PreReadDecision::FormatChanged) return false;
+        if (s->upstreamEosCount == 0) return false;
+        if (!s->eosDelivered) return true;
+        if (s->hasStopPosition && s->hasCurrentPosition && s->currentPosition < s->stopPosition) {
+            return true;
+        }
+        if (s->targetBytes > 0 && s->downstreamBytes < s->targetBytes) {
+            return true;
+        }
+        return false;
+    }
+
+    void markFormatChangeStopDeferred(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.formatChangeStopDeferred = true;
+    }
+
+    void onFormatChangeCompleted(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.formatChangeCompleted = true;
+        s.formatChangeStopDeferred = false;
+        s.eosPending = false;
+    }
+
     void onReset(void* graphKey, ResetReason reason) {
         if (graphKey) {
             auto it = graphs_.find(graphKey);
@@ -288,6 +353,10 @@ private:
         s.downstreamBytes = 0;
         s.downstreamLastEndTime = -1;
         s.downstreamHasTimestamp = false;
+        s.hasStopPosition = false;
+        s.hasCurrentPosition = false;
+        s.formatChangeStopDeferred = false;
+        s.formatChangeCompleted = false;
         s.preReadDecision = PreReadDecision::Unknown;
         s.eosPending = false;
         s.eosDelivered = false;

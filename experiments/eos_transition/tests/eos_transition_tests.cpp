@@ -1,4 +1,4 @@
-// Headless state-transition and DirectShow filter integration tests for Issue #20
+// Headless state-transition and DirectShow filter integration tests for Issue #20 / #21
 // (experimental segment-based EOS delivery across format-changing transitions).
 #include <windows.h>
 #include <dshow.h>
@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "MinHook.h"
+#include "track_tail_check.h"
 #include "eos_transition.h"
 
 namespace {
@@ -852,11 +854,325 @@ void testDirectShowEqFilterIntegration() {
 }
 #endif
 
+// Test 8: COM vtable hooks on IMediaSeeking (vtable[11], [12], [14]) and AM_SEEKING_NoPositioning safety
+class MockMediaSeeking final : public IMediaSeeking {
+public:
+    LONGLONG currentPos = 10000000LL; // 1.0s
+    LONGLONG stopPos = 230000000LL;    // 23.0s
+    LONGLONG duration = 230000000LL;
+    int setPositionsCallCount = 0;
+    int getStopPositionCallCount = 0;
+    int getCurrentPositionCallCount = 0;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IMediaSeeking) {
+            *ppv = static_cast<IMediaSeeking*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++ref_; }
+    ULONG STDMETHODCALLTYPE Release() override { return --ref_; }
+
+    HRESULT STDMETHODCALLTYPE GetCapabilities(DWORD*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE CheckCapabilities(DWORD*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE IsFormatSupported(const GUID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE QueryPreferredFormat(GUID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetTimeFormat(GUID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE IsUsingTimeFormat(const GUID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetTimeFormat(const GUID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetDuration(LONGLONG* pDuration) override {
+        if (!pDuration) return E_POINTER;
+        *pDuration = duration;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetStopPosition(LONGLONG* pStop) override {
+        ++getStopPositionCallCount;
+        if (!pStop) return E_POINTER;
+        *pStop = stopPos;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetCurrentPosition(LONGLONG* pCurrent) override {
+        ++getCurrentPositionCallCount;
+        if (!pCurrent) return E_POINTER;
+        *pCurrent = currentPos;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE ConvertTimeFormat(LONGLONG*, const GUID*, LONGLONG, const GUID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPositions(LONGLONG* pCurrent, DWORD dwCurrentFlags,
+                                          LONGLONG* pStop, DWORD dwStopFlags) override {
+        ++setPositionsCallCount;
+        DWORD currBits = dwCurrentFlags & AM_SEEKING_PositioningBitsMask;
+        DWORD stopBits = dwStopFlags & AM_SEEKING_PositioningBitsMask;
+        if (currBits == AM_SEEKING_AbsolutePositioning && pCurrent) {
+            currentPos = *pCurrent;
+        }
+        if (stopBits == AM_SEEKING_AbsolutePositioning && pStop) {
+            stopPos = *pStop;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPositions(LONGLONG* pCurrent, LONGLONG* pStop) override {
+        if (pCurrent) *pCurrent = currentPos;
+        if (pStop) *pStop = stopPos;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetAvailable(LONGLONG*, LONGLONG*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetRate(double) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetRate(double*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetPreroll(LONGLONG*) override { return E_NOTIMPL; }
+
+private:
+    std::atomic<ULONG> ref_{1};
+};
+
+using GetPositionFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*);
+using SetPositionsFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*, DWORD, LONGLONG*, DWORD);
+
+static GetPositionFn g_testOrigGetStopPosition = nullptr;
+static GetPositionFn g_testOrigGetCurrentPosition = nullptr;
+static SetPositionsFn g_testOrigSetPositions = nullptr;
+static eosTransition::Tracker* g_testTracker = nullptr;
+static void* g_testGraphKey = nullptr;
+
+static HRESULT STDMETHODCALLTYPE testHookGetStopPosition(IMediaSeeking* self, LONGLONG* pStop) {
+    auto hr = g_testOrigGetStopPosition(self, pStop);
+    if (SUCCEEDED(hr) && pStop && g_testTracker) {
+        g_testTracker->onStopPositionReported(g_testGraphKey, *pStop);
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE testHookGetCurrentPosition(IMediaSeeking* self, LONGLONG* pCurrent) {
+    auto hr = g_testOrigGetCurrentPosition(self, pCurrent);
+    if (SUCCEEDED(hr) && pCurrent && g_testTracker) {
+        g_testTracker->onCurrentPositionReported(g_testGraphKey, *pCurrent);
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE testHookSetPositions(IMediaSeeking* self, LONGLONG* pCurrent, DWORD dwCurrentFlags,
+                                                     LONGLONG* pStop, DWORD dwStopFlags) {
+    const DWORD currPosBits = dwCurrentFlags & AM_SEEKING_PositioningBitsMask;
+    const DWORD stopPosBits = dwStopFlags & AM_SEEKING_PositioningBitsMask;
+    bool modifiesCurr = (currPosBits != AM_SEEKING_NoPositioning) && (pCurrent != nullptr);
+    bool modifiesStop = (stopPosBits != AM_SEEKING_NoPositioning) && (pStop != nullptr);
+    if ((modifiesCurr || modifiesStop) && g_testTracker) {
+        LONGLONG newPos = modifiesCurr ? *pCurrent : -1;
+        LONGLONG newStop = modifiesStop ? *pStop : -1;
+        g_testTracker->onSeekPositions(g_testGraphKey, modifiesCurr, newPos, modifiesStop, newStop);
+    }
+    return g_testOrigSetPositions(self, pCurrent, dwCurrentFlags, pStop, dwStopFlags);
+}
+
+#pragma optimize("", off)
+static IMediaSeeking* createMockMediaSeeking() {
+    return new MockMediaSeeking();
+}
+#pragma optimize("", on)
+
+void testMediaSeekingComVtableHooks() {
+    std::printf("[TEST 8] IMediaSeeking COM vtable hooks (index 11, 12, 14) and positioning flag safety...\n");
+    CHECK(MH_Initialize() == MH_OK);
+
+    eosTransition::Tracker tracker;
+    void* graph = reinterpret_cast<void*>(0x8888);
+    tracker.onGraphActivated(graph, true, 48000, 2, 24);
+    tracker.onUpstreamNewSegment(graph, 0, 230000000LL, 1.0);
+
+    g_testTracker = &tracker;
+    g_testGraphKey = graph;
+
+    IMediaSeeking* pSeeking = createMockMediaSeeking();
+    auto* mock = static_cast<MockMediaSeeking*>(pSeeking);
+    auto seekVtable = *reinterpret_cast<void***>(pSeeking);
+
+    auto h1 = MH_CreateHook(seekVtable[11], reinterpret_cast<void*>(testHookGetStopPosition),
+                            reinterpret_cast<void**>(&g_testOrigGetStopPosition));
+    auto h2 = MH_CreateHook(seekVtable[12], reinterpret_cast<void*>(testHookGetCurrentPosition),
+                            reinterpret_cast<void**>(&g_testOrigGetCurrentPosition));
+    auto h3 = MH_CreateHook(seekVtable[14], reinterpret_cast<void*>(testHookSetPositions),
+                            reinterpret_cast<void**>(&g_testOrigSetPositions));
+    CHECK(h1 == MH_OK);
+    CHECK(h2 == MH_OK);
+    CHECK(h3 == MH_OK);
+    CHECK(MH_EnableHook(MH_ALL_HOOKS) == MH_OK);
+
+    // 1. Verify GetStopPosition (vtable[11])
+    LONGLONG stop = 0;
+    CHECK(SUCCEEDED(pSeeking->GetStopPosition(&stop)));
+    CHECK(stop == 230000000LL);
+    CHECK(mock->getStopPositionCallCount == 1);
+    const auto* st = tracker.findGraph(graph);
+    CHECK(st != nullptr && st->hasStopPosition && st->stopPosition == 230000000LL);
+
+    // 2. Verify GetCurrentPosition (vtable[12])
+    LONGLONG curr = 0;
+    CHECK(SUCCEEDED(pSeeking->GetCurrentPosition(&curr)));
+    CHECK(curr == 10000000LL);
+    CHECK(mock->getCurrentPositionCallCount == 1);
+    CHECK(st->hasCurrentPosition && st->currentPosition == 10000000LL);
+
+    // 3. Verify AM_SEEKING_NoPositioning safety (both nullptr and dummy pointers)
+    CHECK(SUCCEEDED(pSeeking->SetPositions(nullptr, AM_SEEKING_NoPositioning, nullptr, AM_SEEKING_NoPositioning)));
+    CHECK(mock->setPositionsCallCount == 1);
+    CHECK(st->lastResetReason != eosTransition::ResetReason::Seek);
+
+    LONGLONG dummyPos = 99999LL;
+    CHECK(SUCCEEDED(pSeeking->SetPositions(&dummyPos, AM_SEEKING_NoPositioning, &dummyPos, AM_SEEKING_NoPositioning)));
+    CHECK(mock->setPositionsCallCount == 2);
+    CHECK(mock->currentPos == 10000000LL); // Must NOT be overwritten
+    CHECK(mock->stopPos == 230000000LL);    // Must NOT be overwritten
+    CHECK(st->lastResetReason != eosTransition::ResetReason::Seek);
+
+    // 4. Verify SetPositions with real seek flags (vtable[14])
+    LONGLONG seekPos = 50000000LL; // seek to 5.0s
+    CHECK(SUCCEEDED(pSeeking->SetPositions(&seekPos, AM_SEEKING_AbsolutePositioning, nullptr, AM_SEEKING_NoPositioning)));
+    CHECK(mock->setPositionsCallCount == 3);
+    CHECK(mock->currentPos == 50000000LL);
+    CHECK(st->lastResetReason == eosTransition::ResetReason::Seek);
+    CHECK(st->hasCurrentPosition && st->currentPosition == 50000000LL);
+
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
+    pSeeking->Release();
+    g_testTracker = nullptr;
+    g_testGraphKey = nullptr;
+}
+
+// Test 9: Defer format-changing transition until track end with track-tail analyzer check (#19 analyzer)
+void testDeferredFormatChangeWithTrackTailCheck() {
+    std::printf("[TEST 9] Defer format change transition until track end + trackTail::analyzeStream check...\n");
+    eosTransition::Tracker tracker;
+    void* graph = reinterpret_cast<void*>(0x9999);
+    tracker.onGraphActivated(graph, true, 48000, 2, 24);
+
+    const size_t track1Frames = 24000; // 0.500s of 48kHz/24bit audio (boosted tail in final 300ms)
+    std::vector<uint8_t> pcmStream;
+    trackTail::appendSynthesizedTrack(pcmStream, 48000, 24, track1Frames, false);
+    CHECK(pcmStream.size() == track1Frames * 6);
+
+    const REFERENCE_TIME segDuration = static_cast<REFERENCE_TIME>((track1Frames * 10000000ULL) / 48000ULL);
+    tracker.onUpstreamNewSegment(graph, 0, segDuration, 1.0);
+    tracker.onStopPositionReported(graph, segDuration);
+
+    // Upstream feeds 5 chunks of 4,800 frames (28,800 bytes)
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 5; ++i) {
+        REFERENCE_TIME sStart = static_cast<REFERENCE_TIME>(i) * 1000000LL;
+        REFERENCE_TIME sEnd = static_cast<REFERENCE_TIME>(i + 1) * 1000000LL;
+        tracker.onUpstreamSamplePreReceive(graph, chunkBytes);
+        tracker.onUpstreamSample(graph, chunkBytes, true, sStart, sEnd);
+    }
+
+    // Upstream finishes decoding ahead of DirectSound playback clock (~3s before end in Music Center)
+    CHECK(!tracker.onUpstreamEndOfStream(graph));
+
+    // Format change candidate reported at 0x31E7A (e.g. next track is 16-bit FLAC)
+    tracker.onPreReadFormatCandidate(graph, false, 48000, 2, 16);
+
+    // Verify format change transition is detected and pending
+    CHECK(tracker.isFormatChangePending(graph) == true);
+    const auto* st = tracker.findGraph(graph);
+    CHECK(st != nullptr && st->preReadDecision == eosTransition::PreReadDecision::FormatChanged);
+    CHECK(st->eosPending == true && !st->eosDelivered);
+
+    // Downstream plays out chunks 0..3 (4800 * 4 = 19,200 frames)
+    for (int i = 0; i < 4; ++i) {
+        REFERENCE_TIME sStart = static_cast<REFERENCE_TIME>(i) * 1000000LL;
+        REFERENCE_TIME sEnd = static_cast<REFERENCE_TIME>(i + 1) * 1000000LL;
+        tracker.onCurrentPositionReported(graph, sEnd);
+        CHECK(!tracker.onDownstreamSample(graph, chunkBytes, true, sStart, sEnd));
+        CHECK(tracker.isFormatChangePending(graph) == true);
+    }
+
+    // Final chunk 4 reaches EQ: triggers EOS delivery once!
+    REFERENCE_TIME finalStart = 4000000LL;
+    REFERENCE_TIME finalEnd = 5000000LL;
+    tracker.onCurrentPositionReported(graph, finalEnd);
+    CHECK(tracker.onDownstreamSample(graph, chunkBytes, true, finalStart, finalEnd));
+    CHECK(st->eosDelivered == true);
+    CHECK(st->downstreamEosDeliveredCount == 1);
+
+    // DirectSound drains to track end (curPos >= stopPos)
+    tracker.onCurrentPositionReported(graph, segDuration);
+    CHECK(tracker.isFormatChangePending(graph) == false);
+
+    // Deferred stop completes cleanly
+    tracker.onFormatChangeCompleted(graph);
+    tracker.onStop(graph);
+
+    // Verify Track 1 tail completeness using #19's analyzer
+    auto a1 = trackTail::analyzeStream(pcmStream.data(), pcmStream.size(), 48000, 24, track1Frames);
+    CHECK(a1.tailComplete == true);
+    CHECK(a1.missingTailFrames == 0);
+    CHECK(a1.missingTailMs == 0.0);
+    CHECK(a1.approx300msMissing == false);
+    CHECK(a1.track1LastFrame == track1Frames);
+
+    // Now append next track (48kHz/16bit stereo anti-phase, 12,000 frames)
+    const size_t track2Frames = 12000;
+    trackTail::appendSynthesizedTrack(pcmStream, 48000, 16, track2Frames, true);
+
+    // Verify 24-bit analysis on Track 1 boundary: Track 1 tail is 100% intact before Track 2
+    auto a2 = trackTail::analyzeStream(pcmStream.data(), track1Frames * 6, 48000, 24, track1Frames);
+    CHECK(a2.tailComplete == true);
+    CHECK(a2.missingTailFrames == 0);
+}
+
+// Test 10: Playlist-end (no next track) drain with track-tail analyzer check
+void testPlaylistEndDrainWithTrackTailCheck() {
+    std::printf("[TEST 10] Playlist-end drain (no next track) + trackTail::analyzeStream check...\n");
+    eosTransition::Tracker tracker;
+    void* graph = reinterpret_cast<void*>(0xAAAA);
+    tracker.onGraphActivated(graph, true, 48000, 2, 24);
+
+    const size_t track1Frames = 24000;
+    std::vector<uint8_t> pcmStream;
+    trackTail::appendSynthesizedTrack(pcmStream, 48000, 24, track1Frames, false);
+
+    const REFERENCE_TIME segDuration = static_cast<REFERENCE_TIME>((track1Frames * 10000000ULL) / 48000ULL);
+    tracker.onUpstreamNewSegment(graph, 0, segDuration, 1.0);
+    tracker.onStopPositionReported(graph, segDuration);
+
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 5; ++i) {
+        REFERENCE_TIME sStart = static_cast<REFERENCE_TIME>(i) * 1000000LL;
+        REFERENCE_TIME sEnd = static_cast<REFERENCE_TIME>(i + 1) * 1000000LL;
+        tracker.onUpstreamSamplePreReceive(graph, chunkBytes);
+        tracker.onUpstreamSample(graph, chunkBytes, true, sStart, sEnd);
+    }
+
+    // Upstream finishes decoding; no next track in playlist (PreReadDecision::Unknown)
+    CHECK(!tracker.onUpstreamEndOfStream(graph));
+
+    for (int i = 0; i < 4; ++i) {
+        REFERENCE_TIME sStart = static_cast<REFERENCE_TIME>(i) * 1000000LL;
+        REFERENCE_TIME sEnd = static_cast<REFERENCE_TIME>(i + 1) * 1000000LL;
+        CHECK(!tracker.onDownstreamSample(graph, chunkBytes, true, sStart, sEnd));
+    }
+
+    // Final chunk reaches EQ and fires EOS once
+    CHECK(tracker.onDownstreamSample(graph, chunkBytes, true, 4000000LL, 5000000LL));
+    const auto* st = tracker.findGraph(graph);
+    CHECK(st != nullptr && st->eosDelivered == true && st->downstreamEosDeliveredCount == 1);
+
+    auto a = trackTail::analyzeStream(pcmStream.data(), pcmStream.size(), 48000, 24, track1Frames);
+    CHECK(a.tailComplete == true);
+    CHECK(a.missingTailFrames == 0);
+    CHECK(a.missingTailMs == 0.0);
+    CHECK(a.approx300msMissing == false);
+    CHECK(a.nextTrackDetected == false);
+}
+
 } // namespace
 
 int main() {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    std::printf("=== Issue #20 Experimental EOS State-Transition Tests ===\n");
+    std::printf("=== Issue #20 / #21 Experimental EOS Transition Tests ===\n");
 
     testArbitraryDurationsAndOffsets();
     testDuplicateEosCalls();
@@ -867,10 +1183,13 @@ int main() {
 #ifdef _M_IX86
     testDirectShowEqFilterIntegration();
 #endif
+    testMediaSeekingComVtableHooks();
+    testDeferredFormatChangeWithTrackTailCheck();
+    testPlaylistEndDrainWithTrackTailCheck();
 
     if (SUCCEEDED(co)) CoUninitialize();
     if (g_failures == 0) {
-        std::printf("=== ALL ISSUE #20 EOS TRANSITION TESTS PASSED ===\n");
+        std::printf("=== ALL ISSUE #20 / #21 EOS TRANSITION TESTS PASSED ===\n");
         return 0;
     }
     std::printf("=== %d TEST ASSERTION(S) FAILED ===\n", g_failures);
