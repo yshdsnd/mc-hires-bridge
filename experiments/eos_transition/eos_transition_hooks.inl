@@ -379,7 +379,25 @@ static void initPauseMode() {
 
 #ifdef TESTING_HEADLESS
 static bool g_forceOpcDsPlayPauseCaller = false;
+static bool g_simulateThreadCreateFailure = false;
 #endif
+
+static bool isCallerFromOpcDSPlay(void* returnAddress) {
+#ifdef TESTING_HEADLESS
+    if (g_forceOpcDsPlayPauseCaller) return true;
+#endif
+    if (!returnAddress) return false;
+    HMODULE hMod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(returnAddress), &hMod) || !hMod) {
+        return false;
+    }
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(hMod, path, MAX_PATH);
+    const wchar_t* pName = wcsrchr(path, L'\\');
+    const wchar_t* baseName = pName ? (pName + 1) : path;
+    return (_wcsicmp(baseName, L"OpcDSPlay.dll") == 0);
+}
 
 static bool isOpcDsPlayPauseCaller(void* returnAddress) {
 #ifdef TESTING_HEADLESS
@@ -407,28 +425,39 @@ static bool isOpcDsPlayPauseCaller(void* returnAddress) {
     return isKnownMc274;
 }
 
+static void* g_lastActiveSoundBuffer = nullptr;
+
 static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
     if (!inEosHook) {
         void* caller = _ReturnAddress();
-        bool isEngine = isOpcDsPlayPauseCaller(caller);
+        void* activeGraphKey = nullptr;
         AcquireSRWLockShared(&eosLock);
-        bool virtualActive = eosTracker.hasAnyVirtualPauseActive();
+        bool isAssoc = eosTracker.isTransitionBuffer(self, &activeGraphKey);
         ReleaseSRWLockShared(&eosLock);
 
-        if (virtualActive) {
-            if (isEngine) {
+        if (isAssoc && activeGraphKey) {
+            bool isEngineCall = isCallerFromOpcDSPlay(caller);
+            AcquireSRWLockShared(&eosLock);
+            bool isTransitionThread = eosTracker.isTransitionThread(activeGraphKey, GetCurrentThreadId());
+            ReleaseSRWLockShared(&eosLock);
+#ifdef TESTING_HEADLESS
+            if (g_forceOpcDsPlayPauseCaller) isEngineCall = true;
+#endif
+            if (isEngineCall && isTransitionThread) {
                 // Engine automatic buffer stop while Virtual Pause active: suppress it so tail finishes playing
-                recordDiag("DS_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE", nullptr, caller, 0, 0, S_OK);
+                recordDiag("DS_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE", activeGraphKey, caller, 0, 0, S_OK);
                 return DS_OK;
             } else {
                 // User manual stop: cancel Virtual Pause
                 AcquireSRWLockExclusive(&eosLock);
-                eosTracker.cancelVirtualPause(nullptr, eosTransition::PauseDeferralStatus::CancelledStop);
+                eosTracker.cancelVirtualPause(activeGraphKey, eosTransition::PauseDeferralStatus::CancelledStop);
                 ReleaseSRWLockExclusive(&eosLock);
-                recordDiag("PAUSE_DEFERRED_CANCELLED", nullptr, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledStop), 0, S_OK);
+                recordDiag("PAUSE_DEFERRED_CANCELLED", activeGraphKey, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledStop), 0, S_OK);
+                recordDiag("DEFERRED_SETPOSITIONS_PURGED", activeGraphKey, caller, 0, 0, S_OK);
             }
         }
 
+        // Unrelated buffer or normal stop: proceed to original DirectSoundBuffer::Stop
         DWORD play = 0, write = 0;
         self->GetCurrentPosition(&play, &write);
         record("DS_STOP", play, write, S_OK);
@@ -785,7 +814,8 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
 }
 
 struct AsyncDrainParams {
-    IUnknown* control = nullptr;
+    IStream* marshalStream = nullptr;
+    IMediaSeeking* rawSeeking = nullptr;
     void* key = nullptr;
     void* caller = nullptr;
     DWORD startTick = 0;
@@ -796,9 +826,14 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
     auto* p = reinterpret_cast<AsyncDrainParams*>(param);
     if (!p) return 0;
 
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IMediaSeeking* seeking = nullptr;
-    if (p->control) {
-        p->control->QueryInterface(IID_PPV_ARGS(&seeking));
+    if (p->marshalStream) {
+        CoGetInterfaceAndReleaseStream(p->marshalStream, IID_IMediaSeeking, reinterpret_cast<void**>(&seeking));
+        p->marshalStream = nullptr;
+    } else if (p->rawSeeking) {
+        seeking = p->rawSeeking;
+        p->rawSeeking = nullptr;
     }
 
     DWORD startTick = p->startTick;
@@ -822,21 +857,34 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
             break;
         }
 
+        // Two-stage drain verification:
+        // Stage 1: Downstream PCM delivery
+        bool pcmDelivered = false;
+        AcquireSRWLockExclusive(&eosLock);
+        if (eosTracker.hasDownstreamReachedTarget(key)) {
+            eosTracker.onDownstreamPcmDelivered(key);
+        }
+        const auto* curG = eosTracker.findGraph(key);
+        pcmDelivered = curG && curG->transition.pcmDeliveryComplete;
+        ReleaseSRWLockExclusive(&eosLock);
+
+        // Stage 2: Audio renderer final output drain
         LONGLONG c = 0, s = 0;
-        bool positionReached = false;
+        bool rendererFinished = false;
         if (seeking && SUCCEEDED(seeking->GetCurrentPosition(&c)) &&
             SUCCEEDED(seeking->GetStopPosition(&s))) {
             if (c >= s && s > 0) {
-                positionReached = true;
+                rendererFinished = true;
             }
         }
-
-        bool bytesReached = false;
         AcquireSRWLockShared(&eosLock);
-        bytesReached = eosTracker.hasDownstreamReachedTarget(key);
+        if (curG && curG->transition.rendererOutputComplete) {
+            rendererFinished = true;
+        }
         ReleaseSRWLockShared(&eosLock);
 
-        bool completed = positionReached || bytesReached;
+        // Must satisfy BOTH Stage 1 (PCM delivered) AND Stage 2 (renderer finished)
+        bool completed = pcmDelivered && rendererFinished;
         bool timedOut = (GetTickCount() - startTick >= maxWait);
 
         if (completed || timedOut) {
@@ -844,27 +892,31 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
                                     : eosTransition::PauseDeferralStatus::TimedOut;
 
             AcquireSRWLockExclusive(&eosLock);
-            eosTracker.onVirtualPauseCompleted(key, status);
+            bool executedOnce = eosTracker.onVirtualPauseCompleted(key, status);
             eosTransition::GraphState::DeferredSeekParams seekParams;
-            bool hasSeek = eosTracker.popDeferredSeek(key, seekParams);
+            bool hasSeek = false;
+            if (executedOnce) {
+                hasSeek = eosTracker.popDeferredSeek(key, seekParams);
+            }
             ReleaseSRWLockExclusive(&eosLock);
 
-            recordDiag(completed ? "PAUSE_DEFERRED_COMPLETED" : "PAUSE_DEFERRED_TIMED_OUT",
-                       key, caller, GetTickCount() - startTick, 0, S_OK);
+            if (executedOnce) {
+                recordDiag(completed ? "PAUSE_DEFERRED_COMPLETED" : "PAUSE_DEFERRED_TIMED_OUT",
+                           key, caller, GetTickCount() - startTick, 0, S_OK);
 
-            if (hasSeek && seeking && originalSetPositions) {
-                originalSetPositions(seeking, &seekParams.current, seekParams.currentFlags,
-                                     &seekParams.stop, seekParams.stopFlags);
-                recordDiag("DEFERRED_SETPOSITIONS_EXECUTED", key, caller,
-                           static_cast<DWORD>(seekParams.current / 10000), seekParams.currentFlags, S_OK);
+                if (hasSeek && seeking && originalSetPositions) {
+                    originalSetPositions(seeking, &seekParams.current, seekParams.currentFlags,
+                                         &seekParams.stop, seekParams.stopFlags);
+                    recordDiag("DEFERRED_SETPOSITIONS_EXECUTED", key, caller,
+                               static_cast<DWORD>(seekParams.current / 10000), seekParams.currentFlags, S_OK);
+                }
             }
-
             break;
         }
     }
 
     if (seeking) seeking->Release();
-    if (p->control) p->control->Release();
+    if (SUCCEEDED(hrCo)) CoUninitialize();
     delete p;
     return 0;
 }
@@ -872,20 +924,55 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
 template<class T>
 static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
     auto* p = new AsyncDrainParams();
-    if (self) {
-        self->QueryInterface(IID_PPV_ARGS(&p->control));
-    }
     p->key = key;
     p->caller = caller;
     p->startTick = GetTickCount();
     p->maxWaitMs = 4500;
 
-    HANDLE hThread = CreateThread(nullptr, 0, asyncDrainWorkerThread, p, 0, nullptr);
-    if (hThread) {
-        CloseHandle(hThread);
-    } else {
-        asyncDrainWorkerThread(p);
+    IMediaSeeking* seeking = nullptr;
+    if (self) {
+        self->QueryInterface(IID_PPV_ARGS(&seeking));
     }
+    if (seeking) {
+        IStream* pStream = nullptr;
+        HRESULT hrM = CoMarshalInterThreadInterfaceInStream(IID_IMediaSeeking, seeking, &pStream);
+        if (SUCCEEDED(hrM) && pStream) {
+            p->marshalStream = pStream;
+        } else {
+            p->rawSeeking = seeking;
+            seeking->AddRef();
+        }
+        seeking->Release();
+    }
+
+#ifdef TESTING_HEADLESS
+    if (g_simulateThreadCreateFailure) {
+        recordDiag("ASYNC_MONITOR_THREAD_CREATE_FAILED", key, caller, ERROR_NOT_ENOUGH_MEMORY, 0, E_FAIL);
+        AcquireSRWLockExclusive(&eosLock);
+        eosTracker.cancelVirtualPause(key, eosTransition::PauseDeferralStatus::TimedOut);
+        ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("PAUSE_DEFERRED_ABORT_BY_THREAD_FAILURE", key, caller, 0, 0, S_OK);
+        if (p->marshalStream) p->marshalStream->Release();
+        if (p->rawSeeking) p->rawSeeking->Release();
+        delete p;
+        return;
+    }
+#endif
+
+    HANDLE hThread = CreateThread(nullptr, 0, asyncDrainWorkerThread, p, 0, nullptr);
+    if (!hThread) {
+        recordDiag("ASYNC_MONITOR_THREAD_CREATE_FAILED", key, caller, GetLastError(), 0, E_FAIL);
+        // Do NOT block caller synchronously!
+        AcquireSRWLockExclusive(&eosLock);
+        eosTracker.cancelVirtualPause(key, eosTransition::PauseDeferralStatus::TimedOut);
+        ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("PAUSE_DEFERRED_ABORT_BY_THREAD_FAILURE", key, caller, 0, 0, S_OK);
+        if (p->marshalStream) p->marshalStream->Release();
+        if (p->rawSeeking) p->rawSeeking->Release();
+        delete p;
+        return;
+    }
+    CloseHandle(hThread);
 }
 
 static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
@@ -921,7 +1008,7 @@ static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
         if (isKnownCaller && pendingFormatChange) {
             if (g_pauseMode == PauseMode::AsyncVirtual) {
                 AcquireSRWLockExclusive(&eosLock);
-                eosTracker.markVirtualPauseActive(key);
+                eosTracker.markVirtualPauseActive(key, GetCurrentThreadId(), g_lastActiveSoundBuffer);
                 ReleaseSRWLockExclusive(&eosLock);
 
                 recordDiag("PAUSE_ASYNC_VIRTUAL_ENTER", key, caller, 0, 0, S_OK);
@@ -983,7 +1070,7 @@ static HRESULT STDMETHODCALLTYPE filterPauseHook(IMediaFilter* self) {
         if (isKnownCaller && pendingFormatChange) {
             if (g_pauseMode == PauseMode::AsyncVirtual) {
                 AcquireSRWLockExclusive(&eosLock);
-                eosTracker.markVirtualPauseActive(key);
+                eosTracker.markVirtualPauseActive(key, GetCurrentThreadId(), g_lastActiveSoundBuffer);
                 ReleaseSRWLockExclusive(&eosLock);
 
                 recordDiag("PAUSE_ASYNC_VIRTUAL_ENTER", key, caller, 0, 0, S_OK);
@@ -1191,7 +1278,11 @@ static HRESULT STDMETHODCALLTYPE setPositionsHook(IMediaSeeking* self, LONGLONG*
             recordDiag("BOUNDARY_SEEK_SETPOSITIONS_ENTER", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
             AcquireSRWLockExclusive(&eosLock);
             auto* g = eosTracker.findGraph(key);
-            bool isEngineCall = isOpcDsPlayPauseCaller(caller);
+            bool isEngineCall = isCallerFromOpcDSPlay(caller) &&
+                                eosTracker.isTransitionThread(key, GetCurrentThreadId());
+#ifdef TESTING_HEADLESS
+            if (g_forceOpcDsPlayPauseCaller) isEngineCall = true;
+#endif
             if (g && g->isVirtualPauseActive()) {
                 if (isEngineCall) {
                     eosTracker.deferAutomaticSeek(key, newPos, dwCurrentFlags, newStop, dwStopFlags);

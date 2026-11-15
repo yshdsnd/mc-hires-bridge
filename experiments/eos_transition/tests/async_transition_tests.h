@@ -85,6 +85,7 @@ public:
 
     void initializeGraph(DWORD rate = 48000, WORD channels = 2, WORD bits = 24) {
         tracker.onGraphActivated(mockGraph, bits == 24, rate, channels, bits);
+        tracker.registerActiveSoundBuffer(mockGraph, pDsBuffer);
     }
 
     void startSegment(REFERENCE_TIME start, REFERENCE_TIME stop, double rate = 1.0) {
@@ -112,6 +113,7 @@ public:
 
         // Check if downstream reached target
         if (tracker.onDownstreamSample(mockGraph, static_cast<uint32_t>(size), hasTime, sStart, sEnd)) {
+            tracker.onDownstreamPcmDelivered(mockGraph);
             deliverDownstreamEosIfValid();
         }
         return hr;
@@ -127,7 +129,7 @@ public:
     }
 
     // --- Non-Blocking Virtual Pause Control Hook ---
-    HRESULT executePause() {
+    HRESULT executePause(DWORD threadId = 0) {
         bool isEngine = (currentCallerContext == CallerContext::EngineAutoChange);
         if (tracker.isVirtualPauseActive(mockGraph) && !isEngine) {
             // Manual Pause from user while Virtual Pause is active:
@@ -139,7 +141,7 @@ public:
 
         if (isEngine && tracker.isFormatChangePending(mockGraph)) {
             // Automatic track transition: Enter Virtual Pause and return S_OK immediately!
-            tracker.markVirtualPauseActive(mockGraph);
+            tracker.markVirtualPauseActive(mockGraph, threadId, pDsBuffer);
             virtualPauseEntered = true;
             return S_OK; // Returns in < 1 ms! Caller immediately releases its internal lock.
         }
@@ -149,8 +151,9 @@ public:
 
     // --- Non-Blocking SetPositions Hook ---
     HRESULT executeSetPositions(LONGLONG* pCurrent, DWORD dwCurrentFlags,
-                                LONGLONG* pStop, DWORD dwStopFlags) {
-        bool isEngine = (currentCallerContext == CallerContext::EngineAutoChange);
+                                LONGLONG* pStop, DWORD dwStopFlags, DWORD threadId = 0) {
+        bool isEngine = (currentCallerContext == CallerContext::EngineAutoChange) &&
+                        tracker.isTransitionThread(mockGraph, threadId);
         DWORD currBits = dwCurrentFlags & AM_SEEKING_PositioningBitsMask;
         DWORD stopBits = dwStopFlags & AM_SEEKING_PositioningBitsMask;
         bool modifiesCurr = (currBits != AM_SEEKING_NoPositioning) && (pCurrent != nullptr);
@@ -185,15 +188,23 @@ public:
     }
 
     // --- DirectSound Stop Hook ---
-    HRESULT executeDsStop() {
+    HRESULT executeDsStop(IDirectSoundBuffer* buf = nullptr, DWORD threadId = 0) {
+        if (!buf) buf = pDsBuffer;
         dsStopCallCount++;
-        bool isEngine = (currentCallerContext == CallerContext::EngineAutoChange);
-        if (tracker.isVirtualPauseActive(mockGraph) && isEngine) {
-            // Engine automatic buffer stop while Virtual Pause active: suppress it!
-            dsStopSuppressed = true;
-            return DS_OK;
+        void* activeGraph = nullptr;
+        bool isAssoc = tracker.isTransitionBuffer(buf, &activeGraph);
+        if (isAssoc && activeGraph) {
+            bool isEngine = (currentCallerContext == CallerContext::EngineAutoChange) &&
+                            tracker.isTransitionThread(activeGraph, threadId);
+            if (isEngine) {
+                dsStopSuppressed = true;
+                return DS_OK;
+            } else {
+                tracker.cancelVirtualPause(activeGraph, eosTransition::PauseDeferralStatus::CancelledStop);
+                manualOpObserved = true;
+            }
         }
-        return pDsBuffer->Stop();
+        return buf->Stop();
     }
 
     // --- Control Stop Hook ---
@@ -224,9 +235,17 @@ public:
         if (tracker.isCancelled(mockGraph) || !tracker.isVirtualPauseActive(mockGraph)) {
             return false;
         }
-        tracker.onVirtualPauseCompleted(mockGraph, eosTransition::PauseDeferralStatus::CompletedDrain);
+        // Stage 1: PCM reached downstream
+        tracker.onDownstreamPcmDelivered(mockGraph);
         if (downstreamEosReceived.load() == 0) {
             deliverDownstreamEosIfValid();
+        }
+        // Stage 2: Renderer output complete
+        tracker.onRendererOutputComplete(mockGraph);
+
+        // Execute once
+        if (!tracker.onVirtualPauseCompleted(mockGraph, eosTransition::PauseDeferralStatus::CompletedDrain)) {
+            return false;
         }
 
         // Apply deferred seek if present
@@ -243,7 +262,9 @@ public:
         if (tracker.isCancelled(mockGraph) || !tracker.isVirtualPauseActive(mockGraph)) {
             return false;
         }
-        tracker.onVirtualPauseCompleted(mockGraph, eosTransition::PauseDeferralStatus::TimedOut);
+        if (!tracker.onVirtualPauseCompleted(mockGraph, eosTransition::PauseDeferralStatus::TimedOut)) {
+            return false;
+        }
         if (downstreamEosReceived.load() == 0) {
             deliverDownstreamEosIfValid();
         }
@@ -618,8 +639,171 @@ inline void testWatchdogTimeoutSafetyAndFlush() {
     CHECK(harness.mockSeeking->stopPos == 20000000LL);
 }
 
+// Test 51: Automated SetPositions Caller Matching & Unrelated Buffer Stop Isolation
+inline void testAutomatedSetPositionsCallerMatchingAndUnrelatedBufferIsolation() {
+    std::printf("[TEST 51] Automated SetPositions caller matching & unrelated buffer stop isolation...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 10000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    // Setup track end
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 10; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    // Engine enters Virtual Pause on thread 1001
+    const DWORD engineThreadId = 1001;
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(engineThreadId) == S_OK);
+    CHECK(harness.virtualPauseEntered.load());
+
+    // 1. Unrelated DirectSoundBuffer Stop (e.g. system sound or UI click)
+    MockDirectSoundBufferEx unrelatedBuffer;
+    harness.currentCallerContext = CallerContext::UserManualOp; // Unrelated caller
+    CHECK(harness.executeDsStop(&unrelatedBuffer, 9999) == DS_OK);
+    CHECK(unrelatedBuffer.stopCallCount == 1);
+    // Virtual Pause MUST NOT be cancelled by unrelated buffer!
+    const auto* st = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(st != nullptr && st->isVirtualPauseActive());
+    CHECK(!harness.manualOpObserved.load());
+
+    // 2. Engine calls SetPositions on the same transition thread (thread 1001), but from a different RVA
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    LONGLONG nextPos = 0, nextStop = 15000000LL;
+    CHECK(harness.executeSetPositions(&nextPos, AM_SEEKING_AbsolutePositioning, &nextStop, AM_SEEKING_AbsolutePositioning, engineThreadId) == S_OK);
+    CHECK(harness.deferredSeekQueued.load());
+    CHECK(st->isVirtualPauseActive());
+
+    // 3. Unrelated / manual Seek from a different thread (thread 2002 - UI thread)
+    harness.currentCallerContext = CallerContext::UserManualOp;
+    LONGLONG userPos = 5000000LL;
+    CHECK(harness.executeSetPositions(&userPos, AM_SEEKING_AbsolutePositioning, nullptr, AM_SEEKING_NoPositioning, 2002) == S_OK);
+    // Manual seek from UI thread cancels Virtual Pause immediately!
+    CHECK(!st->isVirtualPauseActive());
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CancelledSeek);
+    CHECK(harness.manualOpObserved.load());
+}
+
+// Test 52: Two-Stage Drain Verification (PCM Delivery vs Renderer Output)
+inline void testTwoStageDrainCompletionVerification() {
+    std::printf("[TEST 52] Two-stage drain verification: PCM delivery vs renderer output...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 10000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 10; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+    LONGLONG nextPos = 0, nextStop = 20000000LL;
+    CHECK(harness.executeSetPositions(&nextPos, AM_SEEKING_AbsolutePositioning, &nextStop, AM_SEEKING_AbsolutePositioning, 1001) == S_OK);
+
+    // Feed all 10 downstream chunks (Stage 1: PCM delivered)
+    for (int i = 0; i < 10; ++i) {
+        harness.feedDownstreamChunk(nullptr, chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    const auto* st = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(st != nullptr);
+    CHECK(st->transition.pcmDeliveryComplete == true);
+    // Downstream EOS delivered
+    CHECK(harness.downstreamEosReceived.load() == 1);
+
+    // BUT renderer output has NOT finished yet!
+    CHECK(st->transition.rendererOutputComplete == false);
+    // Drain is NOT fully complete yet!
+    CHECK(!harness.tracker.isDrainFullyComplete(harness.mockGraph));
+    CHECK(st->isVirtualPauseActive() == true);
+    CHECK(!harness.deferredSeekExecuted.load());
+
+    // Now Stage 2 completes: Audio renderer finishes outputting to device
+    harness.tracker.onRendererOutputComplete(harness.mockGraph);
+    CHECK(harness.tracker.isDrainFullyComplete(harness.mockGraph));
+
+    // Complete drain naturally
+    CHECK(harness.completeDrainNaturally());
+    CHECK(!st->isVirtualPauseActive());
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CompletedDrain);
+    CHECK(harness.deferredSeekExecuted.load());
+    CHECK(harness.mockSeeking->stopPos == 20000000LL);
+}
+
+// Test 53: Pre-Completion Cancellation Race Prevention
+inline void testPreCompletionCancellationRacePrevention() {
+    std::printf("[TEST 53] Pre-completion cancellation race: manual op right before output finish...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 10000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 10; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+    LONGLONG nextPos = 0, nextStop = 20000000LL;
+    CHECK(harness.executeSetPositions(&nextPos, AM_SEEKING_AbsolutePositioning, &nextStop, AM_SEEKING_AbsolutePositioning, 1001) == S_OK);
+
+    // Stage 1 completes: PCM delivered, downstream EOS sent
+    for (int i = 0; i < 10; ++i) {
+        harness.feedDownstreamChunk(nullptr, chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    const auto* st = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(st != nullptr);
+    CHECK(st->transition.pcmDeliveryComplete == true);
+
+    // User presses Pause RIGHT BEFORE renderer output finishes
+    harness.currentCallerContext = CallerContext::UserManualOp;
+    CHECK(harness.executePause(2002) == S_OK);
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CancelledManualPause);
+    CHECK(st->transition.cancelled == true);
+
+    // Now late renderer output finish arrives
+    harness.tracker.onRendererOutputComplete(harness.mockGraph);
+
+    // Attempting to complete drain or pop deferred seek MUST FAIL and NOT execute deferred seek!
+    CHECK(!harness.completeDrainNaturally());
+    CHECK(!harness.deferredSeekExecuted.load());
+    eosTransition::GraphState::DeferredSeekParams sp;
+    CHECK(!harness.tracker.popDeferredSeek(harness.mockGraph, sp));
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CancelledManualPause);
+}
+
+// Test 54: Monitor Thread Creation Failure Non-blocking Safety
+inline void testMonitorThreadCreateFailureNonBlocking() {
+    std::printf("[TEST 54] Monitor thread creation failure non-blocking safety...\n");
+    eosTransition::Tracker testTracker;
+    void* fakeGraph = reinterpret_cast<void*>(0x12345678);
+    testTracker.onGraphActivated(fakeGraph, true, 48000, 2, 24);
+    testTracker.onPreReadDecision(fakeGraph, eosTransition::PreReadDecision::FormatChanged);
+
+    DWORD start = GetTickCount();
+    testTracker.markVirtualPauseActive(fakeGraph, 1001);
+
+    // When thread creation fails, cancelVirtualPause is called immediately
+    testTracker.cancelVirtualPause(fakeGraph, eosTransition::PauseDeferralStatus::TimedOut);
+    DWORD elapsed = GetTickCount() - start;
+
+    CHECK(elapsed < 10); // Must be non-blocking (< 10 ms)
+    const auto* st = testTracker.findGraph(fakeGraph);
+    CHECK(st != nullptr);
+    CHECK(!st->isVirtualPauseActive());
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::TimedOut);
+    CHECK(st->transition.cancelled == true);
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -631,7 +815,11 @@ inline void runAllAsyncTransitionTests() {
     testStaleEosDiscardedAfterCancellation();
     testSameFormatPreReadBypassesVirtualPause();
     testWatchdogTimeoutSafetyAndFlush();
-    std::printf("=== Issue #33 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testAutomatedSetPositionsCallerMatchingAndUnrelatedBufferIsolation();
+    testTwoStageDrainCompletionVerification();
+    testPreCompletionCancellationRacePrevention();
+    testMonitorThreadCreateFailureNonBlocking();
+    std::printf("=== Issue #33 / #34 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests

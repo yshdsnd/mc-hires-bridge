@@ -85,7 +85,19 @@ struct GraphState {
         DWORD stopFlags = 0;
     };
 
+    struct TransitionContext {
+        uint64_t transitionId = 0;
+        DWORD initiatingThreadId = 0;
+        void* primaryDsBuffer = nullptr;
+        bool pcmDeliveryComplete = false;
+        bool downstreamEosDelivered = false;
+        bool rendererOutputComplete = false;
+        bool completed = false;
+        bool cancelled = false;
+    };
+
     bool virtualPauseActive = false;
+    TransitionContext transition;
     DeferredSeekParams deferredSeek;
     bool deferredDsStop = false;
     bool deferredGraphStop = false;
@@ -93,7 +105,8 @@ struct GraphState {
     bool isVirtualPauseActive() const { return virtualPauseActive; }
     bool isPauseDeferralActive() const { return virtualPauseActive || pauseDeferralStatus == PauseDeferralStatus::Active; }
     bool isCancelled() const {
-        return pauseDeferralStatus == PauseDeferralStatus::CancelledStop ||
+        return transition.cancelled ||
+               pauseDeferralStatus == PauseDeferralStatus::CancelledStop ||
                pauseDeferralStatus == PauseDeferralStatus::CancelledSeek ||
                pauseDeferralStatus == PauseDeferralStatus::CancelledTrackChange ||
                pauseDeferralStatus == PauseDeferralStatus::CancelledManualPause ||
@@ -339,6 +352,7 @@ public:
     void onFormatChangePauseCompleted(void* graphKey, PauseDeferralStatus status = PauseDeferralStatus::CompletedDrain) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
+        if (s.isCancelled()) return;
         s.formatChangePauseCompleted = true;
         s.formatChangePauseDeferred = false;
         s.pauseDeferralStatus = status;
@@ -349,6 +363,7 @@ public:
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
         s.virtualPauseActive = false;
+        s.transition.cancelled = true;
         s.formatChangePauseDeferred = false;
         s.pauseDeferralStatus = status;
         s.deferredSeek = GraphState::DeferredSeekParams{};
@@ -357,7 +372,39 @@ public:
         s.eosPending = false;
     }
 
-    void markVirtualPauseActive(void* graphKey) {
+    uint64_t nextTransitionId_ = 0;
+
+    void registerActiveSoundBuffer(void* graphKey, void* buffer) {
+        if (graphKey) {
+            auto& s = ensureGraph(graphKey);
+            s.transition.primaryDsBuffer = buffer;
+        } else {
+            for (auto& kv : graphs_) {
+                if (kv.second.virtualPauseActive || kv.second.active24) {
+                    kv.second.transition.primaryDsBuffer = buffer;
+                }
+            }
+        }
+    }
+
+    bool isTransitionBuffer(void* buffer, void** outGraphKey = nullptr) const {
+        if (!buffer) return false;
+        for (const auto& kv : graphs_) {
+            if (kv.second.virtualPauseActive && kv.second.transition.primaryDsBuffer == buffer) {
+                if (outGraphKey) *outGraphKey = kv.first;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isTransitionThread(void* graphKey, DWORD threadId) const {
+        const auto* s = findGraph(graphKey);
+        if (!s || !s->virtualPauseActive) return false;
+        return (s->transition.initiatingThreadId == 0 || s->transition.initiatingThreadId == threadId);
+    }
+
+    void markVirtualPauseActive(void* graphKey, DWORD initiatingThreadId = 0, void* primaryDsBuffer = nullptr) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
         s.virtualPauseActive = true;
@@ -366,6 +413,15 @@ public:
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;
+
+        s.transition.transitionId = ++nextTransitionId_;
+        s.transition.initiatingThreadId = initiatingThreadId;
+        if (primaryDsBuffer) s.transition.primaryDsBuffer = primaryDsBuffer;
+        s.transition.pcmDeliveryComplete = false;
+        s.transition.downstreamEosDelivered = false;
+        s.transition.rendererOutputComplete = false;
+        s.transition.completed = false;
+        s.transition.cancelled = false;
     }
 
     bool isVirtualPauseActive(void* graphKey) const {
@@ -378,6 +434,29 @@ public:
             if (kv.second.virtualPauseActive) return true;
         }
         return false;
+    }
+
+    void onDownstreamPcmDelivered(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.transition.pcmDeliveryComplete = true;
+    }
+
+    void onDownstreamEosDelivered(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.transition.downstreamEosDelivered = true;
+    }
+
+    void onRendererOutputComplete(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.transition.rendererOutputComplete = true;
+    }
+
+    bool isDrainFullyComplete(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s && s->transition.pcmDeliveryComplete && s->transition.rendererOutputComplete;
     }
 
     void deferAutomaticSeek(void* graphKey, LONGLONG current, DWORD currentFlags, LONGLONG stop, DWORD stopFlags) {
@@ -398,24 +477,35 @@ public:
     bool popDeferredSeek(void* graphKey, GraphState::DeferredSeekParams& outSeek) {
         if (!graphKey) return false;
         auto& s = ensureGraph(graphKey);
-        if (!s.deferredSeek.valid) return false;
+        if (s.transition.cancelled || !s.deferredSeek.valid) return false;
         outSeek = s.deferredSeek;
         s.deferredSeek = GraphState::DeferredSeekParams{};
         return true;
     }
 
-    void onVirtualPauseCompleted(void* graphKey, PauseDeferralStatus status = PauseDeferralStatus::CompletedDrain) {
-        if (!graphKey) return;
+    bool onVirtualPauseCompleted(void* graphKey, PauseDeferralStatus status = PauseDeferralStatus::CompletedDrain) {
+        if (!graphKey) return false;
         auto& s = ensureGraph(graphKey);
+        if (s.transition.cancelled || s.transition.completed) return false;
+        s.transition.completed = true;
         s.virtualPauseActive = false;
         s.formatChangePauseCompleted = true;
         s.formatChangePauseDeferred = false;
         s.pauseDeferralStatus = status;
         s.eosPending = false;
+        return true;
     }
 
     void cancelVirtualPause(void* graphKey, PauseDeferralStatus status) {
-        cancelFormatChangePause(graphKey, status);
+        if (graphKey) {
+            cancelFormatChangePause(graphKey, status);
+        } else {
+            for (auto& kv : graphs_) {
+                if (kv.second.virtualPauseActive) {
+                    cancelFormatChangePause(kv.first, status);
+                }
+            }
+        }
     }
 
     void clearDeferredActions(void* graphKey) {
@@ -535,6 +625,7 @@ private:
         s.formatChangeCompleted = false;
         s.preReadDecision = PreReadDecision::Unknown;
         s.virtualPauseActive = false;
+        s.transition = GraphState::TransitionContext{};
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;
