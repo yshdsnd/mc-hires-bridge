@@ -77,7 +77,8 @@ inline void appendSynthesizedTrack(
 
     const double fullScale = (bits == 24) ? 8388607.0 : 32767.0;
     const int32_t minMagnitude = (bits == 24) ? 4096 : 32;
-    const size_t tailStart = (frames > kFrames300MsAt48k) ? (frames - kFrames300MsAt48k) : 0;
+    const size_t tailFrames = (rate > 0) ? (static_cast<size_t>(rate) * 3 / 10) : kFrames300MsAt48k;
+    const size_t tailStart = (frames > tailFrames) ? (frames - tailFrames) : 0;
     const double baseFreq = isNextTrack ? 1750.0 : 997.0;
     const double harmonicFreq = isNextTrack ? 3500.0 : 2991.0;
 
