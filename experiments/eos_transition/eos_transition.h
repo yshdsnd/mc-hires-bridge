@@ -87,7 +87,9 @@ struct GraphState {
 
     struct TransitionContext {
         uint64_t transitionId = 0;
+        uint32_t generation = 0;
         DWORD initiatingThreadId = 0;
+        DWORD enterTick = 0;
         void* primaryDsBuffer = nullptr;
         bool pcmDeliveryComplete = false;
         bool downstreamEosDelivered = false;
@@ -97,6 +99,9 @@ struct GraphState {
     };
 
     bool virtualPauseActive = false;
+    bool autoTrackChangeInProgress = false;
+    uint32_t transitionGeneration = 0;
+    DWORD virtualPauseEnterTick = 0;
     TransitionContext transition;
     DeferredSeekParams deferredSeek;
     bool deferredDsStop = false;
@@ -408,6 +413,9 @@ public:
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
         s.virtualPauseActive = true;
+        s.autoTrackChangeInProgress = true;
+        s.transitionGeneration++;
+        s.virtualPauseEnterTick = GetTickCount();
         s.formatChangePauseDeferred = true;
         s.pauseDeferralStatus = PauseDeferralStatus::Active;
         s.deferredSeek = GraphState::DeferredSeekParams{};
@@ -415,13 +423,58 @@ public:
         s.deferredGraphStop = false;
 
         s.transition.transitionId = ++nextTransitionId_;
+        s.transition.generation = s.transitionGeneration;
         s.transition.initiatingThreadId = initiatingThreadId;
+        s.transition.enterTick = s.virtualPauseEnterTick;
         if (primaryDsBuffer) s.transition.primaryDsBuffer = primaryDsBuffer;
         s.transition.pcmDeliveryComplete = false;
         s.transition.downstreamEosDelivered = false;
         s.transition.rendererOutputComplete = false;
         s.transition.completed = false;
         s.transition.cancelled = false;
+    }
+
+    enum class SeekClassification {
+        NotVirtualPause,
+        AutomatedDeferred,
+        ManualCancelled
+    };
+
+    SeekClassification classifySeekOperation(void* graphKey, bool isExplicitManualOp, bool isExplicitEngineCall,
+                                            LONGLONG seekPos, DWORD lastInputTick = 0) const {
+        const auto* s = findGraph(graphKey);
+        if (!s || !s->virtualPauseActive) {
+            return SeekClassification::NotVirtualPause;
+        }
+
+        if (isExplicitManualOp) {
+            return SeekClassification::ManualCancelled;
+        }
+        if (isExplicitEngineCall) {
+            return s->deferredSeek.valid ? SeekClassification::ManualCancelled : SeekClassification::AutomatedDeferred;
+        }
+
+        // Check if user interacted with UI (mouse click, keyboard, seekbar scroll) recently
+        if (lastInputTick != 0 && (lastInputTick >= s->virtualPauseEnterTick || (GetTickCount() - lastInputTick < 400))) {
+            return SeekClassification::ManualCancelled;
+        }
+
+        // The automated next-track seek only occurs once per transition generation
+        if (s->deferredSeek.valid) {
+            return SeekClassification::ManualCancelled;
+        }
+
+        // Automated next-track initial seek starts at 0. A non-zero seek position (> 0) indicates a user seekbar jump.
+        if (seekPos > 0) {
+            return SeekClassification::ManualCancelled;
+        }
+
+        return SeekClassification::AutomatedDeferred;
+    }
+
+    uint32_t getTransitionGeneration(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->transitionGeneration : 0;
     }
 
     bool isVirtualPauseActive(void* graphKey) const {
@@ -625,6 +678,7 @@ private:
         s.formatChangeCompleted = false;
         s.preReadDecision = PreReadDecision::Unknown;
         s.virtualPauseActive = false;
+        s.autoTrackChangeInProgress = false;
         s.transition = GraphState::TransitionContext{};
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;

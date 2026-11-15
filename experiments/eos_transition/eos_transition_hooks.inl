@@ -357,17 +357,22 @@ static bool tryAttachOpcDsPlayLockHooks() {
     }
 }
 
+static std::atomic<DWORD> g_lastUserInputTick{0};
+
 static LRESULT WINAPI dispatchMessageWHook(const MSG* lpMsg) {
-    if (!inMsgHook && g_diagEnabled && lpMsg) {
+    if (!inMsgHook && lpMsg) {
         UINT msg = lpMsg->message;
         if ((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) ||
             (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
             msg == WM_COMMAND || msg == WM_SYSCOMMAND || msg == WM_APP ||
             (msg >= 0x8000 && msg <= 0xBFFF)) {
-            inMsgHook = true;
-            void* caller = _ReturnAddress();
-            recordDiag("APP_INPUT_DISPATCH", reinterpret_cast<void*>(lpMsg->hwnd), caller, msg, lpMsg->wParam, S_OK);
-            inMsgHook = false;
+            g_lastUserInputTick.store(GetTickCount());
+            if (g_diagEnabled) {
+                inMsgHook = true;
+                void* caller = _ReturnAddress();
+                recordDiag("APP_INPUT_DISPATCH", reinterpret_cast<void*>(lpMsg->hwnd), caller, msg, lpMsg->wParam, S_OK);
+                inMsgHook = false;
+            }
         }
     }
     return originalDispatchMessageW ? originalDispatchMessageW(lpMsg) : DispatchMessageW(lpMsg);
@@ -380,6 +385,8 @@ static void initPauseMode() {
 #ifdef TESTING_HEADLESS
 static bool g_forceOpcDsPlayPauseCaller = false;
 static bool g_simulateThreadCreateFailure = false;
+static bool g_forceManualSeek = false;
+static bool g_forceManualStop = false;
 #endif
 
 static bool isCallerFromOpcDSPlay(void* returnAddress) {
@@ -430,25 +437,29 @@ static void* g_lastActiveSoundBuffer = nullptr;
 static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
     if (!inEosHook) {
         void* caller = _ReturnAddress();
-        void* activeGraphKey = nullptr;
         AcquireSRWLockShared(&eosLock);
+        bool virtualActive = eosTracker.hasAnyVirtualPauseActive();
+        void* activeGraphKey = nullptr;
         bool isAssoc = eosTracker.isTransitionBuffer(self, &activeGraphKey);
         ReleaseSRWLockShared(&eosLock);
 
-        if (isAssoc && activeGraphKey) {
-            bool isEngineCall = isCallerFromOpcDSPlay(caller);
-            AcquireSRWLockShared(&eosLock);
-            bool isTransitionThread = eosTracker.isTransitionThread(activeGraphKey, GetCurrentThreadId());
-            ReleaseSRWLockShared(&eosLock);
+        if (virtualActive) {
+            bool isManualStop = false;
 #ifdef TESTING_HEADLESS
-            if (g_forceOpcDsPlayPauseCaller) isEngineCall = true;
+            if (g_forceManualStop) isManualStop = true;
 #endif
-            if (isEngineCall && isTransitionThread) {
-                // Engine automatic buffer stop while Virtual Pause active: suppress it so tail finishes playing
+            // Check if user manually stopped via input message
+            DWORD lastInput = g_lastUserInputTick.load();
+            if (lastInput != 0 && (GetTickCount() - lastInput < 400)) {
+                isManualStop = true;
+            }
+
+            // If user did not manually request stop, suppress automatic renderer/engine buffer stop
+            // so the queued PCM audio drains naturally through the sound card!
+            if (!isManualStop) {
                 recordDiag("DS_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE", activeGraphKey, caller, 0, 0, S_OK);
                 return DS_OK;
             } else {
-                // User manual stop: cancel Virtual Pause
                 AcquireSRWLockExclusive(&eosLock);
                 eosTracker.cancelVirtualPause(activeGraphKey, eosTransition::PauseDeferralStatus::CancelledStop);
                 ReleaseSRWLockExclusive(&eosLock);
@@ -457,7 +468,7 @@ static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
             }
         }
 
-        // Unrelated buffer or normal stop: proceed to original DirectSoundBuffer::Stop
+        // Normal stop: proceed to original DirectSoundBuffer::Stop
         DWORD play = 0, write = 0;
         self->GetCurrentPosition(&play, &write);
         record("DS_STOP", play, write, S_OK);
@@ -1278,22 +1289,23 @@ static HRESULT STDMETHODCALLTYPE setPositionsHook(IMediaSeeking* self, LONGLONG*
             recordDiag("BOUNDARY_SEEK_SETPOSITIONS_ENTER", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
             AcquireSRWLockExclusive(&eosLock);
             auto* g = eosTracker.findGraph(key);
-            bool isEngineCall = isCallerFromOpcDSPlay(caller) &&
-                                eosTracker.isTransitionThread(key, GetCurrentThreadId());
+            bool isExplicitManual = false;
+            bool isExplicitEngine = false;
 #ifdef TESTING_HEADLESS
-            if (g_forceOpcDsPlayPauseCaller) isEngineCall = true;
+            if (g_forceManualSeek) isExplicitManual = true;
+            if (g_forceOpcDsPlayPauseCaller) isExplicitEngine = true;
 #endif
-            if (g && g->isVirtualPauseActive()) {
-                if (isEngineCall) {
-                    eosTracker.deferAutomaticSeek(key, newPos, dwCurrentFlags, newStop, dwStopFlags);
-                    ReleaseSRWLockExclusive(&eosLock);
-                    recordDiag("DEFERRED_SETPOSITIONS_QUEUED", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
-                    return S_OK;
-                } else {
-                    eosTracker.cancelVirtualPause(key, eosTransition::PauseDeferralStatus::CancelledSeek);
-                    recordDiag("PAUSE_DEFERRED_CANCELLED", key, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledSeek), 0, S_OK);
-                    recordDiag("DEFERRED_SETPOSITIONS_PURGED", key, caller, 0, 0, S_OK);
-                }
+            auto classification = eosTracker.classifySeekOperation(key, isExplicitManual, isExplicitEngine,
+                                                                   newPos, g_lastUserInputTick.load());
+            if (classification == eosTransition::Tracker::SeekClassification::AutomatedDeferred) {
+                eosTracker.deferAutomaticSeek(key, newPos, dwCurrentFlags, newStop, dwStopFlags);
+                ReleaseSRWLockExclusive(&eosLock);
+                recordDiag("DEFERRED_SETPOSITIONS_QUEUED", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
+                return S_OK;
+            } else if (classification == eosTransition::Tracker::SeekClassification::ManualCancelled) {
+                eosTracker.cancelVirtualPause(key, eosTransition::PauseDeferralStatus::CancelledSeek);
+                recordDiag("PAUSE_DEFERRED_CANCELLED", key, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledSeek), 0, S_OK);
+                recordDiag("DEFERRED_SETPOSITIONS_PURGED", key, caller, 0, 0, S_OK);
             } else if (g && g->isPauseDeferralActive()) {
                 eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledSeek);
                 recordDiag("PAUSE_DEFERRED_ABORT_BY_SEEK", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, 0, S_OK);
