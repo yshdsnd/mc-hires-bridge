@@ -1,4 +1,4 @@
-# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37）
+# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37 / #38）
 
 ## 1. 概要とアーキテクチャ
 
@@ -30,9 +30,12 @@ Issue #33、#34、#35、および #36 では、この排他制御拘束を解消
        |---> IDirectSoundBuffer::Stop() --------> [仮想Pause中の自動停止を抑止 (DS_OK 返却、再生継続)]
        |---> 旧グラフへの SetPositions(~20s) ---> [旧グラフ内部シークを退避・吸収 (OLD_GRAPH_PARKED)]
        |                                          (ドレイン中断・旧グラフのフラッシュを防止)
-       |---> 新グラフへの SetPositions(0) ------> [次曲頭出しシークを退避・保留 (DEFERRED_QUEUED)]
-       |                                          (新グラフへドレイン完了時に 1 度だけ適用)
-       | (※ ユーザーの手動非ゼロシーク・手動停止は UI 入力検知により即時最優先実行)
+       |---> 新グラフへの次曲一元準備 (Issue #38)
+       |     ・SetPositions(0) -----------------> [頭出しシークを退避・保留 (DEFERRED_SETPOSITIONS_QUEUED)]
+       |     ・IMediaControl::Run() ------------> [再生開始を保留・抑止 (DEFERRED_CONTROL_RUN_QUEUED)]
+       |     ・DirectSoundBuffer::Play() -------> [バッファ再生を保留・抑止 (DS_PLAY_DEFERRED_FOR_VIRTUAL_PAUSE)]
+       |     (※ 旧グラフ待機解除時に シーク(0) → Run() → Play() の順に厳密に一度だけ確定適用！)
+       | (※ ユーザーの手動非ゼロシーク・手動停止・手動再生は UI 入力検知により即時最優先実行)
        |
        +=======================================================+
        | バックグラウンド監視スレッド (asyncDrainWorkerThread) |
@@ -115,11 +118,23 @@ Issue #33、#34、#35、および #36 では、この排他制御拘束を解消
 5. `DRAIN_PROGRESS_TICK`: ドレイン監視スレッドから約 500ms ごとに進捗ハートビートを出力（`downstreamBytes`, `targetBytes`, `upstreamBytes`, `curPos`, `stopPos`）。
 6. `PAUSE_DRAIN_TIMEOUT_STATE`: タイムアウト（4.5 秒上限）到達時の未達条件を特定（`pcmDelivered`, `rendererFinished`, `targetBytes - downstreamBytes`, `stopPos - curPos`）。
 
+### 2.5 次曲準備の一元確定ログシーケンス（Issue #38）
+次曲の頭出しシークと再生開始（`Run`/`Play`）を同一グラフ・遷移世代で一元管理し、旧グラフの待機解除後に順序立てて適用：
+1. `DEFERRED_SETPOSITIONS_QUEUED`: 仮想 Pause 中の新グラフへの `SetPositions(0)` を保留。
+2. `DEFERRED_CONTROL_RUN_QUEUED`: 仮想 Pause 中の新グラフへの `IMediaControl::Run()` を保留（新グラフの早回り再生を抑止）。
+3. `DS_PLAY_DEFERRED_FOR_VIRTUAL_PAUSE`: 仮想 Pause 中の新バッファへの `IDirectSoundBuffer::Play()` を保留。
+4. 旧グラフの待機解除時（自然完了またはタイムアウト）に、厳密に以下の順序で一度だけ確定適用：
+   - `DEFERRED_SETPOSITIONS_EXECUTED`: 新グラフ位置 0 へシーク適用。
+   - `DEFERRED_CONTROL_RUN_EXECUTED`: 新グラフ `IMediaControl::Run()` を適用（新曲再生開始）。
+   - `DEFERRED_DS_PLAY_EXECUTED`: 新バッファ `IDirectSoundBuffer::Play()` を適用。
+5. 手動操作（手動 Pause, Seek, Stop, TrackChange, Exit, ManualPlay）発生時：
+   - `DEFERRED_OPERATIONS_PURGED`: 保留されていた次曲のシーク・Run・Play をすべて安全に破棄。
+
 ---
 
-## 3. ヘッドレス競合テストスイート（Tests 40〜59）検証結果
+## 3. ヘッドレス競合テストスイート（Tests 40〜64）検証結果
 
-Issue #30、#33、#34、#35、#36、#37 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35 / #36）、旧グラフ非ゼロシークのパーキング、新グラフゼロシークの 1 度きり適用、手動操作即時優先、および次曲先行再生とタイムアウト重複頭出しの回帰を検証する Tests 40〜59 を実装・全件合格を確認しました。
+Issue #30、#33、#34、#35、#36、#37、#38 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35 / #36）、旧グラフ非ゼロシークのパーキング、新グラフゼロシークと再生開始（Run/Play）の一元確定適用、手動操作即時優先、および COM スレッド境界マーシャリングを検証する Tests 40〜64 を実装・全件合格を確認しました。
 
 | テスト番号 | テスト名称 | 検証項目 | 結果 |
 |:---:|:---|:---|:---:|
@@ -143,8 +158,13 @@ Issue #30、#33、#34、#35、#36、#37 の競合テストハーネス（`AsyncC
 | **TEST 57** | Manual stop regression during Virtual Pause | 仮想 Pause 保留中に手動停止が発行された場合、直ちに仮想 Pause を取消してグラフおよび DirectSound を完全停止することを確認 | **PASS** |
 | **TEST 58** | Next track zero seek applied to new graph exactly once (Issue #36) | 重複したエンジン頭出し呼出が発生した場合でも、新グラフへの頭出しシークがドレイン完了時に厳密に 1 回だけ適用されることを確認 | **PASS** |
 | **TEST 59** | New graph playback precedes deferred seek & causes timeout duplicate (Issue #37) | 新グラフ再生開始（`Run`/`Play`）が保留シーク適用に先行し、旧グラフ未達によるタイムアウト（約 4.5 秒後）で保留シークが実行されて次曲が頭出しリセットされ重複波形が生じる実機現象を完全モデル化して検証 | **PASS** |
+| **TEST 60** | Unified seek (0) and playback start (Run/Play) on natural drain (Issue #38) | 仮想 Pause 中の新グラフ位置 0 シーク、Run、Play を一元保留し、自然完了時に シーク(0) → Run → Play の順序で厳密に一度だけ確定適用されることを検証 | **PASS** |
+| **TEST 61** | Unified seek (0) and playback start on timeout: no duplicate waveform (Issue #38) | 旧グラフ未達タイムアウト時にも次曲が先行再生されず、タイムアウト時に初めて シーク(0) → Run → Play が適用され重複波形を完全解消することを検証 | **PASS** |
+| **TEST 62** | Manual cancellation purges unified seek and playback start (Issue #38) | ユーザー手動操作（Stop等）発生時に一元保留されたシーク・Run・Play が即座に全破棄され、古い再生命令が一切発生しないことを検証 | **PASS** |
+| **TEST 63** | Transition generation update discards stale preparation (Issue #38) | 遷移世代が更新（新世代突入）された場合、旧世代の一元保留命令が無効化され新世代へ誤適用されないことを検証 | **PASS** |
+| **TEST 64** | COM thread boundary marshaling and execution across apartments (Issue #38) | `CoMarshalInterThreadInterfaceInStream` による `IMediaSeeking` および `IMediaControl` のアパートメント間ストリームマーシャリング・復元実行が正常動作することを検証 | **PASS** |
 
-> 合計 59 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 非同期テスト 40〜59）すべてがエラーなしで通過しました。
+> 合計 64 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 / #38 非同期テスト 40〜64）すべてがエラーなしで通過しました。
 
 ---
 
@@ -199,3 +219,18 @@ Codex が Music Center for PC 2.7.4 x86 実機環境で動作検証を行うた�
   - 先行曲の約 20.2 秒付近で次曲波形が出現する際、どの経路（`CONTROL_RUN`, `FILTER_RUN`, `DS_PLAY` 等）が新グラフ・バッファで呼ばれているか確認する。
   - 約 24.6 秒付近でタイムアウト（`PAUSE_DEFERRED_COMPLETED (status=TimedOut)`）が発生する際、直前に出力される `PAUSE_DRAIN_TIMEOUT_STATE` から旧グラフが未達となった原因（`pcmDelivered` が偽か、`rendererFinished` が偽か、未到達 PCM バイト数、またはレンダラー進行度）を特定する。
   - ピンフラッシュ（`SEAMLESS_BEGIN_FLUSH`, `EQ_BEGIN_FLUSH` 等）がどのタイミングで発生しているか確認する。
+
+#### シナリオ F: 次曲再生開始と保留シークの一元確定・重複波形解消確認（Issue #38 実機検証）
+- **対象**: 48 kHz/24 bit FLAC から 48 kHz/16 bit FLAC への自動曲送り。
+- **確認事項**:
+  - **重複波形の完全解消**: 先行曲再生中（仮想 Pause 中、約 20.2 秒付近）に次曲の音声波形が早期出現しないこと。次曲の音声波形は先行曲のドレイン完了（または安全タイムアウト時）に**一度だけ**出現すること（Issue #37 で観測された 20.220 秒と 24.621 秒の二重波形が解消されていること）。
+  - **先行開始抑止ログの確認**:
+    - 仮想 Pause 突入後（約 20.2 秒〜20.3 秒）、新グラフに対する `IMediaControl::Run` が `DEFERRED_CONTROL_RUN_QUEUED` として抑止・保留されること。
+    - 新バッファに対する `IDirectSoundBuffer::Play` が `DS_PLAY_DEFERRED_FOR_VIRTUAL_PAUSE` として抑止・保留されること。
+  - **一元確定順序の検証**:
+    - ドレイン完了時（またはタイムアウト時）に、厳密に以下の順序で確定・実行されること:
+      1. `DEFERRED_SETPOSITIONS_EXECUTED` (位置 0 へのシーク)
+      2. `DEFERRED_CONTROL_RUN_EXECUTED` (新グラフの Run)
+      3. `DEFERRED_DS_PLAY_EXECUTED` (新バッファの Play)
+  - **手動操作時のキャンセル安全性**:
+    - 仮想 Pause 保留区間中に手動停止・一時停止・シーク・手動再生を行った場合、一元保留されたシーク・Run・Play が全て即座に破棄され、古い再生命令や新グラフの誤再生が一切発生しないこと。

@@ -41,6 +41,10 @@ static bool isNativeSupported24(IUnknown* self){
     IBaseFilter* f=nullptr;if(FAILED(self->QueryInterface(IID_PPV_ARGS(&f))))return false;IEnumPins* pins=nullptr;bool found=false;if(SUCCEEDED(f->EnumPins(&pins))){IPin* p=nullptr;while(pins->Next(1,&p,nullptr)==S_OK){PIN_DIRECTION direction;p->QueryDirection(&direction);IEnumMediaTypes* types=nullptr;if(direction==PINDIR_OUTPUT&&SUCCEEDED(p->EnumMediaTypes(&types))){AM_MEDIA_TYPE* mt=nullptr;if(types->Next(1,&mt,nullptr)==S_OK){if(mt->majortype==MEDIATYPE_Audio&&mt->subtype==MEDIASUBTYPE_PCM&&mt->formattype==FORMAT_WaveFormatEx&&mt->cbFormat>=16&&mt->pbFormat){WAVEFORMATEX wave{};memcpy(&wave,mt->pbFormat,min(size_t(mt->cbFormat),sizeof(wave)));found=supportedFlacRate(wave.nSamplesPerSec)&&wave.wBitsPerSample==24&&wave.nChannels==2;}if(mt->cbFormat)CoTaskMemFree(mt->pbFormat);if(mt->pUnk)mt->pUnk->Release();CoTaskMemFree(mt);}types->Release();}p->Release();if(found)break;}pins->Release();}f->Release();return found;
 }
 static bool supportedOutputRate(DWORD rate){return supportedFlacRate(rate);}
+using Run=HRESULT(STDMETHODCALLTYPE*)(IMediaControl*);
+using FilterRun=HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*,REFERENCE_TIME);
+static Run originalRun=nullptr;static FilterRun originalFilterRun=nullptr;
+static void updateStatus(IUnknown* object,HRESULT result);
 #ifdef EXPERIMENT_WAV192
 #include "wav192_hooks.inl"
 #endif
@@ -63,9 +67,6 @@ static HRESULT STDMETHODCALLTYPE setterHook(IUnknown* self,DWORD value){
 #endif
     if(FAILED(hr)){auto fallback=original(self,value);record("SET_16_FALLBACK",value,value,fallback);return fallback;}return hr;
 }
-using Run=HRESULT(STDMETHODCALLTYPE*)(IMediaControl*);
-using FilterRun=HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*,REFERENCE_TIME);
-static Run originalRun=nullptr;static FilterRun originalFilterRun=nullptr;
 static void updateStatus(IUnknown* object,HRESULT result) {
     bool source=false,output24=false;DWORD outputRate=0;WORD outputChannels=0,outputBits=0;IFilterGraph* graph=nullptr;
     if(SUCCEEDED(result)&&bridgeStatus::directSoundSelected()&&SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&graph)))){
@@ -84,7 +85,10 @@ static HRESULT STDMETHODCALLTYPE runHook(IMediaControl* self){
     WavScope scope;if(scope.outer){auto check=prepareWav(self);if(FAILED(check))return check;}
 #endif
 #ifdef EXPERIMENT_EOS_TRANSITION
-    onEosControlRun(self, _ReturnAddress());
+    HRESULT deferHr = S_OK;
+    if (handleEosControlRun(self, _ReturnAddress(), &deferHr)) {
+        return deferHr;
+    }
     updateStatus(self,S_OK);
     tryAttachOpcDsPlayLockHooks();
 #endif

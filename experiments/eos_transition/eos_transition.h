@@ -7,6 +7,7 @@
 #include <map>
 
 struct IStream;
+struct IDirectSoundBuffer;
 
 namespace eosTransition {
 
@@ -24,6 +25,7 @@ enum class PauseDeferralStatus {
     CancelledSeek,
     CancelledTrackChange,
     CancelledManualPause,
+    CancelledManualPlay,
     CancelledQuit,
     TimedOut
 };
@@ -90,6 +92,35 @@ struct GraphState {
         DWORD stopFlags = 0;
     };
 
+    struct DeferredNextTrackPreparation {
+        bool valid = false;
+        void* targetGraph = nullptr;
+        uint32_t transitionGeneration = 0;
+
+        // Deferred Seek (SetPositions)
+        bool hasSeek = false;
+        void* targetSeeking = nullptr;
+        IStream* targetSeekingMarshalStream = nullptr;
+        LONGLONG seekCurrent = 0;
+        DWORD seekCurrentFlags = 0;
+        LONGLONG seekStop = 0;
+        DWORD seekStopFlags = 0;
+
+        // Deferred Playback Start (IMediaControl::Run)
+        bool hasRun = false;
+        void* targetControl = nullptr;
+        IStream* targetControlMarshalStream = nullptr;
+        void* runCaller = nullptr;
+
+        // Deferred DirectSound Play
+        bool hasDsPlay = false;
+        void* targetDsBuffer = nullptr;
+        DWORD dsReserved1 = 0;
+        DWORD dsPriority = 0;
+        DWORD dsFlags = 0;
+        void* dsCaller = nullptr;
+    };
+
     struct TransitionContext {
         uint64_t transitionId = 0;
         uint32_t generation = 0;
@@ -108,16 +139,31 @@ struct GraphState {
     uint32_t transitionGeneration = 0;
     DWORD virtualPauseEnterTick = 0;
     TransitionContext transition;
+    DeferredNextTrackPreparation deferredPreparation;
     DeferredSeekParams deferredSeek;
     bool deferredDsStop = false;
     bool deferredGraphStop = false;
 
-    void releaseDeferredSeekStream() {
+    void releaseDeferredStreams() {
+        if (deferredPreparation.targetSeekingMarshalStream) {
+            auto* pStream = deferredPreparation.targetSeekingMarshalStream;
+            deferredPreparation.targetSeekingMarshalStream = nullptr;
+            pStream->Release();
+        }
+        if (deferredPreparation.targetControlMarshalStream) {
+            auto* pStream = deferredPreparation.targetControlMarshalStream;
+            deferredPreparation.targetControlMarshalStream = nullptr;
+            pStream->Release();
+        }
         if (deferredSeek.targetSeekingMarshalStream) {
             auto* pStream = deferredSeek.targetSeekingMarshalStream;
             deferredSeek.targetSeekingMarshalStream = nullptr;
             pStream->Release();
         }
+    }
+
+    void releaseDeferredSeekStream() {
+        releaseDeferredStreams();
     }
 
     bool isVirtualPauseActive() const { return virtualPauseActive; }
@@ -128,6 +174,7 @@ struct GraphState {
                pauseDeferralStatus == PauseDeferralStatus::CancelledSeek ||
                pauseDeferralStatus == PauseDeferralStatus::CancelledTrackChange ||
                pauseDeferralStatus == PauseDeferralStatus::CancelledManualPause ||
+               pauseDeferralStatus == PauseDeferralStatus::CancelledManualPlay ||
                pauseDeferralStatus == PauseDeferralStatus::CancelledQuit;
     }
 };
@@ -384,7 +431,8 @@ public:
         s.transition.cancelled = true;
         s.formatChangePauseDeferred = false;
         s.pauseDeferralStatus = status;
-        s.releaseDeferredSeekStream();
+        s.releaseDeferredStreams();
+        s.deferredPreparation = GraphState::DeferredNextTrackPreparation{};
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;
@@ -432,6 +480,8 @@ public:
         s.virtualPauseEnterTick = GetTickCount();
         s.formatChangePauseDeferred = true;
         s.pauseDeferralStatus = PauseDeferralStatus::Active;
+        s.releaseDeferredStreams();
+        s.deferredPreparation = GraphState::DeferredNextTrackPreparation{};
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;
@@ -446,6 +496,45 @@ public:
         s.transition.rendererOutputComplete = false;
         s.transition.completed = false;
         s.transition.cancelled = false;
+    }
+
+    enum class RunClassification {
+        NotVirtualPause,
+        AutomatedDeferred,
+        OldGraphIgnored,
+        ManualCancelled
+    };
+
+    RunClassification classifyRunOperation(void* targetGraphKey, bool isExplicitManualOp,
+                                           DWORD lastInputTick = 0, void** outActiveVirtualGraph = nullptr) const {
+        void* activeVirtualKey = nullptr;
+        if (!findActiveVirtualPauseGraph(&activeVirtualKey)) {
+            if (outActiveVirtualGraph) *outActiveVirtualGraph = nullptr;
+            return RunClassification::NotVirtualPause;
+        }
+        if (outActiveVirtualGraph) {
+            *outActiveVirtualGraph = activeVirtualKey;
+        }
+        const auto* activeState = findGraph(activeVirtualKey);
+        if (!activeState || !activeState->virtualPauseActive) {
+            return RunClassification::NotVirtualPause;
+        }
+
+        // Priority 1: User manual operations (mouse click, keyboard, explicit Play)
+        if (isExplicitManualOp) {
+            return RunClassification::ManualCancelled;
+        }
+        if (lastInputTick != 0 && (lastInputTick >= activeState->virtualPauseEnterTick || (GetTickCount() - lastInputTick < 400))) {
+            return RunClassification::ManualCancelled;
+        }
+
+        // Priority 2: Automated engine operations (no user input observed)
+        bool isOldGraph = (targetGraphKey == nullptr || targetGraphKey == activeVirtualKey);
+        if (isOldGraph) {
+            return RunClassification::OldGraphIgnored;
+        } else {
+            return RunClassification::AutomatedDeferred;
+        }
     }
 
     enum class SeekClassification {
@@ -560,11 +649,24 @@ public:
                             IStream* marshalStream = nullptr) {
         if (!activeGraphKey) return;
         auto& s = ensureGraph(activeGraphKey);
-        s.releaseDeferredSeekStream();
+        if (s.deferredPreparation.targetSeekingMarshalStream) {
+            s.deferredPreparation.targetSeekingMarshalStream->Release();
+            s.deferredPreparation.targetSeekingMarshalStream = nullptr;
+        }
+        s.deferredPreparation.valid = true;
+        s.deferredPreparation.targetGraph = targetGraphKey ? targetGraphKey : activeGraphKey;
+        s.deferredPreparation.transitionGeneration = s.transitionGeneration;
+        s.deferredPreparation.hasSeek = true;
+        s.deferredPreparation.targetSeeking = targetSeeking;
+        s.deferredPreparation.targetSeekingMarshalStream = marshalStream;
+        s.deferredPreparation.seekCurrent = current;
+        s.deferredPreparation.seekCurrentFlags = currentFlags;
+        s.deferredPreparation.seekStop = stop;
+        s.deferredPreparation.seekStopFlags = stopFlags;
+
         s.deferredSeek.valid = true;
-        s.deferredSeek.targetGraph = targetGraphKey ? targetGraphKey : activeGraphKey;
+        s.deferredSeek.targetGraph = s.deferredPreparation.targetGraph;
         s.deferredSeek.targetSeeking = targetSeeking;
-        s.deferredSeek.targetSeekingMarshalStream = marshalStream;
         s.deferredSeek.current = current;
         s.deferredSeek.currentFlags = currentFlags;
         s.deferredSeek.stop = stop;
@@ -575,16 +677,80 @@ public:
         deferAutomaticSeek(graphKey, graphKey, nullptr, current, currentFlags, stop, stopFlags, nullptr);
     }
 
+    void deferAutomaticRun(void* activeGraphKey, void* targetGraphKey, void* targetControl,
+                           IStream* marshalStream, void* caller) {
+        if (!activeGraphKey) return;
+        auto& s = ensureGraph(activeGraphKey);
+        if (s.deferredPreparation.targetControlMarshalStream) {
+            s.deferredPreparation.targetControlMarshalStream->Release();
+            s.deferredPreparation.targetControlMarshalStream = nullptr;
+        }
+        s.deferredPreparation.valid = true;
+        s.deferredPreparation.targetGraph = targetGraphKey ? targetGraphKey : activeGraphKey;
+        s.deferredPreparation.transitionGeneration = s.transitionGeneration;
+        s.deferredPreparation.hasRun = true;
+        s.deferredPreparation.targetControl = targetControl;
+        s.deferredPreparation.targetControlMarshalStream = marshalStream;
+        s.deferredPreparation.runCaller = caller;
+    }
+
+    void deferAutomaticDsPlay(void* activeGraphKey, void* buf,
+                              DWORD dwReserved1, DWORD dwPriority, DWORD dwFlags, void* caller) {
+        if (!activeGraphKey) return;
+        auto& s = ensureGraph(activeGraphKey);
+        s.deferredPreparation.valid = true;
+        s.deferredPreparation.transitionGeneration = s.transitionGeneration;
+        s.deferredPreparation.hasDsPlay = true;
+        s.deferredPreparation.targetDsBuffer = buf;
+        s.deferredPreparation.dsReserved1 = dwReserved1;
+        s.deferredPreparation.dsPriority = dwPriority;
+        s.deferredPreparation.dsFlags = dwFlags;
+        s.deferredPreparation.dsCaller = caller;
+    }
+
     bool hasDeferredSeek(void* graphKey) const {
         const auto* s = findGraph(graphKey);
-        return s ? s->deferredSeek.valid : false;
+        return s ? s->deferredPreparation.hasSeek : false;
+    }
+
+    bool hasDeferredRun(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->deferredPreparation.hasRun : false;
+    }
+
+    bool hasDeferredDsPlay(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->deferredPreparation.hasDsPlay : false;
+    }
+
+    bool popDeferredNextTrackPreparation(void* graphKey, GraphState::DeferredNextTrackPreparation& outPrep) {
+        if (!graphKey) return false;
+        auto& s = ensureGraph(graphKey);
+        if (s.transition.cancelled || !s.deferredPreparation.valid) return false;
+        outPrep = s.deferredPreparation;
+        s.deferredPreparation = GraphState::DeferredNextTrackPreparation{};
+        s.deferredSeek = GraphState::DeferredSeekParams{};
+        return true;
     }
 
     bool popDeferredSeek(void* graphKey, GraphState::DeferredSeekParams& outSeek) {
         if (!graphKey) return false;
         auto& s = ensureGraph(graphKey);
-        if (s.transition.cancelled || !s.deferredSeek.valid) return false;
-        outSeek = s.deferredSeek;
+        if (s.transition.cancelled || (!s.deferredPreparation.hasSeek && !s.deferredSeek.valid)) return false;
+        if (s.deferredPreparation.hasSeek) {
+            outSeek.valid = true;
+            outSeek.targetGraph = s.deferredPreparation.targetGraph;
+            outSeek.targetSeeking = s.deferredPreparation.targetSeeking;
+            outSeek.targetSeekingMarshalStream = s.deferredPreparation.targetSeekingMarshalStream;
+            s.deferredPreparation.targetSeekingMarshalStream = nullptr; // ownership transferred
+            outSeek.current = s.deferredPreparation.seekCurrent;
+            outSeek.currentFlags = s.deferredPreparation.seekCurrentFlags;
+            outSeek.stop = s.deferredPreparation.seekStop;
+            outSeek.stopFlags = s.deferredPreparation.seekStopFlags;
+            s.deferredPreparation.hasSeek = false;
+        } else {
+            outSeek = s.deferredSeek;
+        }
         s.deferredSeek = GraphState::DeferredSeekParams{};
         return true;
     }
@@ -617,7 +783,8 @@ public:
     void clearDeferredActions(void* graphKey) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
-        s.releaseDeferredSeekStream();
+        s.releaseDeferredStreams();
+        s.deferredPreparation = GraphState::DeferredNextTrackPreparation{};
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;

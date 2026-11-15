@@ -57,6 +57,13 @@ public:
     std::atomic<int> controlRunCount{0};
     std::atomic<int> dsPlayCount{0};
     std::atomic<bool> newGraphRunPrecededDeferredSeek{false};
+    std::atomic<bool> deferredRunQueued{false};
+    std::atomic<bool> deferredRunExecuted{false};
+    std::atomic<int> deferredRunExecutedCount{0};
+    std::atomic<bool> deferredDsPlayQueued{false};
+    std::atomic<bool> deferredDsPlayExecuted{false};
+    std::atomic<int> deferredDsPlayExecutedCount{0};
+    std::vector<std::string> executionSequence;
     DWORD lastUserInputTick = 0;
 
     // Stored deferred seek parameters
@@ -228,9 +235,26 @@ public:
     }
 
     // --- Control Run Hook ---
-    HRESULT executeControlRun(MockFilterGraphEx* graph = nullptr) {
+    HRESULT executeControlRun(MockFilterGraphEx* graph = nullptr, bool deferIfVirtual = false) {
         controlRunCount++;
-        if (graph && graph != mockGraph && tracker.isVirtualPauseActive(mockGraph)) {
+        bool isManual = (currentCallerContext == CallerContext::UserManualOp);
+        void* activeGraph = nullptr;
+        bool virtualActive = tracker.findActiveVirtualPauseGraph(&activeGraph);
+
+        if (deferIfVirtual && virtualActive && graph && graph != mockGraph) {
+            if (isManual) {
+                tracker.cancelVirtualPause(activeGraph, eosTransition::PauseDeferralStatus::CancelledManualPlay);
+                manualOpObserved = true;
+                if (graph->control) return graph->control->Run();
+                return pControl->Run();
+            } else {
+                tracker.deferAutomaticRun(activeGraph, graph, graph->control, nullptr, nullptr);
+                deferredRunQueued = true;
+                return S_OK; // Suppressed until drain release!
+            }
+        }
+
+        if (graph && graph != mockGraph && virtualActive) {
             newGraphRunPrecededDeferredSeek = true;
         }
         if (graph && graph->control) {
@@ -240,9 +264,25 @@ public:
     }
 
     // --- DirectSound Play Hook ---
-    HRESULT executeDsPlay(MockDirectSoundBufferEx* buf = nullptr, DWORD dwFlags = 0) {
+    HRESULT executeDsPlay(MockDirectSoundBufferEx* buf = nullptr, DWORD dwFlags = 0, bool deferIfVirtual = false) {
         dsPlayCount++;
-        if (buf && buf != mockDsBuffer && tracker.isVirtualPauseActive(mockGraph)) {
+        bool isManual = (currentCallerContext == CallerContext::UserManualOp);
+        void* activeGraph = nullptr;
+        bool virtualActive = tracker.findActiveVirtualPauseGraph(&activeGraph);
+
+        if (deferIfVirtual && virtualActive && buf && buf != mockDsBuffer) {
+            if (isManual) {
+                tracker.cancelVirtualPause(activeGraph, eosTransition::PauseDeferralStatus::CancelledManualPlay);
+                manualOpObserved = true;
+                return buf->Play(0, 0, dwFlags);
+            } else {
+                tracker.deferAutomaticDsPlay(activeGraph, buf, 0, 0, dwFlags, nullptr);
+                deferredDsPlayQueued = true;
+                return DS_OK; // Suppressed until drain release!
+            }
+        }
+
+        if (buf && buf != mockDsBuffer && virtualActive) {
             newGraphRunPrecededDeferredSeek = true;
         }
         if (buf) {
@@ -292,16 +332,35 @@ public:
             return false;
         }
 
-        // Apply deferred seek if present
-        eosTransition::GraphState::DeferredSeekParams sp;
-        if (tracker.popDeferredSeek(mockGraph, sp)) {
-            IMediaSeeking* seekToUse = pSeeking;
-            if (sp.targetSeeking) {
-                seekToUse = static_cast<IMediaSeeking*>(sp.targetSeeking);
+        // Apply unified preparation if present
+        eosTransition::GraphState::DeferredNextTrackPreparation prep;
+        if (tracker.popDeferredNextTrackPreparation(mockGraph, prep)) {
+            if (prep.hasSeek) {
+                IMediaSeeking* seekToUse = pSeeking;
+                if (prep.targetSeeking) {
+                    seekToUse = static_cast<IMediaSeeking*>(prep.targetSeeking);
+                }
+                seekToUse->SetPositions(&prep.seekCurrent, prep.seekCurrentFlags, &prep.seekStop, prep.seekStopFlags);
+                deferredSeekExecuted = true;
+                deferredSeekExecutedCount++;
+                executionSequence.push_back("SEEK");
             }
-            seekToUse->SetPositions(&sp.current, sp.currentFlags, &sp.stop, sp.stopFlags);
-            deferredSeekExecuted = true;
-            deferredSeekExecutedCount++;
+            if (prep.hasRun) {
+                if (prep.targetControl) {
+                    static_cast<IMediaControl*>(prep.targetControl)->Run();
+                } else if (pControl) {
+                    pControl->Run();
+                }
+                deferredRunExecuted = true;
+                deferredRunExecutedCount++;
+                executionSequence.push_back("RUN");
+            }
+            if (prep.hasDsPlay && prep.targetDsBuffer) {
+                static_cast<IDirectSoundBuffer*>(prep.targetDsBuffer)->Play(0, 0, prep.dsFlags);
+                deferredDsPlayExecuted = true;
+                deferredDsPlayExecutedCount++;
+                executionSequence.push_back("PLAY");
+            }
         }
         return true;
     }
@@ -318,15 +377,34 @@ public:
             deliverDownstreamEosIfValid();
         }
 
-        eosTransition::GraphState::DeferredSeekParams sp;
-        if (tracker.popDeferredSeek(mockGraph, sp)) {
-            IMediaSeeking* seekToUse = pSeeking;
-            if (sp.targetSeeking) {
-                seekToUse = static_cast<IMediaSeeking*>(sp.targetSeeking);
+        eosTransition::GraphState::DeferredNextTrackPreparation prep;
+        if (tracker.popDeferredNextTrackPreparation(mockGraph, prep)) {
+            if (prep.hasSeek) {
+                IMediaSeeking* seekToUse = pSeeking;
+                if (prep.targetSeeking) {
+                    seekToUse = static_cast<IMediaSeeking*>(prep.targetSeeking);
+                }
+                seekToUse->SetPositions(&prep.seekCurrent, prep.seekCurrentFlags, &prep.seekStop, prep.seekStopFlags);
+                deferredSeekExecuted = true;
+                deferredSeekExecutedCount++;
+                executionSequence.push_back("SEEK");
             }
-            seekToUse->SetPositions(&sp.current, sp.currentFlags, &sp.stop, sp.stopFlags);
-            deferredSeekExecuted = true;
-            deferredSeekExecutedCount++;
+            if (prep.hasRun) {
+                if (prep.targetControl) {
+                    static_cast<IMediaControl*>(prep.targetControl)->Run();
+                } else if (pControl) {
+                    pControl->Run();
+                }
+                deferredRunExecuted = true;
+                deferredRunExecutedCount++;
+                executionSequence.push_back("RUN");
+            }
+            if (prep.hasDsPlay && prep.targetDsBuffer) {
+                static_cast<IDirectSoundBuffer*>(prep.targetDsBuffer)->Play(0, 0, prep.dsFlags);
+                deferredDsPlayExecuted = true;
+                deferredDsPlayExecutedCount++;
+                executionSequence.push_back("PLAY");
+            }
         }
         return true;
     }
@@ -1131,8 +1209,324 @@ inline void testNewGraphPlaybackPrecedesDeferredSeekAndCausesTimeoutDuplicate() 
     nextMockBuffer->Release();
 }
 
+// Test 60: Unified Seek (0) and Playback Start (Run / Play) on Natural Drain (Issue #38)
+inline void testUnifiedSeekAndPlaybackStartOnNaturalDrain() {
+    std::printf("[TEST 60] Unified seek (0) and playback start (Run/Play) on natural drain (Issue #38)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 10; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    // 1. Enter Virtual Pause on old graph
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+    const auto* st = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(st->isVirtualPauseActive() == true);
+
+    // 2. Suppress DirectSound Stop on old buffer
+    CHECK(harness.executeDsStop(nullptr, 1001) == DS_OK);
+    CHECK(harness.dsStopSuppressed.load() == true);
+
+    // 3. New graph opened for next track
+    MockFilterGraphEx* nextMockGraph = new MockFilterGraphEx();
+    MockMediaControl* nextMockControl = new MockMediaControl();
+    MockMediaSeekingEx* nextMockSeeking = new MockMediaSeekingEx();
+    MockDirectSoundBufferEx* nextMockBuffer = new MockDirectSoundBufferEx();
+    nextMockGraph->control = nextMockControl;
+    nextMockGraph->seeking = nextMockSeeking;
+    harness.tracker.onGraphActivated(nextMockGraph, false, 48000, 2, 16);
+
+    // 4. Engine calls SetPositions(0) on NEW graph -> deferred
+    LONGLONG nextPos = 0, nextStop = 300000000LL;
+    CHECK(harness.executeSetPositions(nextMockGraph, nextMockSeeking, &nextPos, AM_SEEKING_AbsolutePositioning,
+                                      &nextStop, AM_SEEKING_AbsolutePositioning, 2002) == S_OK);
+    CHECK(harness.deferredSeekQueued.load() == true);
+    CHECK(harness.deferredSeekExecutedCount.load() == 0);
+
+    // 5. Engine calls Control Run on NEW graph -> DEFERRED!
+    CHECK(harness.executeControlRun(nextMockGraph, true) == S_OK);
+    CHECK(harness.deferredRunQueued.load() == true);
+    CHECK(harness.deferredRunExecutedCount.load() == 0);
+    CHECK(nextMockControl->state == State_Stopped); // MUST NOT BE RUNNING YET!
+
+    // 6. Engine / Renderer calls DirectSound Play on NEW buffer -> DEFERRED!
+    CHECK(harness.executeDsPlay(nextMockBuffer, DSBPLAY_LOOPING, true) == DS_OK);
+    CHECK(harness.deferredDsPlayQueued.load() == true);
+    CHECK(harness.deferredDsPlayExecutedCount.load() == 0);
+    CHECK(nextMockBuffer->playCallCount == 0); // MUST NOT BE PLAYING YET!
+
+    // 7. Old graph completes natural drain
+    CHECK(harness.completeDrainNaturally() == true);
+    CHECK(!st->isVirtualPauseActive());
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CompletedDrain);
+
+    // 8. Unified preparation executed in strict order: SEEK -> RUN -> PLAY exactly ONCE!
+    CHECK(harness.deferredSeekExecutedCount.load() == 1);
+    CHECK(harness.deferredRunExecutedCount.load() == 1);
+    CHECK(harness.deferredDsPlayExecutedCount.load() == 1);
+    CHECK(harness.executionSequence.size() == 3);
+    CHECK(harness.executionSequence[0] == "SEEK");
+    CHECK(harness.executionSequence[1] == "RUN");
+    CHECK(harness.executionSequence[2] == "PLAY");
+
+    CHECK(nextMockSeeking->currentPos == 0);
+    CHECK(nextMockControl->state == State_Running);
+    CHECK(nextMockBuffer->playCallCount == 1);
+
+    nextMockGraph->Release();
+    nextMockControl->Release();
+    nextMockSeeking->Release();
+    nextMockBuffer->Release();
+}
+
+// Test 61: Unified Seek and Playback Start on Timeout (Issue #38 - Duplicate Start Elimination)
+inline void testUnifiedSeekAndPlaybackStartOnTimeout() {
+    std::printf("[TEST 61] Unified seek (0) and playback start on timeout: no duplicate waveform (Issue #38)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 10; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    // 1. Enter Virtual Pause on old graph
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+    const auto* st = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(st->isVirtualPauseActive() == true);
+
+    // 2. New graph opens and queues unified seek, run, and play
+    MockFilterGraphEx* nextMockGraph = new MockFilterGraphEx();
+    MockMediaControl* nextMockControl = new MockMediaControl();
+    MockMediaSeekingEx* nextMockSeeking = new MockMediaSeekingEx();
+    MockDirectSoundBufferEx* nextMockBuffer = new MockDirectSoundBufferEx();
+    nextMockGraph->control = nextMockControl;
+    nextMockGraph->seeking = nextMockSeeking;
+    harness.tracker.onGraphActivated(nextMockGraph, false, 48000, 2, 16);
+
+    LONGLONG nextPos = 0, nextStop = 300000000LL;
+    CHECK(harness.executeSetPositions(nextMockGraph, nextMockSeeking, &nextPos, AM_SEEKING_AbsolutePositioning,
+                                      &nextStop, AM_SEEKING_AbsolutePositioning, 2002) == S_OK);
+    CHECK(harness.executeControlRun(nextMockGraph, true) == S_OK);
+    CHECK(harness.executeDsPlay(nextMockBuffer, DSBPLAY_LOOPING, true) == DS_OK);
+
+    // During the entire drain wait (up to 4.5s), new graph was silent:
+    CHECK(nextMockControl->state == State_Stopped);
+    CHECK(nextMockBuffer->playCallCount == 0);
+    CHECK(harness.deferredSeekExecutedCount.load() == 0);
+    CHECK(harness.deferredRunExecutedCount.load() == 0);
+
+    // 3. Old graph times out (~4.5s)
+    CHECK(harness.triggerWatchdogTimeout() == true);
+    CHECK(!st->isVirtualPauseActive());
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::TimedOut);
+
+    // 4. Unified execution applies seek -> run -> play once at timeout!
+    // Result: New track starts playing for the FIRST time from position 0!
+    // (No premature playback at 20.2s, no duplicate waveform at 24.6s!)
+    CHECK(harness.deferredSeekExecutedCount.load() == 1);
+    CHECK(harness.deferredRunExecutedCount.load() == 1);
+    CHECK(harness.deferredDsPlayExecutedCount.load() == 1);
+    CHECK(harness.executionSequence[0] == "SEEK");
+    CHECK(harness.executionSequence[1] == "RUN");
+    CHECK(harness.executionSequence[2] == "PLAY");
+    CHECK(nextMockSeeking->currentPos == 0);
+    CHECK(nextMockControl->state == State_Running);
+    CHECK(nextMockBuffer->playCallCount == 1);
+
+    nextMockGraph->Release();
+    nextMockControl->Release();
+    nextMockSeeking->Release();
+    nextMockBuffer->Release();
+}
+
+// Test 62: Manual Cancellation Purges Unified Seek and Playback Start (Issue #38)
+inline void testManualCancellationPurgesUnifiedSeekAndRun() {
+    std::printf("[TEST 62] Manual cancellation purges unified seek and playback start (Issue #38)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 10; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+
+    MockFilterGraphEx* nextMockGraph = new MockFilterGraphEx();
+    MockMediaControl* nextMockControl = new MockMediaControl();
+    MockMediaSeekingEx* nextMockSeeking = new MockMediaSeekingEx();
+    MockDirectSoundBufferEx* nextMockBuffer = new MockDirectSoundBufferEx();
+    nextMockGraph->control = nextMockControl;
+    nextMockGraph->seeking = nextMockSeeking;
+    harness.tracker.onGraphActivated(nextMockGraph, false, 48000, 2, 16);
+
+    LONGLONG nextPos = 0, nextStop = 300000000LL;
+    CHECK(harness.executeSetPositions(nextMockGraph, nextMockSeeking, &nextPos, AM_SEEKING_AbsolutePositioning,
+                                      &nextStop, AM_SEEKING_AbsolutePositioning, 2002) == S_OK);
+    CHECK(harness.executeControlRun(nextMockGraph, true) == S_OK);
+    CHECK(harness.executeDsPlay(nextMockBuffer, DSBPLAY_LOOPING, true) == DS_OK);
+    CHECK(harness.tracker.hasDeferredSeek(harness.mockGraph) == true);
+    CHECK(harness.tracker.hasDeferredRun(harness.mockGraph) == true);
+
+    // User manually clicks STOP during Virtual Pause!
+    harness.currentCallerContext = CallerContext::UserManualOp;
+    CHECK(harness.executeControlStop() == S_OK);
+    CHECK(harness.manualOpObserved.load() == true);
+    CHECK(harness.tracker.isCancelled(harness.mockGraph) == true);
+
+    // Preparation MUST BE PURGED!
+    CHECK(harness.tracker.hasDeferredSeek(harness.mockGraph) == false);
+    CHECK(harness.tracker.hasDeferredRun(harness.mockGraph) == false);
+
+    // Later delayed drain completion or timeout must do nothing:
+    CHECK(harness.completeDrainNaturally() == false);
+    CHECK(harness.triggerWatchdogTimeout() == false);
+    CHECK(harness.deferredSeekExecutedCount.load() == 0);
+    CHECK(harness.deferredRunExecutedCount.load() == 0);
+    CHECK(harness.deferredDsPlayExecutedCount.load() == 0);
+    CHECK(nextMockControl->state == State_Stopped);
+    CHECK(nextMockBuffer->playCallCount == 0);
+
+    nextMockGraph->Release();
+    nextMockControl->Release();
+    nextMockSeeking->Release();
+    nextMockBuffer->Release();
+}
+
+// Test 63: Transition Generation Update Discards Stale Preparation (Issue #38)
+inline void testTransitionGenerationMismatchDiscardsStalePrep() {
+    std::printf("[TEST 63] Transition generation update discards stale preparation (Issue #38)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    const uint32_t chunkBytes = 4800 * 6;
+    for (int i = 0; i < 10; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    // Generation 1: Enter Virtual Pause
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+    uint32_t gen1 = harness.tracker.getTransitionGeneration(harness.mockGraph);
+    CHECK(gen1 == 1);
+
+    MockFilterGraphEx* nextMockGraph = new MockFilterGraphEx();
+    MockMediaControl* nextMockControl = new MockMediaControl();
+    MockMediaSeekingEx* nextMockSeeking = new MockMediaSeekingEx();
+    nextMockGraph->control = nextMockControl;
+    nextMockGraph->seeking = nextMockSeeking;
+    harness.tracker.onGraphActivated(nextMockGraph, false, 48000, 2, 16);
+
+    LONGLONG nextPos = 0, nextStop = 300000000LL;
+    CHECK(harness.executeSetPositions(nextMockGraph, nextMockSeeking, &nextPos, AM_SEEKING_AbsolutePositioning,
+                                      &nextStop, AM_SEEKING_AbsolutePositioning, 2002) == S_OK);
+    CHECK(harness.executeControlRun(nextMockGraph, true) == S_OK);
+    CHECK(harness.tracker.hasDeferredRun(harness.mockGraph) == true);
+
+    // Generation advances (e.g. new track change entered on graph)
+    harness.tracker.markVirtualPauseActive(harness.mockGraph, 9999, nullptr);
+    uint32_t gen2 = harness.tracker.getTransitionGeneration(harness.mockGraph);
+    CHECK(gen2 == 2);
+
+    // Old prep from generation 1 must have been cleared:
+    CHECK(harness.tracker.hasDeferredSeek(harness.mockGraph) == false);
+    CHECK(harness.tracker.hasDeferredRun(harness.mockGraph) == false);
+
+    eosTransition::GraphState::DeferredNextTrackPreparation prep;
+    CHECK(harness.tracker.popDeferredNextTrackPreparation(harness.mockGraph, prep) == false);
+    CHECK(prep.hasSeek == false);
+    CHECK(prep.hasRun == false);
+
+    nextMockGraph->Release();
+    nextMockControl->Release();
+    nextMockSeeking->Release();
+}
+
+// Test 64: COM Thread Boundary Marshaling and Execution (Issue #38)
+inline void testUnifiedPreparationCOMThreadBoundaryMarshalAndExecute() {
+    std::printf("[TEST 64] COM thread boundary marshaling and execution across apartments (Issue #38)...\n");
+    IGraphBuilder* graph = nullptr;
+    HRESULT hrCo = CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&graph));
+    if (FAILED(hrCo) || !graph) {
+        std::printf("  [SKIP] DirectShow FilterGraph CoCreateInstance not available in this environment\n");
+        return;
+    }
+
+    IMediaControl* control = nullptr;
+    IMediaSeeking* seeking = nullptr;
+    CHECK(SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&control))));
+    CHECK(SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&seeking))));
+
+    // Marshal both interfaces into inter-thread stream in Thread A
+    IStream* pStreamControl = nullptr;
+    IStream* pStreamSeeking = nullptr;
+    CHECK(SUCCEEDED(CoMarshalInterThreadInterfaceInStream(IID_IMediaControl, control, &pStreamControl)));
+    CHECK(SUCCEEDED(CoMarshalInterThreadInterfaceInStream(IID_IMediaSeeking, seeking, &pStreamSeeking)));
+    CHECK(pStreamControl != nullptr);
+    CHECK(pStreamSeeking != nullptr);
+
+    std::atomic<bool> threadFinished{false};
+    std::atomic<HRESULT> seekResult{E_FAIL};
+    std::atomic<HRESULT> runResult{E_FAIL};
+    std::atomic<HRESULT> unmarshalSeekResult{E_FAIL};
+    std::atomic<HRESULT> unmarshalRunResult{E_FAIL};
+
+    // Thread B (simulating asyncDrainWorkerThread on COINIT_MULTITHREADED):
+    std::thread worker([&]() {
+        HRESULT hrMTA = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        IMediaSeeking* unmarshaledSeek = nullptr;
+        unmarshalSeekResult = CoGetInterfaceAndReleaseStream(pStreamSeeking, IID_IMediaSeeking, reinterpret_cast<void**>(&unmarshaledSeek));
+        if (SUCCEEDED(unmarshalSeekResult.load()) && unmarshaledSeek) {
+            LONGLONG cur = 0;
+            seekResult = unmarshaledSeek->SetPositions(&cur, AM_SEEKING_AbsolutePositioning, nullptr, AM_SEEKING_NoPositioning);
+            unmarshaledSeek->Release();
+        }
+
+        IMediaControl* unmarshaledControl = nullptr;
+        unmarshalRunResult = CoGetInterfaceAndReleaseStream(pStreamControl, IID_IMediaControl, reinterpret_cast<void**>(&unmarshaledControl));
+        if (SUCCEEDED(unmarshalRunResult.load()) && unmarshaledControl) {
+            runResult = unmarshaledControl->Run();
+            unmarshaledControl->Stop();
+            unmarshaledControl->Release();
+        }
+
+        if (SUCCEEDED(hrMTA)) CoUninitialize();
+        threadFinished = true;
+    });
+
+    worker.join();
+    CHECK(threadFinished.load() == true);
+    CHECK(SUCCEEDED(unmarshalSeekResult.load()));
+    CHECK(SUCCEEDED(unmarshalRunResult.load()));
+    CHECK(seekResult.load() == S_OK || seekResult.load() == E_NOTIMPL || seekResult.load() == static_cast<HRESULT>(0x80040240L));
+    CHECK(SUCCEEDED(runResult.load()));
+
+    control->Release();
+    seeking->Release();
+    graph->Release();
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -1153,7 +1547,12 @@ inline void runAllAsyncTransitionTests() {
     testManualStopRegressionDuringVirtualPause();
     testNewGraphZeroSeekAppliedExactlyOnce();
     testNewGraphPlaybackPrecedesDeferredSeekAndCausesTimeoutDuplicate();
-    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testUnifiedSeekAndPlaybackStartOnNaturalDrain();
+    testUnifiedSeekAndPlaybackStartOnTimeout();
+    testManualCancellationPurgesUnifiedSeekAndRun();
+    testTransitionGenerationMismatchDiscardsStalePrep();
+    testUnifiedPreparationCOMThreadBoundaryMarshalAndExecute();
+    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests

@@ -389,6 +389,7 @@ static bool g_forceOpcDsPlayPauseCaller = false;
 static bool g_simulateThreadCreateFailure = false;
 static bool g_forceManualSeek = false;
 static bool g_forceManualStop = false;
+static bool g_forceManualRun = false;
 #endif
 
 static bool isCallerFromOpcDSPlay(void* returnAddress) {
@@ -492,8 +493,33 @@ static HRESULT WINAPI dsPlayHook(IDirectSoundBuffer* self, DWORD dwReserved1, DW
         recordDiag("DS_PLAY", activeGraphKey ? activeGraphKey : reinterpret_cast<void*>(self), caller,
                    playPos, dwFlags, S_OK);
         if (virtualActive && !isAssoc) {
-            recordDiag("DS_PLAY_NEW_BUFFER_DURING_VIRTUAL_PAUSE", reinterpret_cast<void*>(self), caller,
-                       playPos, dwFlags, S_OK);
+            bool isManualPlay = false;
+            DWORD lastInput = g_lastUserInputTick.load();
+            if (lastInput != 0 && (GetTickCount() - lastInput < 400)) {
+                isManualPlay = true;
+            }
+#ifdef TESTING_HEADLESS
+            if (g_forceManualRun) isManualPlay = true;
+#endif
+            if (!isManualPlay) {
+                AcquireSRWLockExclusive(&eosLock);
+                void* activePauseKey = nullptr;
+                eosTracker.findActiveVirtualPauseGraph(&activePauseKey);
+                eosTracker.deferAutomaticDsPlay(activePauseKey ? activePauseKey : activeGraphKey, self,
+                                                dwReserved1, dwPriority, dwFlags, caller);
+                ReleaseSRWLockExclusive(&eosLock);
+                recordDiag("DS_PLAY_DEFERRED_FOR_VIRTUAL_PAUSE", reinterpret_cast<void*>(self), caller,
+                           playPos, dwFlags, DS_OK);
+                return DS_OK;
+            } else {
+                AcquireSRWLockExclusive(&eosLock);
+                void* activePauseKey = nullptr;
+                eosTracker.findActiveVirtualPauseGraph(&activePauseKey);
+                eosTracker.cancelVirtualPause(activePauseKey ? activePauseKey : activeGraphKey, eosTransition::PauseDeferralStatus::CancelledManualPlay);
+                ReleaseSRWLockExclusive(&eosLock);
+                recordDiag("PAUSE_DEFERRED_CANCELLED", activePauseKey ? activePauseKey : activeGraphKey, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledManualPlay), 0, S_OK);
+                recordDiag("DEFERRED_OPERATIONS_PURGED", activePauseKey ? activePauseKey : activeGraphKey, caller, 0, 0, S_OK);
+            }
         }
     }
     return originalDsPlay ? originalDsPlay(self, dwReserved1, dwPriority, dwFlags) : DSERR_GENERIC;
@@ -966,10 +992,10 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
 
             AcquireSRWLockExclusive(&eosLock);
             bool executedOnce = eosTracker.onVirtualPauseCompleted(key, status);
-            eosTransition::GraphState::DeferredSeekParams seekParams;
-            bool hasSeek = false;
+            eosTransition::GraphState::DeferredNextTrackPreparation prep;
+            bool hasPrep = false;
             if (executedOnce) {
-                hasSeek = eosTracker.popDeferredSeek(key, seekParams);
+                hasPrep = eosTracker.popDeferredNextTrackPreparation(key, prep);
             }
             ReleaseSRWLockExclusive(&eosLock);
 
@@ -977,21 +1003,55 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
                 recordDiag(completed ? "PAUSE_DEFERRED_COMPLETED" : "PAUSE_DEFERRED_TIMED_OUT",
                            key, caller, GetTickCount() - startTick, 0, S_OK);
 
-                if (hasSeek && originalSetPositions) {
-                    IMediaSeeking* targetSeek = nullptr;
-                    if (seekParams.targetSeekingMarshalStream) {
-                        CoGetInterfaceAndReleaseStream(seekParams.targetSeekingMarshalStream, IID_IMediaSeeking, reinterpret_cast<void**>(&targetSeek));
-                        seekParams.targetSeekingMarshalStream = nullptr;
-                    } else if (seeking) {
-                        targetSeek = seeking;
-                        targetSeek->AddRef();
+                if (hasPrep) {
+                    void* targetGraphKey = prep.targetGraph ? prep.targetGraph : key;
+
+                    // STEP 1: Apply deferred seek (position 0)
+                    if (prep.hasSeek && originalSetPositions) {
+                        IMediaSeeking* targetSeek = nullptr;
+                        if (prep.targetSeekingMarshalStream) {
+                            HRESULT hrM = CoGetInterfaceAndReleaseStream(prep.targetSeekingMarshalStream, IID_IMediaSeeking, reinterpret_cast<void**>(&targetSeek));
+                            prep.targetSeekingMarshalStream = nullptr;
+                            if (FAILED(hrM)) {
+                                recordDiag("DEFERRED_SEEK_UNMARSHAL_FAILED", targetGraphKey, caller, 0, 0, hrM);
+                            }
+                        } else if (seeking) {
+                            targetSeek = seeking;
+                            targetSeek->AddRef();
+                        }
+                        if (targetSeek) {
+                            HRESULT hrSeek = originalSetPositions(targetSeek, &prep.seekCurrent, prep.seekCurrentFlags,
+                                                                  &prep.seekStop, prep.seekStopFlags);
+                            recordDiag("DEFERRED_SETPOSITIONS_EXECUTED", targetGraphKey, caller,
+                                       static_cast<DWORD>(prep.seekCurrent / 10000), prep.seekCurrentFlags, hrSeek);
+                            targetSeek->Release();
+                        }
                     }
-                    if (targetSeek) {
-                        originalSetPositions(targetSeek, &seekParams.current, seekParams.currentFlags,
-                                             &seekParams.stop, seekParams.stopFlags);
-                        recordDiag("DEFERRED_SETPOSITIONS_EXECUTED", seekParams.targetGraph ? seekParams.targetGraph : key, caller,
-                                   static_cast<DWORD>(seekParams.current / 10000), seekParams.currentFlags, S_OK);
-                        targetSeek->Release();
+
+                    // STEP 2: Apply deferred playback start (IMediaControl::Run)
+                    if (prep.hasRun && originalRun) {
+                        IMediaControl* targetControl = nullptr;
+                        if (prep.targetControlMarshalStream) {
+                            HRESULT hrM = CoGetInterfaceAndReleaseStream(prep.targetControlMarshalStream, IID_IMediaControl, reinterpret_cast<void**>(&targetControl));
+                            prep.targetControlMarshalStream = nullptr;
+                            if (FAILED(hrM)) {
+                                recordDiag("DEFERRED_RUN_UNMARSHAL_FAILED", targetGraphKey, caller, 0, 0, hrM);
+                            }
+                        }
+                        if (targetControl) {
+                            HRESULT hrRun = originalRun(targetControl);
+                            updateStatus(targetControl, hrRun);
+                            recordDiag("DEFERRED_CONTROL_RUN_EXECUTED", targetGraphKey, caller,
+                                       prep.transitionGeneration, 0, hrRun);
+                            targetControl->Release();
+                        }
+                    }
+
+                    // STEP 3: Apply deferred DirectSound Play (if separate Play was queued)
+                    if (prep.hasDsPlay && originalDsPlay && prep.targetDsBuffer) {
+                        HRESULT hrPlay = originalDsPlay(reinterpret_cast<IDirectSoundBuffer*>(prep.targetDsBuffer), prep.dsReserved1, prep.dsPriority, prep.dsFlags);
+                        recordDiag("DEFERRED_DS_PLAY_EXECUTED", reinterpret_cast<void*>(prep.targetDsBuffer), caller,
+                                   prep.transitionGeneration, prep.dsFlags, hrPlay);
                     }
                 }
             }
@@ -1059,21 +1119,47 @@ static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
     CloseHandle(hThread);
 }
 
-static void onEosControlRun(IMediaControl* self, void* caller) {
-    if (!inEosHook) {
-        void* key = graphKeyFromObject(self);
-        AcquireSRWLockShared(&eosLock);
-        uint32_t gen = eosTracker.getTransitionGeneration(key);
-        bool anyVirtual = eosTracker.hasAnyVirtualPauseActive();
-        void* activePauseKey = nullptr;
-        eosTracker.findActiveVirtualPauseGraph(&activePauseKey);
-        ReleaseSRWLockShared(&eosLock);
+static bool handleEosControlRun(IMediaControl* self, void* caller, HRESULT* outHr) {
+    if (inEosHook) return false;
+    void* key = graphKeyFromObject(self);
+    void* activePauseGraphKey = nullptr;
+    bool isExplicitManual = false;
+#ifdef TESTING_HEADLESS
+    if (g_forceManualRun) isExplicitManual = true;
+#endif
 
-        recordDiag("CONTROL_RUN", key, caller, gen, anyVirtual ? 1 : 0, S_OK);
-        if (anyVirtual && key != activePauseKey) {
-            recordDiag("CONTROL_RUN_NEW_GRAPH_DURING_VIRTUAL_PAUSE", key, caller, gen, 0, S_OK);
+    AcquireSRWLockExclusive(&eosLock);
+    auto classification = eosTracker.classifyRunOperation(key, isExplicitManual,
+                                                          g_lastUserInputTick.load(), &activePauseGraphKey);
+    uint32_t gen = eosTracker.getTransitionGeneration(key);
+
+    if (classification == eosTransition::Tracker::RunClassification::ManualCancelled) {
+        eosTracker.cancelVirtualPause(activePauseGraphKey ? activePauseGraphKey : key, eosTransition::PauseDeferralStatus::CancelledManualPlay);
+        ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("CONTROL_RUN_MANUAL_PLAY", key, caller, gen, 0, S_OK);
+        recordDiag("PAUSE_DEFERRED_CANCELLED", activePauseGraphKey ? activePauseGraphKey : key, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledManualPlay), 0, S_OK);
+        recordDiag("DEFERRED_OPERATIONS_PURGED", activePauseGraphKey ? activePauseGraphKey : key, caller, 0, 0, S_OK);
+        return false;
+    } else if (classification == eosTransition::Tracker::RunClassification::AutomatedDeferred) {
+        IStream* marshalStream = nullptr;
+        if (self) {
+            CoMarshalInterThreadInterfaceInStream(IID_IMediaControl, self, &marshalStream);
         }
+        eosTracker.deferAutomaticRun(activePauseGraphKey ? activePauseGraphKey : key, key, self, marshalStream, caller);
+        ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("DEFERRED_CONTROL_RUN_QUEUED", key, caller, gen, 0, S_OK);
+        if (outHr) *outHr = S_OK;
+        return true;
     }
+
+    ReleaseSRWLockExclusive(&eosLock);
+    recordDiag("CONTROL_RUN", key, caller, gen, (classification == eosTransition::Tracker::RunClassification::OldGraphIgnored) ? 1 : 0, S_OK);
+    return false;
+}
+
+static void onEosControlRun(IMediaControl* self, void* caller) {
+    HRESULT hr = S_OK;
+    handleEosControlRun(self, caller, &hr);
 }
 
 static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
