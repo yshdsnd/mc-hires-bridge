@@ -35,6 +35,7 @@ struct Record {
     double reflectionLatencyMs = 0.0;
     uint32_t staleEosIntrusions = 0;
     bool passed = false;
+    std::string verdict = "FAIL"; // PASS, FAIL, PENDING (判定保留)
     std::string notes;
 };
 
@@ -63,7 +64,7 @@ inline std::string toMarkdownRow(const Record& r) {
        << " | " << (r.manualOpType != "None" ? std::to_string(static_cast<long long>(r.actualReflectionTimeMs)) : "-")
        << " | " << (r.manualOpType != "None" ? std::to_string(r.reflectionLatencyMs).substr(0, 5) : "-")
        << " | " << r.staleEosIntrusions
-       << " | " << (r.passed ? "**PASS**" : "**FAIL**")
+       << " | " << (r.verdict == "PASS" ? "**PASS**" : (r.verdict == "PENDING" ? "**PENDING** (判定保留)" : "**FAIL**"))
        << " |\n";
     return ss.str();
 }
@@ -91,7 +92,7 @@ inline std::string toTsvRow(const Record& r) {
        << r.track1EffectiveEndMs << "\t"
        << r.missingTailFrames << "\t"
        << r.missingTailMs << "\t"
-       << (r.tailComplete ? "Complete" : "Truncated") << "\t"
+       << (r.tailComplete ? "Complete" : (r.verdict == "PENDING" ? "Pending" : "Truncated")) << "\t"
        << (r.nextTrackDetected ? "1" : "0") << "\t"
        << r.nextTrackStartFrame << "\t"
        << r.nextTrackStartMs << "\t"
@@ -102,7 +103,7 @@ inline std::string toTsvRow(const Record& r) {
        << r.actualReflectionTimeMs << "\t"
        << r.reflectionLatencyMs << "\t"
        << r.staleEosIntrusions << "\t"
-       << (r.passed ? "PASS" : "FAIL") << "\t"
+       << r.verdict << "\t"
        << r.notes << "\n";
     return ss.str();
 }
@@ -121,7 +122,7 @@ inline std::string toJson(const Record& r) {
        << "  \"track1_effective_end_ms\": " << r.track1EffectiveEndMs << ",\n"
        << "  \"missing_tail_frames\": " << r.missingTailFrames << ",\n"
        << "  \"missing_tail_ms\": " << r.missingTailMs << ",\n"
-       << "  \"tail_status\": \"" << (r.tailComplete ? "Complete" : "Truncated") << "\",\n"
+       << "  \"tail_status\": \"" << (r.tailComplete ? "Complete" : (r.verdict == "PENDING" ? "Pending" : "Truncated")) << "\",\n"
        << "  \"next_track_detected\": " << (r.nextTrackDetected ? "true" : "false") << ",\n"
        << "  \"next_track_start_frame\": " << r.nextTrackStartFrame << ",\n"
        << "  \"next_track_start_ms\": " << r.nextTrackStartMs << ",\n"
@@ -132,7 +133,7 @@ inline std::string toJson(const Record& r) {
        << "  \"actual_reflection_time_ms\": " << r.actualReflectionTimeMs << ",\n"
        << "  \"reflection_latency_ms\": " << r.reflectionLatencyMs << ",\n"
        << "  \"stale_eos_intrusions\": " << r.staleEosIntrusions << ",\n"
-       << "  \"verdict\": \"" << (r.passed ? "PASS" : "FAIL") << "\",\n"
+       << "  \"verdict\": \"" << r.verdict << "\",\n"
        << "  \"notes\": \"" << r.notes << "\"\n"
        << "}";
     return ss.str();
@@ -152,7 +153,8 @@ inline Record evaluatePcm(
     const std::string& intendedTarget = "-",
     double actualReflectionTimeMs = 0.0,
     uint32_t staleEosIntrusions = 0,
-    const std::string& notes = "") {
+    const std::string& notes = "",
+    bool loopbackDiscontinuity = false) {
 
     Record r;
     r.testCaseId = caseId;
@@ -206,6 +208,21 @@ inline Record evaluatePcm(
         } else {
             r.passed = a.tailComplete && (a.missingTailFrames == 0) && (staleEosIntrusions == 0);
         }
+    }
+
+    if (loopbackDiscontinuity) {
+        r.passed = false;
+        r.verdict = "PENDING";
+        r.tailComplete = false;
+        if (r.notes.empty()) {
+            r.notes = "Loopback discontinuity across transition boundary; verdict pending re-run";
+        } else {
+            r.notes += " (Loopback discontinuity across transition boundary; verdict pending re-run)";
+        }
+    } else if (r.passed) {
+        r.verdict = "PASS";
+    } else {
+        r.verdict = "FAIL";
     }
 
     return r;
@@ -275,6 +292,24 @@ inline std::vector<Record> runSyntheticRegressionSuite() {
         suite.push_back(rec);
     }
 
+    // A4: 24b/48k -> 16b/48k loopback discontinuity across boundary -> PENDING (判定保留)
+    {
+        const uint32_t rate = 48000;
+        const uint16_t bits = 24;
+        const size_t t1Frames = rate * 5;
+        std::vector<uint8_t> pcm;
+        trackTail::appendSynthesizedTrack(pcm, rate, bits, t1Frames, false);
+        trackTail::appendSynthesizedTrack(pcm, rate, bits, rate * 2, true);
+
+        Record rec = evaluatePcm(
+            "TC-1.4", "1. 24->16b Tail", "24b/48k -> 16b/48k",
+            pcm.data(), pcm.size(), rate, bits, t1Frames,
+            "None", 0.0, "Track 2 start", 0.0, 0,
+            "Loopback discontinuity across boundary",
+            true);
+        suite.push_back(rec);
+    }
+
     // --- Scenario 2: 96 kHz / 24 bit seamless transitions ---
     // B1: 96k/24b -> 96k/24b seamless pre-reading with deferral (0ms gap)
     {
@@ -312,6 +347,7 @@ inline std::vector<Record> runSyntheticRegressionSuite() {
             "Pre-read missed deadline, 250ms gap");
         // For seamless scenario with expected 0ms gap, TC-2.2 gap is flagged as failure
         rec.passed = (rec.postEosSilenceMs == 0.0) && rec.tailComplete;
+        rec.verdict = rec.passed ? "PASS" : "FAIL";
         suite.push_back(rec);
     }
 

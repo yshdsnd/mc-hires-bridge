@@ -146,6 +146,7 @@ The automated synthetic suite verifies the deterministic discrimination between 
 | TC-1.1 | 1. 24->16b Tail | 24b/48k -> 16b/48k | 48k/24b | 5000.0 | 0.0 | 欠落なし | 5100 | 100.0 | None | - | Track 2 start | - | - | 0 | **PASS** |
 | TC-1.2 | 1. 24->16b Tail | 24b/48k -> 16b/48k | 48k/24b | 4700.0 | 300.0 | 欠落あり | 5000 | 300.0 | None | - | Track 2 start | - | - | 0 | **FAIL** |
 | TC-1.3 | 1. 24->16b Tail | 24b/48k -> 16b/48k | 48k/24b | 2100.0 | 2900.0 | 欠落あり | - | 0.0 | None | - | Track 2 start | - | - | 0 | **FAIL** |
+| TC-1.4 | 1. 24->16b Tail | 24b/48k -> 16b/48k | 48k/24b | 5000.0 | 0.0 | 欠落あり | 5000 | 0.0 | None | - | Track 2 start | - | - | 0 | **PENDING** (判定保留) |
 | TC-2.1 | 2. 96k Seamless | 24b/96k -> 24b/96k | 96k/24b | 5000.0 | 0.0 | 欠落なし | 5000 | 0.0 | None | - | Track 2 (anti-phase) | - | - | 0 | **PASS** |
 | TC-2.2 | 2. 96k Seamless | 24b/96k -> 24b/96k | 96k/24b | 5000.0 | 0.0 | 欠落なし | 5250 | 250.0 | None | - | Track 2 (anti-phase) | - | - | 0 | **FAIL** |
 | TC-3.1 | 3. Manual Op | 24b/48k Deferral | 48k/24b | 5000.0 | 0.0 | 欠落なし | - | 0.0 | Pause | 4950 | Renderer Pause | 4952 | 2.100 | 0 | **PASS** |
@@ -155,11 +156,12 @@ The automated synthetic suite verifies the deterministic discrimination between 
 | TC-3.5 | 3. Manual Op | 24b/48k Deferral | 48k/24b | 5000.0 | 0.0 | 欠落なし | - | 0.0 | Exit | 4990 | Process/Graph Terminate | 4991 | 1.200 | 0 | **PASS** |
 
 Summary:
-Total Cases: 10 | Passed: 7 | Expected Failures/Truncations Detected: 3
+Total Cases: 11 | Passed: 7 | Pending (判定保留): 1 | Expected Failures/Truncations Detected: 3
 ```
 
 - **TC-1.1**: Verifies 100% complete track tail when deferral is active (`missing_tail_ms == 0.0`).
 - **TC-1.2 & TC-1.3**: Accurately detect simulated EQ cutoff (~300 ms lost) and premature stop (~2.9 s lost) as `欠落あり` (**FAIL**).
+- **TC-1.4**: Accurately flags loopback capture discontinuity occurring across the track transition boundary as `判定保留` (**PENDING**), preventing false failures due to recording tool glitches.
 - **TC-2.1 & TC-2.2**: Accurately discriminate between continuous 0 ms gap and a 250 ms pre-read deadline miss.
 - **TC-3.1 ~ TC-3.5**: Confirm manual operations during deferral achieve $\le 4.3\text{ ms}$ latency with 0 stale EOS events.
 

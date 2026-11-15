@@ -17,6 +17,8 @@ static void printUsage(const char* prog) {
               << "  --target <text>        Intended target / position / track\n"
               << "  --reflect-ms <float>   Actual reflection time in ms\n"
               << "  --stale-eos <int>      Count of stale EOS intrusions (default: 0)\n"
+              << "  --discontinuity        Flag loopback discontinuity across track boundary (marks verdict as PENDING / 判定保留)\n"
+              << "  --pending              Alias for --discontinuity\n"
               << "  --tsv                  Output format in TSV\n"
               << "  --json                 Output format in JSON\n"
               << "  --notes <text>         Optional notes\n"
@@ -65,12 +67,15 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "\nSummary:\n";
             size_t passCount = 0;
+            size_t pendingCount = 0;
             for (const auto& rec : suite) {
-                if (rec.passed) ++passCount;
+                if (rec.verdict == "PASS") ++passCount;
+                else if (rec.verdict == "PENDING") ++pendingCount;
             }
             std::cout << "Total Cases: " << suite.size()
                       << " | Passed: " << passCount
-                      << " | Expected Failures/Truncations Detected: " << (suite.size() - passCount) << "\n";
+                      << " | Pending (判定保留): " << pendingCount
+                      << " | Expected Failures/Truncations Detected: " << (suite.size() - passCount - pendingCount) << "\n";
         }
         return 0;
     }
@@ -94,6 +99,7 @@ int main(int argc, char* argv[]) {
     double reflectTimeMs = 0.0;
     uint32_t staleEos = 0;
     std::string notes = "";
+    bool loopbackDiscontinuity = false;
 
     for (int i = 5; i < argc; ++i) {
         std::string a = argv[i];
@@ -105,6 +111,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--reflect-ms" && i + 1 < argc) reflectTimeMs = std::stod(argv[++i]);
         else if (a == "--stale-eos" && i + 1 < argc) staleEos = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (a == "--notes" && i + 1 < argc) notes = argv[++i];
+        else if (a == "--discontinuity" || a == "--pending") loopbackDiscontinuity = true;
     }
 
     std::ifstream file(pcmPath, std::ios::binary | std::ios::ate);
@@ -126,7 +133,7 @@ int main(int argc, char* argv[]) {
         buffer.data(), buffer.size(),
         rate, bits, expectedFrames,
         manualOp, inputTimeMs, target, reflectTimeMs,
-        staleEos, notes);
+        staleEos, notes, loopbackDiscontinuity);
 
     if (outputTsv) {
         std::cout << trackRegression::tsvHeader();
@@ -138,5 +145,5 @@ int main(int argc, char* argv[]) {
         std::cout << trackRegression::toMarkdownRow(rec);
     }
 
-    return rec.passed ? 0 : 1;
+    return (rec.verdict == "FAIL") ? 1 : 0;
 }
