@@ -168,19 +168,22 @@ $env:MC_BRIDGE_DSEE_MODE = "family2x"
 
 #### Step 2: Audio Capture & Bridge Logging
 1. Launch Music Center under `flac24_dsee_experiment.dll`.
-2. Start audio loopback capture (WASAPI Loopback capture or line recording tap).
+2. Start audio loopback capture using `endpoint_loopback.exe`:
+   ```powershell
+   .\build-Win32\Release\endpoint_loopback.exe "<path_to_capture.raw>" <duration_sec> ["<path_to_capture.discontinuity.tsv>"]
+   ```
+   - Ingests WASAPI loopback audio and writes raw IEEE float32 stereo PCM.
+   - Automatically tracks every packet flagged with `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, recording saved frame offset, millisecond timestamp ($t_{\text{ms}} = \text{saved\_frame} \times 1000.0 / \text{sampleRate}$), device position, QPC counter, and missing frame estimates into stdout and `<path_to_capture.raw>.discontinuity.tsv`.
 3. Play Track 1 and allow Music Center to transition naturally into Track 2 until Track 2 completes.
-4. Stop recording and save the captured PCM/WAV file.
+4. When capture finishes, `endpoint_loopback.exe` reports total discontinuities and exits cleanly.
 
-#### Step 3: Loopback Discontinuity Inspection
-Before evaluating track tails, inspect the capture recording for loopback buffer overflow/underflow or discontinuity:
-- **Discontinuity Check**:
-  - In capture tool log: look for `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` or dropped packets.
-  - In audio waveform: look for sudden DC offsets, missing buffer chunks (>10ms unbuffered drop), or timecode jitter at the boundary.
-- **Handling**:
-  - If a discontinuity is found **across the track transition boundary**, mark the verdict as **`判定保留` (PENDING)**.
-  - Run `track_regression_tool.exe` with `--discontinuity` flag to record `PENDING`.
-  - Repeat the test run with a fresh capture.
+#### Step 3: Loopback Discontinuity & Transition Boundary Inspection (Issue #52)
+Discontinuities (`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`) are inspected against the track transition window on the identical time axis:
+- **Time Axis Alignment**: Discontinuity timestamp ($t_{\text{disc}} = \text{saved\_frame} \times 1000.0 / \text{sampleRate}$) is measured from the start of the saved loopback file ($0.0\text{ms}$), sharing the exact same timeline as `track1MatchedEndMs` and `nextTrackStartMs` in `track_regression_tool.exe`.
+- **Classification Criteria**:
+  1. **Start-of-Recording Discontinuity (収録開始時の不連続)**: Occurs before the transition window ($t_{\text{disc}} < \text{track1MatchedEndMs} - 100\text{ms}$, e.g. during recording startup or early Track 1). Confirmed outside the track transition boundary; does NOT cause verdict to become PENDING. Track tail and next start are evaluated normally (**PASS** if transition is clean).
+  2. **Transition-Boundary Discontinuity (曲間にかかる不連続)**: Occurs across the track transition window ($t_{\text{disc}} \in [\text{track1MatchedEndMs} - 100\text{ms}, \text{nextTrackStartMs} + 100\text{ms}]$). Marks verdict as **`判定保留` (PENDING)** and requires a fresh re-run.
+  3. **Unknown Position / Range (位置不明・曲間にかかるか不明)**: Discontinuity occurred but timestamp/position is unknown (e.g. `--discontinuity` flag without position, or missing timecode). Because impact on track transition cannot be ruled out, safely marks verdict as **`判定保留` (PENDING)**.
 
 #### Step 4: Deterministic Waveform & Log Analysis
 

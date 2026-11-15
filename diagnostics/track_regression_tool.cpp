@@ -12,7 +12,7 @@ static void printUsage(const char* prog) {
               << "  " << prog << " --generate-fixtures <directory>\n"
               << "  " << prog << " --loopback <file> --ref1 <track1.wav> --ref2 <track2.wav> [options]\n"
               << "  " << prog << " <pcm_file> <rate> <bits> <expected_frames> [options]\n\n"
-              << "Reference-Based Comparison Options (Issue #50):\n"
+              << "Reference-Based Comparison Options (Issue #50, #52):\n"
               << "  --loopback <path>      Path to loopback capture (192kHz stereo float32 raw or WAV)\n"
               << "  --ref1 <path>          Path to Track 1 reference WAV\n"
               << "  --ref2 <path>          Path to Track 2 reference WAV\n"
@@ -20,7 +20,12 @@ static void printUsage(const char* prog) {
               << "  --loopback-ch <int>    Raw loopback channels (default: 2)\n"
               << "  --threshold <float>    Normalized cross-correlation threshold (default: 0.65)\n"
               << "  --template-ms <float>  Template length in ms (default: 250.0)\n"
-              << "  --tail-tol-ms <float>  Tail completeness tolerance in ms (default: 50.0)\n\n"
+              << "  --tail-tol-ms <float>  Tail completeness tolerance in ms (default: 50.0)\n"
+              << "  --discontinuity-ms <f> Discontinuity timestamp in ms (\"unknown\" if unpositioned)\n"
+              << "  --discontinuity-frame <int> Discontinuity frame offset in loopback\n"
+              << "  --discontinuity-log <path>  Path to discontinuity TSV log from endpoint_loopback\n"
+              << "  --discontinuity        Flag loopback discontinuity with unknown position -> PENDING\n"
+              << "  --pending              Alias for --discontinuity\n\n"
               << "General Options:\n"
               << "  --scenario <text>      Scenario name (e.g. \"1. 24->16b Tail\")\n"
               << "  --transition <text>    Format transition (e.g. \"24b/48k -> 16b/48k\")\n"
@@ -29,8 +34,6 @@ static void printUsage(const char* prog) {
               << "  --target <text>        Intended target / position / track\n"
               << "  --reflect-ms <float>   Actual reflection time in ms\n"
               << "  --stale-eos <int>      Count of stale EOS intrusions (default: 0)\n"
-              << "  --discontinuity        Flag loopback discontinuity across track boundary (marks verdict as PENDING / 判定保留)\n"
-              << "  --pending              Alias for --discontinuity\n"
               << "  --tsv                  Output format in TSV\n"
               << "  --json                 Output format in JSON\n"
               << "  --notes <text>         Optional notes\n"
@@ -128,6 +131,11 @@ int main(int argc, char* argv[]) {
     uint32_t staleEos = 0;
     std::string notes = "";
     bool loopbackDiscontinuity = false;
+    std::string discontinuityLogPath;
+    double discontinuityMs = -1.0;
+    bool hasDiscontinuityMs = false;
+    uint64_t discontinuityFrame = 0;
+    bool hasDiscontinuityFrame = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -147,10 +155,27 @@ int main(int argc, char* argv[]) {
         else if (a == "--reflect-ms" && i + 1 < argc) reflectTimeMs = std::stod(argv[++i]);
         else if (a == "--stale-eos" && i + 1 < argc) staleEos = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (a == "--notes" && i + 1 < argc) notes = argv[++i];
+        else if (a == "--discontinuity-ms" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "unknown" || val == "none" || val == "-") {
+                discontinuityMs = -1.0;
+                hasDiscontinuityMs = true;
+            } else {
+                discontinuityMs = std::stod(val);
+                hasDiscontinuityMs = true;
+            }
+        }
+        else if (a == "--discontinuity-frame" && i + 1 < argc) {
+            discontinuityFrame = std::stoull(argv[++i]);
+            hasDiscontinuityFrame = true;
+        }
+        else if (a == "--discontinuity-log" && i + 1 < argc) {
+            discontinuityLogPath = argv[++i];
+        }
         else if (a == "--discontinuity" || a == "--pending") loopbackDiscontinuity = true;
     }
 
-    // Reference-Based Comparison Mode (Issue #50)
+    // Reference-Based Comparison Mode (Issue #50, #52)
     if (!loopbackPath.empty()) {
         if (ref1Path.empty() || ref2Path.empty()) {
             std::cerr << "Error: Both --ref1 and --ref2 must be provided with --loopback.\n";
@@ -180,7 +205,37 @@ int main(int argc, char* argv[]) {
         cfg.correlationThreshold = threshold;
         cfg.templateDurationMs = templateMs;
         cfg.tailToleranceMs = tailTolMs;
-        cfg.forcePending = loopbackDiscontinuity;
+
+        if (!discontinuityLogPath.empty()) {
+            trackReference::loadDiscontinuityTsv(discontinuityLogPath, cfg.discontinuities);
+        } else if (!loopbackPath.empty()) {
+            std::string autoLog = loopbackPath + ".discontinuity.tsv";
+            std::ifstream f(autoLog);
+            if (f.good()) {
+                trackReference::loadDiscontinuityTsv(autoLog, cfg.discontinuities);
+            }
+        }
+
+        if (hasDiscontinuityMs) {
+            trackReference::DiscontinuityEvent ev{};
+            if (discontinuityMs >= 0.0) {
+                ev.timeMs = discontinuityMs;
+                ev.isKnownTime = true;
+                ev.framePos = hasDiscontinuityFrame ? discontinuityFrame : static_cast<uint64_t>(discontinuityMs * loopRate / 1000.0);
+            } else {
+                ev.timeMs = -1.0;
+                ev.isKnownTime = false;
+            }
+            cfg.discontinuities.push_back(ev);
+        } else if (hasDiscontinuityFrame) {
+            trackReference::DiscontinuityEvent ev{};
+            ev.framePos = discontinuityFrame;
+            ev.timeMs = static_cast<double>(discontinuityFrame) * 1000.0 / loopRate;
+            ev.isKnownTime = true;
+            cfg.discontinuities.push_back(ev);
+        } else if (loopbackDiscontinuity && cfg.discontinuities.empty()) {
+            cfg.forcePending = true;
+        }
 
         trackReference::MatchResult m = trackReference::evaluateLoopback(loopAudio, ref1Audio, ref2Audio, cfg);
         if (!notes.empty()) {

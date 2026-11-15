@@ -34,6 +34,15 @@ struct AudioBuffer {
     }
 };
 
+struct DiscontinuityEvent {
+    double timeMs = -1.0;          // Millisecond offset in loopback (< 0 if unknown)
+    uint64_t framePos = 0;         // Frame offset in loopback
+    int64_t missingFrames = -1;    // Missing frames (-1 if unknown)
+    uint64_t devicePos = 0;        // Device position
+    uint64_t qpcPos = 0;           // QPC position
+    bool isKnownTime = false;      // True if timestamp/position is known
+};
+
 struct MatchConfig {
     uint32_t analysisRate = kAnalysisRate;
     double templateDurationMs = 250.0;     // Tail template duration (250 ms)
@@ -41,7 +50,9 @@ struct MatchConfig {
     double correlationThreshold = 0.65;    // Minimum Pearson correlation for match
     double minCueSeparationMs = 40.0;      // Minimum separation between distinct cues
     double tailToleranceMs = 50.0;         // Tail completeness threshold (<= 50 ms missing)
-    bool forcePending = false;             // Flag loopback discontinuity -> PENDING
+    bool forcePending = false;             // Flag loopback discontinuity (unpositioned / forced) -> PENDING
+    std::vector<DiscontinuityEvent> discontinuities; // Specific discontinuity events
+    double transitionDiscontinuityMarginMs = 100.0; // Margin around track transition window
 };
 
 struct MatchResult {
@@ -54,10 +65,54 @@ struct MatchResult {
     uint32_t nextTrackCueCount = 0;
     std::vector<double> nextTrackCueTimestampsMs;
     double maxConfidence = 0.0;
-    bool loopbackDiscontinuity = false;
-    std::string verdict = "FAIL"; // PASS, FAIL, PENDING
+    bool loopbackDiscontinuity = false;       // True if any discontinuity occurred
+    bool transitionDiscontinuity = false;     // True if discontinuity occurred across track transition
+    std::string verdict = "FAIL";             // PASS, FAIL, PENDING
     std::string notes;
 };
+
+inline bool loadDiscontinuityTsv(const std::string& path, std::vector<DiscontinuityEvent>& out) {
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        if (line.find("saved_frame") != std::string::npos || line.find("time_ms") != std::string::npos) {
+            continue; // Skip header
+        }
+        std::istringstream ss(line);
+        std::string token;
+        std::vector<std::string> cols;
+        while (std::getline(ss, token, '\t')) {
+            cols.push_back(token);
+        }
+        if (cols.empty()) continue;
+        DiscontinuityEvent ev{};
+        try {
+            ev.framePos = std::stoull(cols[0]);
+            if (cols.size() >= 2) {
+                if (cols[1] != "unknown") {
+                    ev.timeMs = std::stod(cols[1]);
+                    ev.isKnownTime = (ev.timeMs >= 0.0);
+                } else {
+                    ev.timeMs = -1.0;
+                    ev.isKnownTime = false;
+                }
+            }
+            if (cols.size() >= 3 && cols[2] != "unknown") {
+                ev.devicePos = std::stoull(cols[2]);
+            }
+            if (cols.size() >= 4 && cols[3] != "unknown") {
+                ev.qpcPos = std::stoull(cols[3]);
+            }
+            if (cols.size() >= 5 && cols[4] != "unknown") {
+                ev.missingFrames = std::stoll(cols[4]);
+            }
+            out.push_back(ev);
+        } catch (...) {}
+    }
+    return true;
+}
 
 // --- WAV Reader & Helper Functions ---
 
@@ -493,9 +548,10 @@ inline MatchResult evaluateLoopback(
     const MatchConfig& cfg = MatchConfig{}) {
 
     MatchResult res{};
-    res.loopbackDiscontinuity = cfg.forcePending;
+    res.loopbackDiscontinuity = cfg.forcePending || !cfg.discontinuities.empty();
 
     if (cfg.forcePending) {
+        res.transitionDiscontinuity = true;
         res.verdict = "PENDING";
         res.notes = "Loopback discontinuity across transition boundary; verdict pending re-run";
         return res;
@@ -769,7 +825,50 @@ inline MatchResult evaluateLoopback(
         res.nextTrackCueTimestampsMs.push_back(static_cast<double>(cueStart) * 1000.0 / cfg.analysisRate);
     }
 
-    // 4. Formulate Verdict
+    // 4. Evaluate Discontinuities relative to Track Transition Window
+    const double t2StartMs = (!res.nextTrackCueTimestampsMs.empty()) ? res.nextTrackCueTimestampsMs[0] : res.track1MatchedEndMs;
+    const double marginMs = cfg.transitionDiscontinuityMarginMs;
+    const double transStartMs = (res.track1MatchedEndMs > marginMs) ? (res.track1MatchedEndMs - marginMs) : 0.0;
+    const double transEndMs = std::max(res.track1MatchedEndMs, t2StartMs) + marginMs;
+
+    const DiscontinuityEvent* transDiscEvent = nullptr;
+    const DiscontinuityEvent* outsideDiscEvent = nullptr;
+
+    for (const auto& ev : cfg.discontinuities) {
+        if (!ev.isKnownTime) {
+            transDiscEvent = &ev;
+            break;
+        }
+        if (ev.timeMs >= transStartMs && ev.timeMs <= transEndMs) {
+            transDiscEvent = &ev;
+            break;
+        } else {
+            outsideDiscEvent = &ev;
+        }
+    }
+
+    if (transDiscEvent != nullptr) {
+        res.transitionDiscontinuity = true;
+        res.verdict = "PENDING";
+        std::ostringstream ss;
+        if (!transDiscEvent->isKnownTime) {
+            ss << "Loopback discontinuity detected with unknown timestamp/position; verdict pending re-run (判定保留)";
+        } else {
+            ss << "Loopback discontinuity occurred across track transition boundary at "
+               << std::fixed << std::setprecision(1) << transDiscEvent->timeMs << "ms (frame "
+               << transDiscEvent->framePos;
+            if (transDiscEvent->missingFrames >= 0) {
+                ss << ", " << transDiscEvent->missingFrames << " frames missing";
+            } else {
+                ss << ", missing frames unknown";
+            }
+            ss << "); verdict pending re-run (判定保留)";
+        }
+        res.notes = ss.str();
+        return res;
+    }
+
+    // 5. Formulate Verdict
     if (res.nextTrackCueCount == 0) {
         res.verdict = "FAIL";
         res.notes = "Next track start not detected";
@@ -791,6 +890,20 @@ inline MatchResult evaluateLoopback(
     } else {
         res.verdict = "PASS";
         res.notes = "Track 1 tail complete, Next track single start verified";
+    }
+
+    if (outsideDiscEvent != nullptr && res.verdict == "PASS") {
+        std::ostringstream ss;
+        ss << " (loopback discontinuity at "
+           << std::fixed << std::setprecision(1) << outsideDiscEvent->timeMs << "ms [frame "
+           << outsideDiscEvent->framePos;
+        if (outsideDiscEvent->missingFrames >= 0) {
+            ss << ", " << outsideDiscEvent->missingFrames << " frames missing";
+        } else {
+            ss << ", missing frames unknown";
+        }
+        ss << "] confirmed outside track transition)";
+        res.notes += ss.str();
     }
 
     return res;
@@ -981,6 +1094,74 @@ inline void appendSyntheticReferenceTests(std::vector<trackRegression::Record>& 
 
         MatchResult m = evaluateLoopback(loop, ref1, ref2);
         suite.push_back(toRegressionRecord("TC-4.6", "4. Ref-Based Short Capture", "44.1k/16b -> 48k/24b", m));
+    }
+
+    // --- TC-4.7: Discontinuity at Start of Recording (開始時の不連続: Issue #52) ---
+    // Discontinuity occurs at t=120.0ms (recording startup); confirmed outside transition -> PASS
+    {
+        AudioBuffer loop;
+        loop.sampleRate = loopRate;
+        loop.channels = 2;
+        loop.samples.resize(leadSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
+
+        MatchConfig cfg;
+        DiscontinuityEvent ev{};
+        ev.timeMs = 120.0;
+        ev.framePos = static_cast<uint64_t>(120.0 * loopRate / 1000.0);
+        ev.devicePos = 23040;
+        ev.isKnownTime = true;
+        cfg.discontinuities.push_back(ev);
+
+        MatchResult m = evaluateLoopback(loop, ref1, ref2, cfg);
+        suite.push_back(toRegressionRecord("TC-4.7", "4. Ref-Based Disc (Start)", "44.1k/16b -> 48k/24b", m));
+    }
+
+    // --- TC-4.8: Discontinuity Across Track Transition (曲間の不連続: Issue #52) ---
+    // Discontinuity occurs at t=3220.0ms (during transition window 3200ms-3250ms) -> PENDING (判定保留)
+    {
+        AudioBuffer loop;
+        loop.sampleRate = loopRate;
+        loop.channels = 2;
+        loop.samples.resize(leadSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
+
+        MatchConfig cfg;
+        DiscontinuityEvent ev{};
+        ev.timeMs = 3220.0;
+        ev.framePos = static_cast<uint64_t>(3220.0 * loopRate / 1000.0);
+        ev.missingFrames = 384;
+        ev.devicePos = 618240;
+        ev.isKnownTime = true;
+        cfg.discontinuities.push_back(ev);
+
+        MatchResult m = evaluateLoopback(loop, ref1, ref2, cfg);
+        suite.push_back(toRegressionRecord("TC-4.8", "4. Ref-Based Disc (Transition)", "44.1k/16b -> 48k/24b", m));
+    }
+
+    // --- TC-4.9: Discontinuity at Unknown Position (位置不明の不連続: Issue #52) ---
+    // Discontinuity present but timestamp is unknown -> cannot rule out transition -> PENDING (判定保留)
+    {
+        AudioBuffer loop;
+        loop.sampleRate = loopRate;
+        loop.channels = 2;
+        loop.samples.resize(leadSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
+
+        MatchConfig cfg;
+        DiscontinuityEvent ev{};
+        ev.timeMs = -1.0;
+        ev.isKnownTime = false;
+        cfg.discontinuities.push_back(ev);
+
+        MatchResult m = evaluateLoopback(loop, ref1, ref2, cfg);
+        suite.push_back(toRegressionRecord("TC-4.9", "4. Ref-Based Disc (Unknown)", "44.1k/16b -> 48k/24b", m));
     }
 }
 
