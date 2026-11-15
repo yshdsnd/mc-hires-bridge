@@ -1285,10 +1285,18 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
         bool dsStopped = hasDs && SUCCEEDED(hrDsStat) && !(dsStatus & DSBSTATUS_PLAYING);
 
         if (posReached) {
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.onCurrentPositionReported(key, c);
+            eosTracker.onStopPositionReported(key, s);
+            eosTracker.onRendererOutputComplete(key);
+            ReleaseSRWLockExclusive(&eosLock);
             exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
             break;
         }
         if (reachedPcmTarget && dsStopped) {
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.onRendererOutputComplete(key);
+            ReleaseSRWLockExclusive(&eosLock);
             exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
             break;
         }
@@ -1297,6 +1305,9 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
             bool rendererCompleted = posReached || dsStopped ||
                                      (eosDelivered && posValid && (s > c) && ((s - c) <= 500000LL));
             if (rendererCompleted || (eosDelivered && (downB > 0))) {
+                AcquireSRWLockExclusive(&eosLock);
+                eosTracker.onRendererOutputComplete(key);
+                ReleaseSRWLockExclusive(&eosLock);
                 exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
                 recordDiag("DRAIN_VERIFY_DIAGNOSTIC_DEFICIT", key, caller,
                            static_cast<DWORD>(downB), static_cast<DWORD>(targetB),
@@ -1781,6 +1792,24 @@ static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
         void* caller = _ReturnAddress();
         void* key = graphKeyFromObject(self);
         bool isKnownCaller = isOpcDsPlayPauseCaller(caller);
+
+        // Issue #47: Refresh live seeking positions from graph if available
+        IMediaSeeking* seeking = nullptr;
+        if (self && SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&seeking))) && seeking) {
+            LONGLONG curPos = 0, stopPos = 0;
+            if (SUCCEEDED(seeking->GetCurrentPosition(&curPos))) {
+                AcquireSRWLockExclusive(&eosLock);
+                eosTracker.onCurrentPositionReported(key, curPos);
+                ReleaseSRWLockExclusive(&eosLock);
+            }
+            if (SUCCEEDED(seeking->GetStopPosition(&stopPos))) {
+                AcquireSRWLockExclusive(&eosLock);
+                eosTracker.onStopPositionReported(key, stopPos);
+                ReleaseSRWLockExclusive(&eosLock);
+            }
+            seeking->Release();
+        }
+
         bool pendingFormatChange = false;
         bool deferralActive = false;
         AcquireSRWLockShared(&eosLock);
@@ -1860,6 +1889,24 @@ static HRESULT STDMETHODCALLTYPE filterPauseHook(IMediaFilter* self) {
         void* caller = _ReturnAddress();
         void* key = graphKeyFromObject(self);
         bool isKnownCaller = isOpcDsPlayPauseCaller(caller);
+
+        // Issue #47: Refresh live seeking positions from graph if available
+        IMediaSeeking* seeking = nullptr;
+        if (self && SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&seeking))) && seeking) {
+            LONGLONG curPos = 0, stopPos = 0;
+            if (SUCCEEDED(seeking->GetCurrentPosition(&curPos))) {
+                AcquireSRWLockExclusive(&eosLock);
+                eosTracker.onCurrentPositionReported(key, curPos);
+                ReleaseSRWLockExclusive(&eosLock);
+            }
+            if (SUCCEEDED(seeking->GetStopPosition(&stopPos))) {
+                AcquireSRWLockExclusive(&eosLock);
+                eosTracker.onStopPositionReported(key, stopPos);
+                ReleaseSRWLockExclusive(&eosLock);
+            }
+            seeking->Release();
+        }
+
         bool pendingFormatChange = false;
         bool deferralActive = false;
         AcquireSRWLockShared(&eosLock);

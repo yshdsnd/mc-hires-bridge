@@ -2169,8 +2169,78 @@ inline void testDistinctionDiagnosticDeficitVsTailTruncation() {
     CHECK(missingMsB == 200); // 200ms missing tail!
 }
 
+// Test 77: Synchronous Pause Deferral Until Renderer Drain with Active Downstream PCM Progress (Issue #47)
+inline void testSyncPauseDeferralUntilRendererDrainWithActiveDownstreamPcm() {
+    std::printf("[TEST 77] Synchronous pause deferral until renderer drain with active downstream PCM (Issue #47)...\n");
+
+    eosTransition::Tracker tracker;
+    void* graphKey = reinterpret_cast<void*>(0x5000);
+
+    // 1. Initial track setup: 48kHz/24bit FLAC -> DSEE 96kHz/24bit, EQ bypassed, format change pre-read prepared
+    tracker.onGraphActivated(graphKey, true, 96000, 2, 24);
+    tracker.setEqBypassed(graphKey, true);
+    LONGLONG stopPos = 230000000LL; // 23 seconds total duration (in 100ns units)
+    tracker.onStopPositionReported(graphKey, stopPos);
+
+    // Segment size: 23 seconds @ 96kHz / 24-bit / stereo = 23 * 96000 * 6 = 13,248,000 bytes
+    const uint64_t totalBytes = 13248000ULL;
+    tracker.onUpstreamSample(graphKey, totalBytes, true, 0, stopPos);
+    tracker.onUpstreamEndOfStream(graphKey);
+
+    // 2. Downstream PCM delivery progress: all 13,248,000 bytes delivered to renderer's input pin
+    bool eosDeliveredBySample = tracker.onDownstreamSample(graphKey, static_cast<uint32_t>(totalBytes), true, 0, stopPos);
+    CHECK(eosDeliveredBySample == true);
+
+    // Verify 3-way drain state separation:
+    // State 1: Downstream PCM delivery complete
+    CHECK(tracker.hasDownstreamReachedTarget(graphKey) == true);
+    CHECK(tracker.isPcmDeliveryComplete(graphKey) == true);
+
+    // State 2: EOS delivered to downstream renderer
+    CHECK(tracker.isDownstreamEosDelivered(graphKey) == true);
+    CHECK(tracker.getDownstreamEosDeliveredCount(graphKey) == 1);
+
+    // State 3: Renderer audio output has NOT drained yet (DirectSound buffer still playing)
+    CHECK(tracker.isRendererOutputComplete(graphKey) == false);
+    CHECK(tracker.isDrainFullyComplete(graphKey) == false);
+
+    // 3. Approximately 1.55 seconds after EOS delivery (~20.23s into 23s track):
+    // Playback engine issues automatic Pause(). Live current position is at 20.23 seconds.
+    LONGLONG curPosAtPause = 202300000LL; // 20.23 seconds (< 23.00 seconds stop position)
+    tracker.onCurrentPositionReported(graphKey, curPosAtPause);
+
+    // CRITICAL (Issue #47 root cause verification):
+    // In #45, isFormatChangePending returned false because eosDelivered was true AND downstream reached target.
+    // In #47, isFormatChangePending MUST remain true because the renderer buffer is still draining out to speakers!
+    CHECK(tracker.isFormatChangePending(graphKey) == true);
+
+    // 4. Synchronous pause deferral begins
+    tracker.markFormatChangePauseDeferred(graphKey);
+    CHECK(tracker.isPauseDeferralActive(graphKey) == true);
+
+    // Verify EOS duplicate prevention: calling onDownstreamEndOfStream MUST NOT deliver duplicate EOS!
+    bool duplicateEos = tracker.onDownstreamEndOfStream(graphKey);
+    CHECK(duplicateEos == false);
+    CHECK(tracker.getDownstreamEosDeliveredCount(graphKey) == 1);
+
+    // 5. DirectSound buffer plays out remaining ~2.77 seconds to track completion
+    LONGLONG drainedPos = 230000000LL; // Reached stop position
+    tracker.onCurrentPositionReported(graphKey, drainedPos);
+    tracker.onRendererOutputComplete(graphKey);
+
+    // Drain completes cleanly
+    tracker.onFormatChangePauseCompleted(graphKey, eosTransition::PauseDeferralStatus::CompletedDrain);
+
+    // 6. Post-drain verification
+    CHECK(tracker.isRendererOutputComplete(graphKey) == true);
+    CHECK(tracker.isDrainFullyComplete(graphKey) == true);
+    CHECK(tracker.isPauseDeferralActive(graphKey) == false);
+    CHECK(tracker.isFormatChangePending(graphKey) == false);
+    CHECK(tracker.getDownstreamEosDeliveredCount(graphKey) == 1);
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 / #45 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 / #45 / #47 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -2208,7 +2278,8 @@ inline void runAllAsyncTransitionTests() {
     testDirectSoundReceiveSampleCountingWhenEqBypassed();
     testTrackGenerationCorrelationWithDownstreamPcm();
     testDistinctionDiagnosticDeficitVsTailTruncation();
-    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 / #45 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testSyncPauseDeferralUntilRendererDrainWithActiveDownstreamPcm();
+    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 / #45 / #47 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests

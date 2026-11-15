@@ -364,9 +364,13 @@ public:
             s.downstreamLastEndTime = sEnd;
             s.downstreamHasTimestamp = true;
         }
+        if (s.targetBytes > 0 && s.downstreamBytes >= s.targetBytes) {
+            s.transition.pcmDeliveryComplete = true;
+        }
         if (shouldDeliverDownstreamEos(s)) {
             s.eosPending = false;
             s.eosDelivered = true;
+            s.transition.downstreamEosDelivered = true;
             ++s.downstreamEosDeliveredCount;
             return true;
         }
@@ -383,6 +387,7 @@ public:
         }
         s.eosPending = false;
         s.eosDelivered = true;
+        s.transition.downstreamEosDelivered = true;
         ++s.downstreamEosDeliveredCount;
         return true;
     }
@@ -428,14 +433,21 @@ public:
         if (s->pauseDeferralStatus != PauseDeferralStatus::None && s->pauseDeferralStatus != PauseDeferralStatus::Active) {
             return false;
         }
-        if (!s->eosDelivered) return true;
-        if (s->hasStopPosition && s->hasCurrentPosition && s->currentPosition < s->stopPosition) {
-            return true;
+        if (s->transition.rendererOutputComplete) return false;
+
+        // Downstream drain is fully complete if:
+        // 1. All PCM bytes have been delivered to downstream (downstreamReachedTarget)
+        // 2. EOS notification has been delivered to downstream (eosDelivered)
+        // 3. AND actual audio output has completed draining (stop position reached)
+        if (s->hasStopPosition && s->hasCurrentPosition && s->currentPosition >= s->stopPosition &&
+            s->eosDelivered && (s->targetBytes == 0 || s->downstreamBytes >= s->targetBytes)) {
+            return false;
         }
-        if (s->targetBytes > 0 && s->downstreamBytes < s->targetBytes) {
-            return true;
-        }
-        return false;
+
+        // Even if EOS was delivered to downstream and downstream received all PCM samples,
+        // the audio buffer in the renderer still takes 1.5 - 3.0 seconds to drain out to the speakers.
+        // Therefore, synchronous pause must remain pending until the renderer finishes draining (Issue #47).
+        return true;
     }
 
     bool hasDownstreamReachedTarget(void* graphKey) const {
@@ -452,6 +464,11 @@ public:
         s.transition.generation = s.transitionGeneration;
     }
 
+    bool isPauseDeferralActive(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->isPauseDeferralActive() : false;
+    }
+
     void onFormatChangePauseCompleted(void* graphKey, PauseDeferralStatus status = PauseDeferralStatus::CompletedDrain) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
@@ -459,6 +476,7 @@ public:
         s.formatChangePauseCompleted = true;
         s.formatChangePauseDeferred = false;
         s.pauseDeferralStatus = status;
+        s.transition.rendererOutputComplete = true;
         s.eosPending = false;
     }
 
@@ -677,9 +695,33 @@ public:
         s.transition.rendererOutputComplete = true;
     }
 
+    uint32_t getDownstreamEosDeliveredCount(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->downstreamEosDeliveredCount : 0;
+    }
+
+    bool isPcmDeliveryComplete(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s && (s->transition.pcmDeliveryComplete || downstreamReachedTarget(*s));
+    }
+
+    bool isDownstreamEosDelivered(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s && (s->transition.downstreamEosDelivered || s->eosDelivered);
+    }
+
+    bool isRendererOutputComplete(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s && s->transition.rendererOutputComplete;
+    }
+
     bool isDrainFullyComplete(void* graphKey) const {
         const auto* s = findGraph(graphKey);
-        return s && s->transition.pcmDeliveryComplete && s->transition.rendererOutputComplete;
+        if (!s) return false;
+        bool pcmDone = s->transition.pcmDeliveryComplete || downstreamReachedTarget(*s);
+        bool eosDone = s->transition.downstreamEosDelivered || s->eosDelivered;
+        bool renderDone = s->transition.rendererOutputComplete;
+        return pcmDone && eosDone && renderDone;
     }
 
     void deferAutomaticSeek(void* activeGraphKey, void* targetGraphKey, void* targetSeeking,

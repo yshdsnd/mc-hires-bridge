@@ -332,7 +332,85 @@ To maintain DSEE HX's native integer upsampling output (88.2kHz/24bit) all the w
   - `13A`: 44.1kHz FLAC with DSEE HX ON and intermediate downsampler -> `applyEqBypass` successfully connects `dseeOut -> dsIn` directly at 88.2kHz/24bit; reports Peer Code 2 (`isDirectDsee = true`); second invocation reports `AlreadyBypassed`.
   - `13B`: 48kHz FLAC with DSEE HX ON -> `applyEqBypass` successfully connects `seamOut -> dsIn` at 96kHz/24bit; reports Peer Code 1 (`isDirectSeamless = true`).
   - `13C`: Native 192kHz FLAC with DSEE OFF -> `applyEqBypass` preserves bit-perfect 192kHz/24bit output via `seamOut -> dsIn`.
-- **Regression**: All 13 DSEE unified test suites and all 76 EOS transition test cases pass with 0 failures.
+- **Regression**: All 13 DSEE unified test suites and all 77 EOS transition test cases pass with 0 failures.
+
+---
+
+## 12. Issue #47: Retaining Synchronous Pause Deferral until Audio Renderer Drain Completion
+
+### 12.1 Problem Analysis: Premature Pause Deferral Bypass after Downstream PCM Tracking
+
+In commit `5b35497` (#45), live playback of `48kHz/24bit FLAC -> 48kHz/16bit FLAC` in synchronous mode (both DSEE 96kHz/24bit, EQ bypassed) successfully recorded downstream PCM progress to DirectSound audio renderer.
+However:
+1. `SeamlessFilter` delivered EOS to the renderer input pin.
+2. Approximately 1.55 seconds later, Music Center's playback engine issued an automatic `Pause()` (`IMediaControl::Pause`).
+3. At this moment, synchronous pause deferral (`deferFormatChangePause`) **did not start** (`pendingFormatChange` evaluated to `0`), and the next track started ~20.23 seconds after track 1 start.
+4. Compared against reference waveform, ~2.9 seconds of the 23-second preceding track tail was truncated.
+5. In #43, the same track sequence preserved the full track tail because `downstreamBytes` was stuck at 0, which inadvertently kept the deferral condition active.
+
+Investigation of `isFormatChangePending(graphKey)` revealed the root cause:
+- Prior logic checked:
+  ```cpp
+  if (!s->eosDelivered) return true;
+  if (s->hasStopPosition && s->hasCurrentPosition && s->currentPosition < s->stopPosition) return true;
+  if (s->targetBytes > 0 && s->downstreamBytes < s->targetBytes) return true;
+  return false;
+  ```
+- Once #45 fixed downstream tracking, `downstreamBytes >= targetBytes` became true.
+- Because `eosDelivered` was already true (sent 1.55s earlier) and live `currentPosition` was not queried immediately before Pause, `isFormatChangePending` fell through to `return false;`.
+- Consequently, `controlPauseHook` treated format change as already done and executed `originalControlPause`, abruptly pausing the DirectSound renderer while ~2.9 seconds of audio was still actively playing out of the buffer.
+
+### 12.2 Three-Stage Drain State Separation
+
+To prevent premature graph pause and ensure complete acoustic output, three distinct drain states are strictly separated in `eosTransition::Tracker`:
+
+1. **Downstream PCM Delivery Complete (`pcmDeliveryComplete` / `downstreamReachedTarget`)**:
+   - All PCM bytes of the segment have been pushed to the downstream audio renderer's input pin (`downstreamBytes >= targetBytes`).
+2. **EOS Delivery Complete (`downstreamEosDelivered` / `eosDelivered`)**:
+   - `IPin::EndOfStream()` notification has been delivered to downstream renderer input pin.
+   - Guarded by single-delivery logic (`downstreamEosDeliveredCount == 1`) to prevent duplicate EOS calls.
+3. **Renderer Audio Output Drain Complete (`rendererOutputComplete`)**:
+   - The DirectSound audio renderer circular buffer has finished playing out all buffered samples to the hardware speakers (`!(dsStatus & DSBSTATUS_PLAYING)` or reference clock `c >= s && s > 0`).
+
+Full drain completion (`isDrainFullyComplete`) requires all three stages to be satisfied:
+```cpp
+bool isDrainFullyComplete = pcmDeliveryComplete && downstreamEosDelivered && rendererOutputComplete;
+```
+
+### 12.3 Synchronous Pause Deferral Logic Update
+
+1. **`isFormatChangePending(graphKey)` Branching**:
+   - `isFormatChangePending` continues returning `true` even after `downstreamBytes >= targetBytes` and `eosDelivered == true`, as long as `rendererOutputComplete` is false.
+   - It only returns `false` when:
+     - `rendererOutputComplete` is true, or
+     - Live playback position has reached/passed stop position (`currentPosition >= stopPosition && eosDelivered && downstreamBytes >= targetBytes`), or
+     - Format change deferral has already completed (`pauseDeferralStatus == CompletedDrain`).
+2. **Live Seeking Position Refresh**:
+   - In `controlPauseHook` and `filterPauseHook`, before evaluating `isFormatChangePending`, `self->QueryInterface(IID_PPV_ARGS(&seeking))` is invoked to refresh `currentPosition` and `stopPosition` with live DirectShow stream time.
+3. **`deferFormatChangePause` Completion Marking**:
+   - When DirectSound buffer finishes playing (`dsStopped`) or stream position reaches stop position (`posReached`), `eosTracker.onRendererOutputComplete(key)` is recorded.
+   - Subsequent `filterPause` or `controlPause` checks see `rendererOutputComplete == true` and `pauseDeferralStatus == CompletedDrain`, avoiding redundant secondary deferrals.
+4. **Duplicate EOS Prevention**:
+   - `deferFormatChangePause` checks `!g->eosDelivered` before calling `downPin->EndOfStream()`. Since EOS was already delivered when final PCM arrived, duplicate delivery is suppressed.
+
+### 12.4 Test Verification
+
+- **Regression Test 77 in `async_transition_tests.h`**:
+  - Recreates the exact measured sequence:
+    1. 48kHz/24bit FLAC -> DSEE 96kHz/24bit, EQ bypassed, format change pre-read prepared.
+    2. Upstream finishes, downstream receives all 13,248,000 bytes, EOS delivered to renderer (`isDownstreamEosDelivered == true`, count = 1).
+    3. Live playback position at 20.23 seconds (< 23.00 seconds stop position), audio remaining in DirectSound buffer (`rendererOutputComplete == false`).
+    4. Verified `isFormatChangePending == true` at 20.23 seconds.
+    5. Automatic `Pause` arrives: synchronous pause deferral begins (`isPauseDeferralActive == true`).
+    6. Verified `onDownstreamEndOfStream` rejects duplicate delivery (count remains 1).
+    7. DirectSound buffer plays out remaining ~2.77 seconds to completion (`c >= s`).
+    8. Deferral completes with `CompletedDrain`.
+    9. Verified `rendererOutputComplete == true`, `isDrainFullyComplete == true`, `isFormatChangePending == false`.
+- **Suite Results**:
+  - `eos_transition_tests.exe`: 77/77 tests passed (0 failures).
+  - `dsee_unified_tests.exe`: 13/13 test suites passed (0 failures).
+  - `flac24_dsee_experiment.dll`: Built cleanly.
+
 
 
 
