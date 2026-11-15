@@ -1,4 +1,4 @@
-# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37 / #38 / #39）
+# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40）
 
 ## 1. 概要とアーキテクチャ
 
@@ -177,8 +177,11 @@ Issue #30、#33、#34、#35、#36、#37、#38、#39 の競合テストハーネ�
 | **TEST 65** | Heartbeat generation, upstream/downstream/target byte counters, and HRESULT (Issue #39) | ハートビートにおいて世代番号、上流バイト数、下流バイト数、目標バイト数、および `GetCurrentPosition` の HRESULT が正確に記録されることを検証 | **PASS** |
 | **TEST 66** | DirectSound buffer hardware cursor and status tracking across Virtual Pause (Issue #39) | 仮想 Pause 保留中に旧 DirectSound バッファが正常に関連付けられ、ハードウェア再生カーソルおよび `DSBSTATUS_PLAYING` 状態が監視可能であることを検証 | **PASS** |
 | **TEST 67** | Independent isolation of PCM delivery deficit vs renderer position (Issue #39) | 下流 PCM 配送不足（差分 228,960 bytes）と DirectShow 再生位置 0ms（クロック停止・API 成否）を独立して判定・切り分けられることを検証 | **PASS** |
+| **TEST 68** | Old buffer identification, reference lifetime preservation, and continuous cursor reporting (Issue #40) | レンダラー `IAMDirectSound` クエリによる旧バッファ特定、`AddRef`/`Release` による監視スレッド参照寿命保護、ハードウェアカーソル継続取得を検証 | **PASS** |
+| **TEST 69** | DirectSound SetCurrentPosition, SetVolume, and filter Stop suppression (Issue #40) | 仮想 Pause 中の自動 `SetCurrentPosition(0)`、`SetVolume(-10000)`、フィルター停止・一時停止命令の抑止と、手動停止時の即時キャンセル優先を検証 | **PASS** |
+| **TEST 70** | End-of-stream delivery on upstream completion flushes delay line (Issue #40) | 上流完了時の EOS 送出による DSEE/Seamless 中間遅延キュー（228,960 bytes）の EQ への排出と下流目標到達・自然完了ドレインを検証 | **PASS** |
 
-> 合計 67 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 非同期テスト 40〜67）すべてがエラーなしで通過しました。
+> 合計 70 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 非同期テスト 40〜70）すべてがエラーなしで通過しました。
 
 ---
 
@@ -269,3 +272,22 @@ Codex が Music Center for PC 2.7.4 x86 実機環境で動作検証を行うた�
        - `dsStatus & DSBSTATUS_PLAYING` が 1（再生中）か 0（停止）かを確認。
        - `dsPlayCursor` が約 20.2 秒相当（約 5,817,600 bytes 付近）で進捗しているか停止しているかを確認。
        - **判定**: `dsPlayCursor` が実時間通りに進捗していれば、DirectShow グラフ側の位置通知が 0ms であっても音声ハードウェア自体は正常に鳴動していることが特定できる。
+
+
+#### シナリオ H: 旧グラフ PCM 供給とレンダラー末尾維持の実機検証（Issue #40 実機検証）
+- **対象**: 48 kHz/24 bit FLAC から 48 kHz/16 bit FLAC への自動曲送り（実機共有出力、Music Center for PC 2.7.4 x86）。
+- **目的**: 仮想 Pause 突入後の旧バッファ特定・参照保護、消音/停止/位置リセット抑止、および上流完了時 EOS 送出による中間遅延キュー（228,960 bytes）のフラッシュにより、先行曲末尾（約 23 秒）まで音声が維持されることを検証する。
+- **確認事項と判定基準**:
+  1. **旧バッファ特定と参照寿命保護**:
+     - `DRAIN_DSOUND_ATTACHED`: Virtual Pause 突入時に `CLSID_DSoundRender`（`IAMDirectSound::GetSecondaryBufferInterface`）から旧バッファが捕捉・登録されたか。
+     - `DRAIN_HEARTBEAT_DSOUND`: 500ms ごとに旧バッファの再生カーソル（`dsPlayCursor`）と再生中ステータス（`DSBSTATUS_PLAYING`）が継続出力されるか。
+  2. **エンジン側の消音・停止・位置リセット抑止**:
+     - `DS_SETCURRENTPOS_SUPPRESSED_FOR_VIRTUAL_PAUSE`: `IDirectSoundBuffer::SetCurrentPosition(0)` 等の位置リセットが抑止され、ハードウェア再生カーソルがジャンプ・リセットされないこと。
+     - `DS_SETVOLUME_SUPPRESSED_FOR_VIRTUAL_PAUSE`: `IDirectSoundBuffer::SetVolume(-10000)` 等の消音命令が抑止され、ボリュームが保持されること。
+     - `CONTROL_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE` / `FILTER_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE` / `FILTER_PAUSE_SUPPRESSED_FOR_VIRTUAL_PAUSE`: 旧グラフおよびフィルターに対する自動停止・一時停止命令が抑止され、ストリーミングスレッドが末尾まで維持されること。
+  3. **中間遅延キュー（228,960 bytes）の供給維持**:
+     - `EOS_DELIVERED_ASYNC_DRAIN`: 上流完了（`upstreamBytes == 6,624,000`）に伴い EOS が EQ 入力ピンに送出されること。
+     - `DRAIN_HEARTBEAT_PCM`: `downstreamBytes` が 6,395,040 bytes から 6,624,000 bytes まで完全に進行すること。
+  4. **実機ループバック波形の末尾確認**:
+     - 約 20.1 秒付近での波形途絶・不連続フラグが解消し、先行曲が末尾（約 23 秒）まで正常に鳴動すること。
+     - ドレイン完了時に `PAUSE_DEFERRED_COMPLETED` が出力され、次曲へ自然に引き継がれること（Issue #38 の単一起動が維持され、重複波形が発生しないこと）。

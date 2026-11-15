@@ -164,6 +164,9 @@ static void syncGraphActivationFromPin(IPin* pin, void* key) {
 }
 
 #include <dsound.h>
+#include <amaudio.h>
+
+static const GUID kIID_IAMDirectSound = { 0x546f4260, 0xd82c, 0x11cf, { 0x8d, 0x23, 0x00, 0xaa, 0x00, 0x5c, 0xf4, 0x66 } };
 
 using PinOneFn = HRESULT(STDMETHODCALLTYPE*)(IPin*);
 using PinSegmentFn = HRESULT(STDMETHODCALLTYPE*)(IPin*, REFERENCE_TIME, REFERENCE_TIME, double);
@@ -176,6 +179,8 @@ using GetPositionFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*);
 using SetPositionsFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*, DWORD, LONGLONG*, DWORD);
 using DsPlayFn = HRESULT(WINAPI*)(IDirectSoundBuffer*, DWORD, DWORD, DWORD);
 using DsStopFn = HRESULT(WINAPI*)(IDirectSoundBuffer*);
+using DsSetCurrentPositionFn = HRESULT(WINAPI*)(IDirectSoundBuffer*, DWORD);
+using DsSetVolumeFn = HRESULT(WINAPI*)(IDirectSoundBuffer*, LONG);
 
 static MemReceiveFn originalSeamlessReceive = nullptr;
 static PinOneFn originalSeamlessEos = nullptr;
@@ -198,6 +203,8 @@ static GetPositionFn originalGetCurrentPosition = nullptr;
 static SetPositionsFn originalSetPositions = nullptr;
 static DsPlayFn originalDsPlay = nullptr;
 static DsStopFn originalDsStop = nullptr;
+static DsSetCurrentPositionFn originalDsSetCurrentPosition = nullptr;
+static DsSetVolumeFn originalDsSetVolume = nullptr;
 
 using EnterCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
 using LeaveCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
@@ -459,6 +466,26 @@ static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
         bool isAssoc = eosTracker.isTransitionBuffer(self, &activeGraphKey);
         ReleaseSRWLockShared(&eosLock);
 
+        if (!virtualActive && self && !g_lastActiveSoundBuffer) {
+            g_lastActiveSoundBuffer = self;
+        }
+
+        if (virtualActive && self && !isAssoc) {
+            AcquireSRWLockExclusive(&eosLock);
+            void* activePauseKey = nullptr;
+            if (eosTracker.findActiveVirtualPauseGraph(&activePauseKey)) {
+                auto* g = eosTracker.findGraph(activePauseKey);
+                if (g && !g->transition.primaryDsBuffer) {
+                    self->AddRef();
+                    eosTracker.registerActiveSoundBuffer(activePauseKey, self);
+                    isAssoc = true;
+                    activeGraphKey = activePauseKey;
+                    recordDiag("DRAIN_DSOUND_ATTACHED_IN_STOP", activePauseKey, caller, reinterpret_cast<uint64_t>(self), 0, S_OK);
+                }
+            }
+            ReleaseSRWLockExclusive(&eosLock);
+        }
+
         if (virtualActive) {
             bool isManualStop = false;
 #ifdef TESTING_HEADLESS
@@ -490,6 +517,59 @@ static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
         record("DS_STOP", play, write, S_OK);
     }
     return originalDsStop(self);
+}
+
+static HRESULT WINAPI dsSetCurrentPositionHook(IDirectSoundBuffer* self, DWORD dwNewPosition) {
+    if (!inEosHook && self) {
+        void* caller = _ReturnAddress();
+        AcquireSRWLockShared(&eosLock);
+        bool virtualActive = eosTracker.hasAnyVirtualPauseActive();
+        void* activeGraphKey = nullptr;
+        bool isAssoc = eosTracker.isTransitionBuffer(self, &activeGraphKey);
+        ReleaseSRWLockShared(&eosLock);
+
+        if (virtualActive) {
+            bool isManualSeek = false;
+#ifdef TESTING_HEADLESS
+            if (g_forceManualSeek) isManualSeek = true;
+#endif
+            DWORD lastInput = g_lastUserInputTick.load();
+            if (lastInput != 0 && (GetTickCount() - lastInput < 400)) {
+                isManualSeek = true;
+            }
+
+            if (!isManualSeek && (isAssoc || !activeGraphKey)) {
+                recordDiag("DS_SETCURRENTPOS_SUPPRESSED_FOR_VIRTUAL_PAUSE", activeGraphKey ? activeGraphKey : reinterpret_cast<void*>(self), caller, dwNewPosition, 0, S_OK);
+                return DS_OK;
+            }
+        }
+    }
+    return originalDsSetCurrentPosition ? originalDsSetCurrentPosition(self, dwNewPosition) : DSERR_GENERIC;
+}
+
+static HRESULT WINAPI dsSetVolumeHook(IDirectSoundBuffer* self, LONG lVolume) {
+    if (!inEosHook && self) {
+        void* caller = _ReturnAddress();
+        AcquireSRWLockShared(&eosLock);
+        bool virtualActive = eosTracker.hasAnyVirtualPauseActive();
+        void* activeGraphKey = nullptr;
+        bool isAssoc = eosTracker.isTransitionBuffer(self, &activeGraphKey);
+        ReleaseSRWLockShared(&eosLock);
+
+        if (virtualActive) {
+            bool isManual = false;
+            DWORD lastInput = g_lastUserInputTick.load();
+            if (lastInput != 0 && (GetTickCount() - lastInput < 400)) {
+                isManual = true;
+            }
+
+            if (!isManual && (isAssoc || !activeGraphKey)) {
+                recordDiag("DS_SETVOLUME_SUPPRESSED_FOR_VIRTUAL_PAUSE", activeGraphKey ? activeGraphKey : reinterpret_cast<void*>(self), caller, static_cast<uint64_t>(lVolume), 0, S_OK);
+                return DS_OK;
+            }
+        }
+    }
+    return originalDsSetVolume ? originalDsSetVolume(self, lVolume) : DSERR_GENERIC;
 }
 
 static HRESULT WINAPI dsPlayHook(IDirectSoundBuffer* self, DWORD dwReserved1, DWORD dwPriority, DWORD dwFlags) {
@@ -548,6 +628,29 @@ static HRESULT WINAPI dsPlayHook(IDirectSoundBuffer* self, DWORD dwReserved1, DW
 
 static HRESULT STDMETHODCALLTYPE originalEqEndOfStream(IPin* pin) {
     return originalEqEos ? originalEqEos(pin) : S_OK;
+}
+
+static IDirectSoundBuffer* findDirectSoundBufferFromGraph(IFilterGraph* graph) {
+    if (!graph) return nullptr;
+    IDirectSoundBuffer* foundBuffer = nullptr;
+    IEnumFilters* filters = nullptr;
+    if (SUCCEEDED(graph->EnumFilters(&filters))) {
+        IBaseFilter* f = nullptr;
+        while (filters->Next(1, &f, nullptr) == S_OK) {
+            IAMDirectSound* amDs = nullptr;
+            if (SUCCEEDED(f->QueryInterface(kIID_IAMDirectSound, reinterpret_cast<void**>(&amDs))) && amDs) {
+                LPDIRECTSOUNDBUFFER dsb = nullptr;
+                if (SUCCEEDED(amDs->GetSecondaryBufferInterface(&dsb)) && dsb) {
+                    foundBuffer = dsb;
+                }
+                amDs->Release();
+            }
+            f->Release();
+            if (foundBuffer) break;
+        }
+        filters->Release();
+    }
+    return foundBuffer;
 }
 
 static IPin* findEqInputPinFromGraph(IFilterGraph* graph) {
@@ -962,6 +1065,7 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
         // Two-stage drain verification:
         // Stage 1: Downstream PCM delivery
         bool pcmDelivered = false;
+        bool curEosDelivered = false;
         uint64_t targetB = 0, downB = 0, upB = 0;
         uint32_t gen = 0;
         void* primaryBuf = nullptr;
@@ -980,10 +1084,28 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
             gen = curG->transitionGeneration;
             primaryBuf = curG->transition.primaryDsBuffer;
             trackerRendererComplete = curG->transition.rendererOutputComplete;
+            curEosDelivered = curG->eosDelivered;
         }
         ReleaseSRWLockExclusive(&eosLock);
 
         if (!primaryBuf) primaryBuf = initialDsBuf;
+
+        // If upstream completed reading (upB == targetB && targetB > 0) but downstream hasn't reached target yet,
+        // intermediate DSP filters (like DSEE) may be holding the remaining tail samples in their latency delay-line.
+        // Deliver EOS to EQ input pin to flush these samples!
+        if (upB == targetB && targetB > 0 && downB < targetB && !curEosDelivered) {
+            IFilterGraph* fg = nullptr;
+            if (seeking && SUCCEEDED(seeking->QueryInterface(IID_PPV_ARGS(&fg))) && fg) {
+                IPin* eqPin = findEqInputPinFromGraph(fg);
+                if (eqPin && originalEqEos) {
+                    EosHookScope scope;
+                    originalEqEndOfStream(eqPin);
+                    recordDiag("EOS_DELIVERED_ASYNC_DRAIN", key, caller, downB, targetB, S_OK);
+                    eqPin->Release();
+                }
+                fg->Release();
+            }
+        }
 
         // Stage 2: Audio renderer final output drain
         LONGLONG c = 0, s = 0;
@@ -1005,6 +1127,17 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
         DWORD dsPlayCursor = 0, dsWriteCursor = 0, dsStatus = 0;
         HRESULT hrDsPos = E_POINTER, hrDsStat = E_POINTER;
         bool hasDs = safeQueryDirectSoundBuffer(activeDsBuf, &dsPlayCursor, &dsWriteCursor, &dsStatus, &hrDsPos, &hrDsStat);
+
+        // Fallback: If DirectSound buffer stopped playing after PCM was delivered, or cursor drained
+        if (hasDs && pcmDelivered && !(dsStatus & DSBSTATUS_PLAYING)) {
+            rendererFinished = true;
+        }
+
+        if (rendererFinished && !trackerRendererComplete) {
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.onRendererOutputComplete(key);
+            ReleaseSRWLockExclusive(&eosLock);
+        }
 
         // Periodic progress heartbeat every 500ms
         if (g_diagEnabled && (GetTickCount() - lastHeartbeatTick >= 500)) {
@@ -1133,6 +1266,10 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
     }
 
     if (seeking) seeking->Release();
+    if (p->primaryDsBuffer) {
+        reinterpret_cast<IDirectSoundBuffer*>(p->primaryDsBuffer)->Release();
+        p->primaryDsBuffer = nullptr;
+    }
     if (SUCCEEDED(hrCo)) CoUninitialize();
     delete p;
     return 0;
@@ -1143,9 +1280,28 @@ static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
     auto* p = new AsyncDrainParams();
     p->key = key;
     p->caller = caller;
-    p->primaryDsBuffer = g_lastActiveSoundBuffer;
     p->startTick = GetTickCount();
     p->maxWaitMs = 4500;
+
+    IDirectSoundBuffer* dsBuf = nullptr;
+    IFilterGraph* fg = nullptr;
+    if (self && SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&fg))) && fg) {
+        dsBuf = findDirectSoundBufferFromGraph(fg);
+        fg->Release();
+    }
+    if (!dsBuf && g_lastActiveSoundBuffer) {
+        dsBuf = reinterpret_cast<IDirectSoundBuffer*>(g_lastActiveSoundBuffer);
+        dsBuf->AddRef();
+    }
+    if (dsBuf) {
+        p->primaryDsBuffer = dsBuf;
+        AcquireSRWLockExclusive(&eosLock);
+        eosTracker.registerActiveSoundBuffer(key, dsBuf);
+        ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("DRAIN_DSOUND_ATTACHED", key, caller, reinterpret_cast<uint64_t>(dsBuf), 0, S_OK);
+    } else {
+        p->primaryDsBuffer = nullptr;
+    }
 
     IMediaFilter* mf = nullptr;
     if (self && SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&mf))) && mf) {
@@ -1181,6 +1337,10 @@ static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
         recordDiag("PAUSE_DEFERRED_ABORT_BY_THREAD_FAILURE", key, caller, 0, 0, S_OK);
         if (p->marshalStream) p->marshalStream->Release();
         if (p->rawSeeking) p->rawSeeking->Release();
+        if (p->primaryDsBuffer) {
+            reinterpret_cast<IDirectSoundBuffer*>(p->primaryDsBuffer)->Release();
+            p->primaryDsBuffer = nullptr;
+        }
         delete p;
         return;
     }
@@ -1196,6 +1356,10 @@ static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
         recordDiag("PAUSE_DEFERRED_ABORT_BY_THREAD_FAILURE", key, caller, 0, 0, S_OK);
         if (p->marshalStream) p->marshalStream->Release();
         if (p->rawSeeking) p->rawSeeking->Release();
+        if (p->primaryDsBuffer) {
+            reinterpret_cast<IDirectSoundBuffer*>(p->primaryDsBuffer)->Release();
+            p->primaryDsBuffer = nullptr;
+        }
         delete p;
         return;
     }
@@ -1377,6 +1541,24 @@ static HRESULT STDMETHODCALLTYPE filterPauseHook(IMediaFilter* self) {
                 return S_OK;
             }
         }
+
+        // Suppress automatic filter pause on old graph while Virtual Pause is active
+        bool isVirtualActive = false;
+        AcquireSRWLockShared(&eosLock);
+        const auto* gV = eosTracker.findGraph(key);
+        isVirtualActive = gV && gV->isVirtualPauseActive();
+        ReleaseSRWLockShared(&eosLock);
+        if (isVirtualActive) {
+            bool isManual = false;
+            DWORD lastInput = g_lastUserInputTick.load();
+            if (lastInput != 0 && (GetTickCount() - lastInput < 400)) {
+                isManual = true;
+            }
+            if (!isManual) {
+                recordDiag("FILTER_PAUSE_SUPPRESSED_FOR_VIRTUAL_PAUSE", key, caller, 0, 0, S_OK);
+                return S_OK;
+            }
+        }
     }
     auto hr = originalFilterPause(self);
     if (!inEosHook) {
@@ -1397,7 +1579,19 @@ static HRESULT STDMETHODCALLTYPE controlStopHook(IMediaControl* self) {
         AcquireSRWLockExclusive(&eosLock);
         auto* g = eosTracker.findGraph(key);
         if (g && g->isVirtualPauseActive()) {
-            if (!isKnownCaller) {
+            bool isManualStop = false;
+#ifdef TESTING_HEADLESS
+            if (g_forceManualStop) isManualStop = true;
+#endif
+            DWORD lastInput = g_lastUserInputTick.load();
+            if (lastInput != 0 && (GetTickCount() - lastInput < 400)) {
+                isManualStop = true;
+            }
+            if (!isManualStop) {
+                ReleaseSRWLockExclusive(&eosLock);
+                recordDiag("CONTROL_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE", key, caller, 0, 0, S_OK);
+                return S_OK;
+            } else {
                 eosTracker.cancelVirtualPause(key, eosTransition::PauseDeferralStatus::CancelledStop);
                 recordDiag("PAUSE_DEFERRED_CANCELLED", key, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledStop), 0, S_OK);
                 recordDiag("DEFERRED_SETPOSITIONS_PURGED", key, caller, 0, 0, S_OK);
@@ -1511,7 +1705,25 @@ static HRESULT STDMETHODCALLTYPE filterStopHook(IMediaFilter* self) {
         recordDiag("BOUNDARY_FILTER_STOP_ENTER", key, caller, 0, 0, S_OK);
         AcquireSRWLockExclusive(&eosLock);
         auto* g = eosTracker.findGraph(key);
-        if (g && g->isPauseDeferralActive()) {
+        if (g && g->isVirtualPauseActive()) {
+            bool isManualStop = false;
+#ifdef TESTING_HEADLESS
+            if (g_forceManualStop) isManualStop = true;
+#endif
+            DWORD lastInput = g_lastUserInputTick.load();
+            if (lastInput != 0 && (GetTickCount() - lastInput < 400)) {
+                isManualStop = true;
+            }
+            if (!isManualStop) {
+                ReleaseSRWLockExclusive(&eosLock);
+                recordDiag("FILTER_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE", key, caller, 0, 0, S_OK);
+                return S_OK;
+            } else {
+                eosTracker.cancelVirtualPause(key, eosTransition::PauseDeferralStatus::CancelledStop);
+                recordDiag("PAUSE_DEFERRED_CANCELLED", key, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledStop), 0, S_OK);
+                recordDiag("DEFERRED_SETPOSITIONS_PURGED", key, caller, 0, 0, S_OK);
+            }
+        } else if (g && g->isPauseDeferralActive()) {
             eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledStop);
             recordDiag("PAUSE_DEFERRED_ABORT_BY_FILTER_STOP", key, caller, 0, 0, S_OK);
         }
@@ -1728,6 +1940,8 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
         if (SUCCEEDED(ds8->CreateSoundBuffer(&desc, &buf, nullptr)) && buf) {
             auto bufV = *reinterpret_cast<void***>(buf);
             MH_CreateHook(bufV[12], reinterpret_cast<void*>(dsPlayHook), reinterpret_cast<void**>(&originalDsPlay));
+            MH_CreateHook(bufV[13], reinterpret_cast<void*>(dsSetCurrentPositionHook), reinterpret_cast<void**>(&originalDsSetCurrentPosition));
+            MH_CreateHook(bufV[15], reinterpret_cast<void*>(dsSetVolumeHook), reinterpret_cast<void**>(&originalDsSetVolume));
             MH_CreateHook(bufV[18], reinterpret_cast<void*>(dsStopHook), reinterpret_cast<void**>(&originalDsStop));
             buf->Release();
         }

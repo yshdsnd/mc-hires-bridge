@@ -478,7 +478,11 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE SetFormat(LPCWAVEFORMATEX) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE SetVolume(LONG) override { return E_NOTIMPL; }
+    LONG volume = 0;
+    HRESULT STDMETHODCALLTYPE SetVolume(LONG v) override {
+        volume = v;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE SetPan(LONG) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE SetFrequency(DWORD) override { return E_NOTIMPL; }
     __declspec(noinline) HRESULT STDMETHODCALLTYPE Stop() override {

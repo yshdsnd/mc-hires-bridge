@@ -49,6 +49,11 @@ public:
     std::atomic<bool> deferredSeekExecuted{false};
     std::atomic<bool> manualOpObserved{false};
     std::atomic<bool> dsStopSuppressed{false};
+    std::atomic<bool> dsSetCurrentPositionSuppressed{false};
+    std::atomic<bool> dsSetVolumeSuppressed{false};
+    std::atomic<bool> controlStopSuppressed{false};
+    std::atomic<bool> filterStopSuppressed{false};
+    std::atomic<bool> filterPauseSuppressed{false};
     std::atomic<int> dsStopCallCount{0};
     std::atomic<int> downstreamEosReceived{0};
     std::atomic<int> staleEosDiscarded{0};
@@ -234,6 +239,58 @@ public:
         return buf->Stop();
     }
 
+    // --- DirectSound SetCurrentPosition Hook ---
+    HRESULT executeDsSetCurrentPosition(DWORD dwNewPosition, IDirectSoundBuffer* buf = nullptr) {
+        if (!buf) buf = pDsBuffer;
+        bool isManual = (currentCallerContext == CallerContext::UserManualOp);
+        void* activeGraph = nullptr;
+        bool isAssoc = (buf == pDsBuffer) || tracker.isTransitionBuffer(buf, &activeGraph);
+        if (tracker.isVirtualPauseActive(mockGraph) && isAssoc && !isManual) {
+            dsSetCurrentPositionSuppressed = true;
+            return DS_OK;
+        }
+        return buf->SetCurrentPosition(dwNewPosition);
+    }
+
+    // --- DirectSound SetVolume Hook ---
+    HRESULT executeDsSetVolume(LONG lVolume, IDirectSoundBuffer* buf = nullptr) {
+        if (!buf) buf = pDsBuffer;
+        bool isManual = (currentCallerContext == CallerContext::UserManualOp);
+        void* activeGraph = nullptr;
+        bool isAssoc = (buf == pDsBuffer) || tracker.isTransitionBuffer(buf, &activeGraph);
+        if (tracker.isVirtualPauseActive(mockGraph) && isAssoc && !isManual) {
+            dsSetVolumeSuppressed = true;
+            return DS_OK;
+        }
+        return buf->SetVolume(lVolume);
+    }
+
+    // --- Filter Pause Hook ---
+    HRESULT executeFilterPause() {
+        bool isManual = (currentCallerContext == CallerContext::UserManualOp);
+        if (tracker.isVirtualPauseActive(mockGraph) && !isManual) {
+            filterPauseSuppressed = true;
+            return S_OK;
+        }
+        return S_OK;
+    }
+
+    // --- Filter Stop Hook ---
+    HRESULT executeFilterStop() {
+        bool isManual = (currentCallerContext == CallerContext::UserManualOp);
+        if (tracker.isVirtualPauseActive(mockGraph)) {
+            if (!isManual) {
+                filterStopSuppressed = true;
+                return S_OK;
+            } else {
+                tracker.cancelVirtualPause(mockGraph, eosTransition::PauseDeferralStatus::CancelledStop);
+                manualOpObserved = true;
+            }
+        }
+        tracker.onStop(mockGraph);
+        return S_OK;
+    }
+
     // --- Control Run Hook ---
     HRESULT executeControlRun(MockFilterGraphEx* graph = nullptr, bool deferIfVirtual = false) {
         controlRunCount++;
@@ -295,7 +352,10 @@ public:
     HRESULT executeControlStop() {
         bool isEngine = (currentCallerContext == CallerContext::EngineAutoChange);
         if (tracker.isVirtualPauseActive(mockGraph)) {
-            if (!isEngine) {
+            if (isEngine) {
+                controlStopSuppressed = true;
+                return S_OK;
+            } else {
                 // User manual stop: cancel Virtual Pause immediately!
                 tracker.cancelVirtualPause(mockGraph, eosTransition::PauseDeferralStatus::CancelledStop);
                 manualOpObserved = true;
@@ -1694,8 +1754,161 @@ inline void testIndependentPcmStallVsPositionMeasurementIsolation() {
     CHECK(g->pauseDeferralStatus == eosTransition::PauseDeferralStatus::TimedOut);
 }
 
+// Test 68: Old Buffer Identification via Renderer Query, Reference Lifetime Preservation, and Continuous Cursor Reporting (Issue #40)
+inline void testOldBufferIdentificationAndReferenceLifetime() {
+    std::printf("[TEST 68] Old buffer identification, reference lifetime preservation, and continuous cursor reporting (Issue #40)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    // Simulate Track 1 started without invoking dsPlayHook (g_lastActiveSoundBuffer wasn't populated yet)
+    // Audio hardware is playing at ~20.2s
+    harness.mockDsBuffer->playPos = 5817600;
+    harness.mockDsBuffer->writePos = 5817600 + 4800;
+    harness.mockDsBuffer->status = DSBSTATUS_PLAYING;
+
+    // Upstream finishes decoding so format change is pending
+    harness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+    harness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
+
+    // Simulate reference count check
+    ULONG refBefore = harness.mockDsBuffer->AddRef();
+    harness.mockDsBuffer->Release();
+
+    // Enter Virtual Pause with buffer registered
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+
+    // Verify buffer is attached to transition context
+    void* activeGraph = nullptr;
+    CHECK(harness.tracker.isTransitionBuffer(harness.pDsBuffer, &activeGraph) == true);
+    CHECK(activeGraph == harness.mockGraph);
+
+    // Simulate worker thread holding AddRef on primaryDsBuffer
+    harness.pDsBuffer->AddRef();
+    ULONG refHolding = harness.mockDsBuffer->AddRef();
+    harness.mockDsBuffer->Release();
+    CHECK(refHolding > refBefore);
+
+    // Verify cursor reporting remains active and accurate
+    auto snap = harness.queryHeartbeat();
+    CHECK(snap.dsPlayCursor == 5817600);
+    CHECK((snap.dsStatus & DSBSTATUS_PLAYING) != 0);
+    CHECK(SUCCEEDED(snap.hrDsPos));
+
+    // Release buffer reference as worker thread does on exit
+    harness.pDsBuffer->Release();
+    ULONG refAfter = harness.mockDsBuffer->AddRef();
+    harness.mockDsBuffer->Release();
+    CHECK(refAfter == refBefore);
+
+    harness.triggerWatchdogTimeout();
+}
+
+// Test 69: DirectSound SetCurrentPosition, SetVolume, and Engine Filter Stop Suppression During Virtual Pause (Issue #40)
+inline void testEngineFilterAndBufferStopSuppressionDuringVirtualPause() {
+    std::printf("[TEST 69] DirectSound SetCurrentPosition, SetVolume, and filter Stop suppression (Issue #40)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    harness.mockDsBuffer->playPos = 5817600;
+    harness.mockDsBuffer->status = DSBSTATUS_PLAYING;
+    harness.mockDsBuffer->volume = 0;
+
+    // Upstream finishes decoding so format change is pending
+    harness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+    harness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
+
+    // Enter Virtual Pause
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+    CHECK(harness.tracker.isVirtualPauseActive(harness.mockGraph) == true);
+
+    // 1. Engine attempts to reset DirectSound buffer position to 0 (muting/discontinuity cause):
+    CHECK(harness.executeDsSetCurrentPosition(0) == DS_OK);
+    CHECK(harness.dsSetCurrentPositionSuppressed == true);
+    CHECK(harness.mockDsBuffer->playPos == 5817600); // Position was NOT reset!
+
+    // 2. Engine attempts to set volume to mute (-10000):
+    CHECK(harness.executeDsSetVolume(-10000) == DS_OK);
+    CHECK(harness.dsSetVolumeSuppressed == true);
+    CHECK(harness.mockDsBuffer->volume == 0); // Volume was NOT muted!
+
+    // 3. Engine attempts to stop DirectSound buffer:
+    CHECK(harness.executeDsStop() == DS_OK);
+    CHECK(harness.dsStopSuppressed == true);
+    CHECK(harness.mockDsBuffer->status == DSBSTATUS_PLAYING); // Buffer is STILL playing!
+
+    // 4. Engine attempts to pause/stop DirectShow filter:
+    CHECK(harness.executeFilterPause() == S_OK);
+    CHECK(harness.filterPauseSuppressed == true);
+    CHECK(harness.executeFilterStop() == S_OK);
+    CHECK(harness.filterStopSuppressed == true);
+    CHECK(harness.executeControlStop() == S_OK);
+    CHECK(harness.controlStopSuppressed == true);
+    CHECK(harness.tracker.isVirtualPauseActive(harness.mockGraph) == true); // Graph remains active!
+
+    // 5. Now simulate user manual stop: must immediately cancel Virtual Pause and execute real stop!
+    harness.currentCallerContext = CallerContext::UserManualOp;
+    harness.lastUserInputTick = 1002;
+    CHECK(harness.executeControlStop() == S_OK);
+    CHECK(harness.tracker.isVirtualPauseActive(harness.mockGraph) == false);
+    const auto* g = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(g != nullptr);
+    CHECK(g->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CancelledStop);
+}
+
+// Test 70: End-of-stream Delivery on Upstream Completion to Flush Intermediate Delay Line (Issue #40)
+inline void testEndOfStreamDeliveryOnUpstreamCompletionFlushesDelayLine() {
+    std::printf("[TEST 70] End-of-stream delivery on upstream completion flushes delay line (Issue #40)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    // Upstream finishes decoding: 6,624,000 bytes (23.0s)
+    harness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    // Downstream EQ received 6,395,040 bytes; remaining 228,960 bytes sits in DSEE delay line
+    harness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
+
+    // Enter Virtual Pause
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+
+    auto snap = harness.queryHeartbeat();
+    CHECK(snap.pcmDelivered == false);
+    CHECK(snap.downstreamBytes == 6395040);
+    CHECK(snap.targetBytes == 6624000);
+
+    // Delivering EOS flushes the remaining 228,960 bytes to EQ input pin:
+    harness.feedDownstreamChunk(nullptr, 228960, true, 222050000LL, 230000000LL);
+
+    // Now downstream reaches full 6,624,000 bytes
+    snap = harness.queryHeartbeat();
+    CHECK(snap.pcmDelivered == true);
+    CHECK(snap.downstreamBytes == 6624000);
+    CHECK(snap.targetBytes == 6624000);
+
+    // DirectSound hardware playback reaches tail
+    harness.mockDsBuffer->playPos = 6624000;
+    harness.mockDsBuffer->status = 0; // playback completed
+
+    CHECK(harness.completeDrainNaturally() == true);
+    CHECK(harness.tracker.isVirtualPauseActive(harness.mockGraph) == false);
+    const auto* g = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(g != nullptr);
+    CHECK(g->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CompletedDrain);
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -1724,7 +1937,10 @@ inline void runAllAsyncTransitionTests() {
     testHeartbeatGenerationAndByteCounters();
     testDirectSoundBufferCursorTrackingAcrossVirtualPause();
     testIndependentPcmStallVsPositionMeasurementIsolation();
-    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testOldBufferIdentificationAndReferenceLifetime();
+    testEngineFilterAndBufferStopSuppressionDuringVirtualPause();
+    testEndOfStreamDeliveryOnUpstreamCompletionFlushesDelayLine();
+    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests
