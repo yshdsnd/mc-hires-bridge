@@ -276,4 +276,63 @@ In synchronous mode (`deferFormatChangePause`), completion is evaluated using tw
 - Track 2 -> Track 3 (Track 2's own tail): Topology B EQ bypass, downstream PCM tracking, full drain.
 - Reverse order (e.g. 48kHz/16bit -> 48kHz/24bit): Topology B -> Topology A/B transitions with symmetrical tail protection and single-start playback.
 
+---
+
+## 11. Issue #46: Maintaining 44.1kHz DSEE Output (88.2kHz) up to DirectSound Renderer and Peer Code 3 Resolution
+
+### 11.1 Problem Analysis: Origin of Peer Code 3 and Downsampler Insertion
+
+In actual playback on Music Center 2.7.4 with DSEE HX ON (Family2x mode) using commit `5b35497`:
+- **48kHz FLAC**: DSEE input was 48kHz/16bit (or 24bit), DSEE output was 96kHz/24bit. After EQ bypass, renderer received 96kHz/24bit with Peer Code 1 (`isDirectSeamless = true`).
+- **44.1kHz FLAC**: DSEE input was 44.1kHz/16bit, DSEE output was 88.2kHz/24bit. However, after EQ bypass, the actual renderer input received **44.1kHz/24bit**, and the direct peer was classified as **Peer Code 3 ("その他")**.
+
+Investigation of filter format acceptance via live `QueryAccept` revealed the root cause:
+1. `OmgEqxlFilter.ax` (Sony Equalizer) accepts:
+   - 44.1kHz / 16-bit: ACCEPT
+   - 44.1kHz / 24-bit: ACCEPT
+   - 48kHz / 16-bit: ACCEPT
+   - 48kHz / 24-bit: ACCEPT
+   - 96kHz / 24-bit: ACCEPT
+   - **88.2kHz / 24-bit: REJECT**
+2. DirectSound Audio Renderer (`CLSID_DSoundRender`) accepts:
+   - 44.1kHz, 48kHz, **88.2kHz**, 96kHz, 176.4kHz, 192kHz (all 16-bit & 24-bit PCM): ACCEPT.
+3. Because `OmgEqxlFilter` strictly rejects 88.2kHz, Music Center's graph construction automatically inserts a frequency sampling converter / downsampler filter in front of `OmgEqxlFilter` to resample the 88.2kHz stream down to 44.1kHz.
+4. In prior implementation, `applyEqBypass` only disconnected `OmgEqxlFilter` and connected whatever pin was feeding `eqIn` directly to `dsIn`. Because the downsampler sat in front of `eqIn`, `applyEqBypass` connected the downsampler's output to DirectSound! This left the downsampler in place, feeding 44.1kHz/24bit to DirectSound, and because that filter was neither `SeamlessFilter` nor `OmgDseeHxFilter`, it was recorded as Peer Code 3 ("その他").
+
+### 11.2 Direct Native DSEE Routing without Extra Resamplers
+
+To maintain DSEE HX's native integer upsampling output (88.2kHz/24bit) all the way to DirectSound renderer without adding any external resampler:
+1. **Target Upstream Pin Selection**:
+   - When DSEE HX is active and generating Hi-Res audio (`dseeOut` rate >= 88.2kHz):
+     - If `SeamlessFilter` is present and its output format matches `dseeOut` rate (>= 88.2kHz, e.g. 96kHz in 48kHz FLAC), `seamOut -> dsIn` is selected (Peer Code 1), preserving seamless track transitions.
+     - If `SeamlessFilter` is downsampling (outputting 44.1kHz) or absent/rejecting 88.2kHz, `dseeOut -> dsIn` is selected directly (Peer Code 2).
+   - When DSEE is OFF or for native Hi-Res audio:
+     - If `SeamlessFilter` is present, `seamOut -> dsIn` is selected.
+     - Otherwise, standard upstream pin (`upstreamEqOut -> dsIn`) is selected.
+2. **Direct Connection to DirectSound**:
+   - `targetOut` (`dseeOut`) is connected directly to `dsIn` (`DirectSoundRender`).
+   - The intermediate downsampler and `OmgEqxlFilter` pins are disconnected and remain idle in the graph.
+   - DirectSound natively receives **88.2kHz / 24-bit PCM**.
+   - If connection fails, full rollback to original pin connections is performed.
+
+### 11.3 Peer Code 3 Identification and Full Linear Chain Traversal
+
+`GraphInspection` and diagnostic logging have been expanded:
+1. **Linear Chain Traversal**:
+   - Starting from `decoderFilter` output pin, follows `ConnectedTo` across all intermediate transform filters until reaching `DirectSoundRender`.
+   - Records CLSID, filter name (`achName`), pin names, input format, and output format for up to 8 nodes in `out.chain[0..N]`.
+   - Pinpoints the exact filter node where sample rate reduction occurs.
+2. **Peer Diagnostics**:
+   - For any DirectSound peer, queries `FILTER_INFO` and `GetClassID`.
+   - Records `GRAPH_PEER_CLSID_1` / `GRAPH_PEER_CLSID_2` (full 128-bit GUID) and `GRAPH_RENDER_PEER` (0 = EQ, 1 = Seamless, 2 = DSEE, 3 = Other).
+
+### 11.4 Test Verification
+
+- **Unit Test 13 in `dsee_unified_tests.cpp`**:
+  - `13A`: 44.1kHz FLAC with DSEE HX ON and intermediate downsampler -> `applyEqBypass` successfully connects `dseeOut -> dsIn` directly at 88.2kHz/24bit; reports Peer Code 2 (`isDirectDsee = true`); second invocation reports `AlreadyBypassed`.
+  - `13B`: 48kHz FLAC with DSEE HX ON -> `applyEqBypass` successfully connects `seamOut -> dsIn` at 96kHz/24bit; reports Peer Code 1 (`isDirectSeamless = true`).
+  - `13C`: Native 192kHz FLAC with DSEE OFF -> `applyEqBypass` preserves bit-perfect 192kHz/24bit output via `seamOut -> dsIn`.
+- **Regression**: All 13 DSEE unified test suites and all 76 EOS transition test cases pass with 0 failures.
+
+
 

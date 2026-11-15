@@ -246,8 +246,10 @@ public:
     IBaseFilter* filter = nullptr;
     IPin* connectedTo = nullptr;
     AM_MEDIA_TYPE mt{};
+    std::wstring pinName;
 
-    MockPin(PIN_DIRECTION d, IBaseFilter* f, DWORD rate = 88200, WORD bits = 24) : dir(d), filter(f) {
+    MockPin(PIN_DIRECTION d, IBaseFilter* f, DWORD rate = 88200, WORD bits = 24, const wchar_t* pn = L"")
+        : dir(d), filter(f), pinName(pn ? pn : L"") {
         mt.majortype = MEDIATYPE_Audio;
         mt.subtype = MEDIASUBTYPE_PCM;
         mt.formattype = FORMAT_WaveFormatEx;
@@ -286,6 +288,21 @@ public:
     HRESULT STDMETHODCALLTYPE Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* pmt) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE ReceiveConnection(IPin* pConnector, const AM_MEDIA_TYPE* pmt) override {
         connectedTo = pConnector;
+        if (pmt && pmt->pbFormat && pmt->cbFormat >= sizeof(WAVEFORMATEX)) {
+            if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+            mt = *pmt;
+            mt.pbFormat = reinterpret_cast<BYTE*>(CoTaskMemAlloc(pmt->cbFormat));
+            std::memcpy(mt.pbFormat, pmt->pbFormat, pmt->cbFormat);
+        } else if (!pmt && pConnector && dir == PINDIR_INPUT) {
+            AM_MEDIA_TYPE peerMt{};
+            if (SUCCEEDED(pConnector->ConnectionMediaType(&peerMt)) && peerMt.pbFormat && peerMt.cbFormat >= sizeof(WAVEFORMATEX)) {
+                if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+                mt = peerMt;
+                mt.pbFormat = reinterpret_cast<BYTE*>(CoTaskMemAlloc(peerMt.cbFormat));
+                std::memcpy(mt.pbFormat, peerMt.pbFormat, peerMt.cbFormat);
+                CoTaskMemFree(peerMt.pbFormat);
+            }
+        }
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Disconnect() override {
@@ -313,7 +330,7 @@ public:
         pInfo->pFilter = filter;
         if (filter) filter->AddRef();
         pInfo->dir = dir;
-        pInfo->achName[0] = L'\0';
+        wcsncpy_s(pInfo->achName, pinName.c_str(), _TRUNCATE);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE QueryDirection(PIN_DIRECTION* pPinDir) override {
@@ -380,9 +397,10 @@ class MockFilter : public IBaseFilter {
 public:
     ULONG ref = 1;
     CLSID clsid;
+    std::wstring filterName;
     std::vector<IPin*> pins;
 
-    MockFilter(const CLSID& id) : clsid(id) {}
+    MockFilter(const CLSID& id, const wchar_t* name = L"") : clsid(id), filterName(name ? name : L"") {}
     ~MockFilter() {
         for (auto* p : pins) p->Release();
     }
@@ -427,7 +445,12 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE FindPin(LPCWSTR Id, IPin** ppPin) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE QueryFilterInfo(FILTER_INFO* pInfo) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE QueryFilterInfo(FILTER_INFO* pInfo) override {
+        if (!pInfo) return E_POINTER;
+        pInfo->pGraph = nullptr;
+        wcsncpy_s(pInfo->achName, filterName.c_str(), _TRUNCATE);
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE JoinFilterGraph(IFilterGraph* pGraph, LPCWSTR pName) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE QueryVendorInfo(LPWSTR* pVendorInfo) override { return E_NOTIMPL; }
 };
@@ -788,6 +811,242 @@ void testLiveSonyFilterIfAvailable() {
     FreeLibrary(module);
 }
 
+static bool testPinAcceptFormat(IPin* pin, DWORD sampleRate, WORD bits, WORD channels = 2) {
+    if (!pin) return false;
+    AM_MEDIA_TYPE mt{};
+    mt.majortype = MEDIATYPE_Audio;
+    mt.subtype = MEDIASUBTYPE_PCM;
+    mt.formattype = FORMAT_WaveFormatEx;
+    mt.bFixedSizeSamples = TRUE;
+    mt.bTemporalCompression = FALSE;
+    mt.lSampleSize = channels * (bits / 8);
+
+    WAVEFORMATEX wfx{};
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
+    wfx.nChannels = channels;
+    wfx.nSamplesPerSec = sampleRate;
+    wfx.wBitsPerSample = bits;
+    wfx.nBlockAlign = channels * (bits / 8);
+    wfx.nAvgBytesPerSec = sampleRate * wfx.nBlockAlign;
+    wfx.cbSize = 0;
+
+    mt.cbFormat = sizeof(wfx);
+    mt.pbFormat = reinterpret_cast<BYTE*>(&wfx);
+
+    HRESULT hr = pin->QueryAccept(&mt);
+    return hr == S_OK;
+}
+
+struct CFactoryTemplateProbe {
+    const WCHAR* m_Name;
+    const CLSID* m_ClsID;
+    void* m_lpfnNew;
+    void* m_lpfnInit;
+    void* m_pAMovieSetup_Filter;
+};
+
+static void scanFilterTemplates(const wchar_t* dllName) {
+    wchar_t path[MAX_PATH]{};
+    swprintf_s(path, L"C:\\Program Files (x86)\\Sony\\Music Center\\Sony.Earth\\%s", dllName);
+    HMODULE mod = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!mod) return;
+
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<BYTE*>(mod) + dos->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    BYTE* textStart = nullptr;
+    BYTE* textEnd = nullptr;
+    BYTE* rdataStart = nullptr;
+    BYTE* rdataEnd = nullptr;
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (memcmp(sec[i].Name, ".text", 5) == 0) {
+            textStart = reinterpret_cast<BYTE*>(mod) + sec[i].VirtualAddress;
+            textEnd = textStart + sec[i].Misc.VirtualSize;
+        } else if (memcmp(sec[i].Name, ".rdata", 6) == 0) {
+            rdataStart = reinterpret_cast<BYTE*>(mod) + sec[i].VirtualAddress;
+            rdataEnd = rdataStart + sec[i].Misc.VirtualSize;
+        }
+    }
+
+    BYTE* modStart = reinterpret_cast<BYTE*>(mod);
+    BYTE* modEnd = modStart + nt->OptionalHeader.SizeOfImage;
+
+    if (rdataStart && rdataEnd && textStart && textEnd) {
+        for (BYTE* p = rdataStart; p + sizeof(CFactoryTemplateProbe) <= rdataEnd; p += 4) {
+            auto t = reinterpret_cast<const CFactoryTemplateProbe*>(p);
+            auto namePtr = reinterpret_cast<const BYTE*>(t->m_Name);
+            auto clsidPtr = reinterpret_cast<const BYTE*>(t->m_ClsID);
+            auto newPtr = reinterpret_cast<const BYTE*>(t->m_lpfnNew);
+
+            if (namePtr >= rdataStart && namePtr < rdataEnd &&
+                clsidPtr >= rdataStart && clsidPtr < rdataEnd &&
+                newPtr >= textStart && newPtr < textEnd) {
+                // Check if name is valid wide string
+                auto ws = reinterpret_cast<const wchar_t*>(namePtr);
+                size_t len = 0;
+                bool ok = true;
+                while (len < 64 && ws[len] != 0) {
+                    if (ws[len] < 32 || ws[len] > 126) { ok = false; break; }
+                    len++;
+                }
+                if (ok && len >= 3 && ws[len] == 0) {
+                    LPOLESTR clsidStr = nullptr;
+                    StringFromCLSID(*reinterpret_cast<const CLSID*>(clsidPtr), &clsidStr);
+                    std::printf("  [%ls] Found: '%ls', CLSID: %ls\n", dllName, ws, clsidStr ? clsidStr : L"(null)");
+                    if (clsidStr) CoTaskMemFree(clsidStr);
+                }
+            }
+        }
+    }
+    FreeLibrary(mod);
+}
+
+void testLiveSonyFilterFormatsAcceptance() {
+    std::printf("[TEST 7.5] Live Sony Filters Format Acceptance Probe...\n");
+
+    scanFilterTemplates(L"OmgFsConvFilter.ax");
+    scanFilterTemplates(L"OmgAudioMix.ax");
+    scanFilterTemplates(L"SeamlessFilter.ax");
+    scanFilterTemplates(L"OmgEqxlFilter.ax");
+    scanFilterTemplates(L"OmgDseeHxFilter.ax");
+    scanFilterTemplates(L"saliconv.ax");
+    scanFilterTemplates(L"saloconv.ax");
+    scanFilterTemplates(L"OmgSaEnvelope.ax");
+    scanFilterTemplates(L"OmgNormalizer.ax");
+
+    // 1. Probe SeamlessFilter.ax
+    {
+        HMODULE mod = LoadLibraryExW(L"C:\\Program Files (x86)\\Sony\\Music Center\\Sony.Earth\\SeamlessFilter.ax",
+                                     nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (mod) {
+            auto get = reinterpret_cast<HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, void**)>(
+                GetProcAddress(mod, "DllGetClassObject"));
+            if (get) {
+                Microsoft::WRL::ComPtr<IClassFactory> factory;
+                Microsoft::WRL::ComPtr<IBaseFilter> filter;
+                if (SUCCEEDED(get(dseeUnified::seamlessId, IID_PPV_ARGS(&factory))) && factory) {
+                    factory->CreateInstance(nullptr, IID_PPV_ARGS(&filter));
+                }
+                if (filter) {
+                    Microsoft::WRL::ComPtr<IEnumPins> ep;
+                    filter->EnumPins(&ep);
+                    Microsoft::WRL::ComPtr<IPin> p;
+                    std::printf("  SeamlessFilter All Pins:\n");
+                    while (ep->Next(1, &p, nullptr) == S_OK) {
+                        PIN_INFO pi{};
+                        p->QueryPinInfo(&pi);
+                        std::printf("    Pin name: %ls, dir: %s\n", pi.achName, pi.dir == PINDIR_INPUT ? "INPUT" : "OUTPUT");
+                        if (pi.pFilter) pi.pFilter->Release();
+                        p.Reset();
+                    }
+                    auto inPin = dseeUnified::findUniquePin(filter.Get(), PINDIR_INPUT);
+                    auto outPin = dseeUnified::findUniquePin(filter.Get(), PINDIR_OUTPUT);
+                    std::printf("  SeamlessFilter Input Pin QueryAccept:\n");
+                    std::printf("    44.1k/16b: %s\n", testPinAcceptFormat(inPin.Get(), 44100, 16) ? "ACCEPT" : "REJECT");
+                    std::printf("    44.1k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 44100, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    88.2k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 88200, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    176.4k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 176400, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    48k/16b: %s\n", testPinAcceptFormat(inPin.Get(), 48000, 16) ? "ACCEPT" : "REJECT");
+                    std::printf("    48k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 48000, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    96k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 96000, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    192k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 192000, 24) ? "ACCEPT" : "REJECT");
+                }
+            }
+            FreeLibrary(mod);
+        }
+    }
+
+    // 2. Probe OmgEqxlFilter.ax
+    {
+        HMODULE mod = LoadLibraryExW(L"C:\\Program Files (x86)\\Sony\\Music Center\\Sony.Earth\\OmgEqxlFilter.ax",
+                                     nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (mod) {
+            auto get = reinterpret_cast<HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, void**)>(
+                GetProcAddress(mod, "DllGetClassObject"));
+            if (get) {
+                Microsoft::WRL::ComPtr<IClassFactory> factory;
+                Microsoft::WRL::ComPtr<IBaseFilter> filter;
+                if (SUCCEEDED(get(dseeUnified::eqId, IID_PPV_ARGS(&factory))) && factory) {
+                    factory->CreateInstance(nullptr, IID_PPV_ARGS(&filter));
+                }
+                if (filter) {
+                    auto inPin = dseeUnified::findUniquePin(filter.Get(), PINDIR_INPUT);
+                    std::printf("  OmgEqxlFilter Input Pin QueryAccept:\n");
+                    std::printf("    44.1k/16b: %s\n", testPinAcceptFormat(inPin.Get(), 44100, 16) ? "ACCEPT" : "REJECT");
+                    std::printf("    44.1k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 44100, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    88.2k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 88200, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    48k/16b: %s\n", testPinAcceptFormat(inPin.Get(), 48000, 16) ? "ACCEPT" : "REJECT");
+                    std::printf("    48k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 48000, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    96k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 96000, 24) ? "ACCEPT" : "REJECT");
+                }
+            }
+            FreeLibrary(mod);
+        }
+    }
+
+    // 3. Probe OmgDseeHxFilter.ax
+    {
+        HMODULE mod = LoadLibraryExW(L"C:\\Program Files (x86)\\Sony\\Music Center\\Sony.Earth\\OmgDseeHxFilter.ax",
+                                     nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (mod) {
+            auto get = reinterpret_cast<HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, void**)>(
+                GetProcAddress(mod, "DllGetClassObject"));
+            if (get) {
+                Microsoft::WRL::ComPtr<IClassFactory> factory;
+                Microsoft::WRL::ComPtr<IBaseFilter> filter;
+                if (SUCCEEDED(get(dseeUnified::dseeId, IID_PPV_ARGS(&factory))) && factory) {
+                    factory->CreateInstance(nullptr, IID_PPV_ARGS(&filter));
+                }
+                if (filter) {
+                    Microsoft::WRL::ComPtr<IEnumPins> ep;
+                    filter->EnumPins(&ep);
+                    Microsoft::WRL::ComPtr<IPin> p;
+                    std::printf("  SeamlessFilter All Pins:\n");
+                    while (ep->Next(1, &p, nullptr) == S_OK) {
+                        PIN_INFO pi{};
+                        p->QueryPinInfo(&pi);
+                        std::printf("    Pin name: %ls, dir: %s\n", pi.achName, pi.dir == PINDIR_INPUT ? "INPUT" : "OUTPUT");
+                        if (pi.pFilter) pi.pFilter->Release();
+                        p.Reset();
+                    }
+                    auto inPin = dseeUnified::findUniquePin(filter.Get(), PINDIR_INPUT);
+                    auto outPin = dseeUnified::findUniquePin(filter.Get(), PINDIR_OUTPUT);
+                    std::printf("  OmgDseeHxFilter Input Pin QueryAccept:\n");
+                    std::printf("    44.1k/16b: %s\n", testPinAcceptFormat(inPin.Get(), 44100, 16) ? "ACCEPT" : "REJECT");
+                    std::printf("    44.1k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 44100, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    88.2k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 88200, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    48k/16b: %s\n", testPinAcceptFormat(inPin.Get(), 48000, 16) ? "ACCEPT" : "REJECT");
+                    std::printf("    48k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 48000, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("  OmgDseeHxFilter Output Pin QueryAccept:\n");
+                    std::printf("    44.1k/24b: %s\n", testPinAcceptFormat(outPin.Get(), 44100, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    88.2k/24b: %s\n", testPinAcceptFormat(outPin.Get(), 88200, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    176.4k/24b: %s\n", testPinAcceptFormat(outPin.Get(), 176400, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    96k/24b: %s\n", testPinAcceptFormat(outPin.Get(), 96000, 24) ? "ACCEPT" : "REJECT");
+                    std::printf("    192k/24b: %s\n", testPinAcceptFormat(outPin.Get(), 192000, 24) ? "ACCEPT" : "REJECT");
+                }
+            }
+            FreeLibrary(mod);
+        }
+    }
+
+    // 4. Probe DirectSoundRender
+    {
+        Microsoft::WRL::ComPtr<IBaseFilter> dsFilter;
+        HRESULT hr = CoCreateInstance(CLSID_DSoundRender, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dsFilter));
+        if (SUCCEEDED(hr) && dsFilter) {
+            auto inPin = dseeUnified::findUniquePin(dsFilter.Get(), PINDIR_INPUT);
+            std::printf("  DirectSoundRender Input Pin QueryAccept:\n");
+            std::printf("    44.1k/16b:  %s\n", testPinAcceptFormat(inPin.Get(), 44100, 16) ? "ACCEPT" : "REJECT");
+            std::printf("    44.1k/24b:  %s\n", testPinAcceptFormat(inPin.Get(), 44100, 24) ? "ACCEPT" : "REJECT");
+            std::printf("    88.2k/24b:  %s\n", testPinAcceptFormat(inPin.Get(), 88200, 24) ? "ACCEPT" : "REJECT");
+            std::printf("    96k/24b:    %s\n", testPinAcceptFormat(inPin.Get(), 96000, 24) ? "ACCEPT" : "REJECT");
+            std::printf("    176.4k/24b: %s\n", testPinAcceptFormat(inPin.Get(), 176400, 24) ? "ACCEPT" : "REJECT");
+            std::printf("    192k/24b:   %s\n", testPinAcceptFormat(inPin.Get(), 192000, 24) ? "ACCEPT" : "REJECT");
+        }
+    }
+}
+
 // Test 8: Decoder Bit Depth Synchronization & 48k Formats (Issue #43)
 void testDecoderBitsSyncAndUnifiedFormats() {
     std::printf("[TEST 8] Decoder Bit Depth Synchronization & 48k Formats...\n");
@@ -1104,6 +1363,209 @@ void testDirectSoundRenderPinInspection() {
     }
 }
 
+// Test 13: Issue #46 DSEE 88.2kHz Maintenance, Downsampler Bypass, & Full Chain Traversal
+void testIssue46Dsee88kRendererAndChainTraversal() {
+    std::printf("[TEST 13] Issue #46: DSEE 88.2kHz Maintenance & Peer Code 3 Diagnostics...\n");
+
+    // Test 13A: 44.1kHz DSEE playback where downsampler was inserted before EQ
+    // Graph topology before bypass:
+    // Decoder (44.1k/16b) -> DSEE (88.2k/24b) -> Downsampler (44.1k/24b) -> EQ (44.1k/24b) -> DirectSoundRender
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        CLSID downsamplerId = { 0x12345678, 0x1234, 0x1234, { 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0 } };
+
+        auto* dec = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* decOut = new MockPin(PINDIR_OUTPUT, dec, 44100, 16, L"Out");
+        dec->addPin(decOut);
+        graph->addFilter(dec);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 16, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* downsampler = new MockFilter(downsamplerId, L"OmgFsConvFilter");
+        auto* downIn = new MockPin(PINDIR_INPUT, downsampler, 88200, 24, L"In");
+        auto* downOut = new MockPin(PINDIR_OUTPUT, downsampler, 44100, 24, L"Out");
+        downsampler->addPin(downIn);
+        downsampler->addPin(downOut);
+        graph->addFilter(downsampler);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 44100, 24, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 44100, 24, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 24, L"Audio Input pin (rendered)");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        // Connect initial chain
+        graph->ConnectDirect(decOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, downIn, nullptr);
+        graph->ConnectDirect(downOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        // Verify initial graph inspection
+        dseeUnified::GraphInspection inspBefore{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), inspBefore));
+        CHECK(inspBefore.decodePcm.sampleRate == 44100 && inspBefore.decodePcm.bitDepth == 16);
+        CHECK(inspBefore.dseeOut.sampleRate == 88200 && inspBefore.dseeOut.bitDepth == 24);
+        CHECK(inspBefore.eqIn.sampleRate == 44100 && inspBefore.eqIn.bitDepth == 24);
+        CHECK(inspBefore.renderIn.sampleRate == 44100 && inspBefore.renderIn.bitDepth == 24);
+        CHECK(!inspBefore.eqBypassed);
+        CHECK(wcscmp(inspBefore.renderPeerFilterName, L"OmgEqxlFilter") == 0);
+        CHECK(inspBefore.chainLength == 5);
+        CHECK(inspBefore.chain[0].clsid == dseeUnified::flacId);
+        CHECK(inspBefore.chain[1].clsid == dseeUnified::dseeId);
+        CHECK(inspBefore.chain[2].clsid == downsamplerId);
+        CHECK(inspBefore.chain[2].inRate == 88200 && inspBefore.chain[2].outRate == 44100); // Discovers downsampler location!
+        CHECK(inspBefore.chain[3].clsid == dseeUnified::eqId);
+        CHECK(inspBefore.chain[4].clsid == CLSID_DSoundRender);
+
+        // Apply EQ Bypass with Issue #46 logic:
+        // Because DSEE is outputting 88.2k/24b, and Seamless is either absent or downsampled,
+        // it must connect dseeOut DIRECTLY to dsIn!
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.change == S_OK);
+        CHECK(routeRes.outputRate == 88200);
+        CHECK(routeRes.outputBits == 24);
+
+        // Verify direct DSEE connection
+        Microsoft::WRL::ComPtr<IPin> currentPeer;
+        CHECK(SUCCEEDED(dsIn->ConnectedTo(&currentPeer)) && currentPeer.Get() == dseeOut);
+
+        // Inspect graph after bypass
+        dseeUnified::GraphInspection inspAfter{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), inspAfter));
+        CHECK(inspAfter.eqBypassed);
+        CHECK(inspAfter.isDirectDsee);
+        CHECK(!inspAfter.isDirectSeamless);
+        CHECK(inspAfter.renderIn.sampleRate == 88200 && inspAfter.renderIn.bitDepth == 24);
+        CHECK(inspAfter.renderPeerClsid == dseeUnified::dseeId);
+        CHECK(wcscmp(inspAfter.renderPeerFilterName, L"OmgDseeHxFilter") == 0);
+
+        DWORD peerCode = inspAfter.isDirectSeamless ? 1 : (inspAfter.isDirectDsee ? 2 : (inspAfter.eqBypassed ? 3 : 0));
+        CHECK(peerCode == 2); // Peer Code 2 (Direct DSEE)
+
+        // Calling applyEqBypass again should report AlreadyBypassed at 88.2kHz
+        auto routeRes2 = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes2.outcome == dseeUnified::RouteOutcome::AlreadyBypassed);
+        CHECK(routeRes2.outputRate == 88200);
+        CHECK(routeRes2.outputBits == 24);
+    }
+
+    // Test 13B: 48kHz DSEE playback where SeamlessFilter successfully passes 96kHz
+    // Graph topology:
+    // Decoder (48k/24b) -> DSEE (96k/24b) -> Seamless (96k/24b) -> EQ (96k/24b) -> DirectSoundRender
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dec = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* decOut = new MockPin(PINDIR_OUTPUT, dec, 48000, 24, L"Out");
+        dec->addPin(decOut);
+        graph->addFilter(dec);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 48000, 24, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 96000, 24, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 96000, 24, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 96000, 24, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 96000, 24, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 96000, 24, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 96000, 24, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(decOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        // Apply EQ Bypass: because seamOut matches DSEE 96kHz, seamOut connects to dsIn
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.outputRate == 96000);
+        CHECK(routeRes.outputBits == 24);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.isDirectSeamless);
+        CHECK(!insp.isDirectDsee);
+        CHECK(insp.renderIn.sampleRate == 96000 && insp.renderIn.bitDepth == 24);
+
+        DWORD peerCode = insp.isDirectSeamless ? 1 : (insp.isDirectDsee ? 2 : (insp.eqBypassed ? 3 : 0));
+        CHECK(peerCode == 1); // Peer Code 1 (Direct Seamless)
+    }
+
+    // Test 13C: DSEE OFF / Native Hi-Res Preservation (192kHz native)
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dec = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* decOut = new MockPin(PINDIR_OUTPUT, dec, 192000, 24, L"Out");
+        dec->addPin(decOut);
+        graph->addFilter(dec);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 192000, 24, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 192000, 24, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 192000, 24, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 192000, 24, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 192000, 24, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(decOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.outputRate == 192000);
+        CHECK(routeRes.outputBits == 24);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.isDirectSeamless);
+        CHECK(insp.renderIn.sampleRate == 192000 && insp.renderIn.bitDepth == 24);
+        DWORD peerCode = insp.isDirectSeamless ? 1 : (insp.isDirectDsee ? 2 : (insp.eqBypassed ? 3 : 0));
+        CHECK(peerCode == 1);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1125,6 +1587,8 @@ int main() {
     std::fflush(stdout);
     testLiveSonyFilterIfAvailable();
     std::fflush(stdout);
+    testLiveSonyFilterFormatsAcceptance();
+    std::fflush(stdout);
     testDecoderBitsSyncAndUnifiedFormats();
     std::fflush(stdout);
     testGraphInspectionCoverage();
@@ -1134,6 +1598,8 @@ int main() {
     testIssue44NegotiationMatrix();
     std::fflush(stdout);
     testDirectSoundRenderPinInspection();
+    std::fflush(stdout);
+    testIssue46Dsee88kRendererAndChainTraversal();
     std::fflush(stdout);
 
     CoUninitialize();

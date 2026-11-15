@@ -46,6 +46,17 @@ inline void recordGraphInspection(const GraphInspection& insp, uint32_t gen) {
     record("GRAPH_RENDER_IN", insp.renderIn.sampleRate, insp.renderIn.bitDepth, HRESULT(insp.renderIn.channels));
     DWORD peerCode = insp.isDirectSeamless ? 1 : (insp.isDirectDsee ? 2 : (insp.eqBypassed ? 3 : 0));
     record("GRAPH_RENDER_PEER", peerCode, 0, S_OK);
+
+    // Issue #46 Diagnostics: Peer Code 3 & Full Filter Chain Traversal
+    if (!InlineIsEqualGUID(insp.renderPeerClsid, GUID_NULL)) {
+        record("GRAPH_PEER_CLSID_1", insp.renderPeerClsid.Data1, (DWORD(insp.renderPeerClsid.Data2) << 16) | insp.renderPeerClsid.Data3, S_OK);
+        record("GRAPH_PEER_CLSID_2", *reinterpret_cast<const DWORD*>(&insp.renderPeerClsid.Data4[0]), *reinterpret_cast<const DWORD*>(&insp.renderPeerClsid.Data4[4]), S_OK);
+    }
+    for (uint8_t i = 0; i < insp.chainLength && i < MAX_CHAIN_NODES; ++i) {
+        record("GRAPH_CHAIN_NODE", i, insp.chain[i].inRate, HRESULT(insp.chain[i].outRate));
+        record("GRAPH_CHAIN_BITS", i, insp.chain[i].inBits, HRESULT(insp.chain[i].outBits));
+        record("GRAPH_CHAIN_CLSID", i, insp.chain[i].clsid.Data1, S_OK);
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE dseeUnifiedSetterHook(IUnknown* self, DseeConfig config) {
