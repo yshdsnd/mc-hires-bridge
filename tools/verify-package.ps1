@@ -334,13 +334,14 @@ function Invoke-SelfTest {
             [BitConverter]::GetBytes([int32]0x80).CopyTo($fakePe, 0x3C)
             [BitConverter]::GetBytes([uint32]0x00004550).CopyTo($fakePe, 0x80) # PE\0\0
             [BitConverter]::GetBytes([uint16]0x014C).CopyTo($fakePe, 0x84) # x86
-            [BitConverter]::GetBytes([uint16]0x0102).CopyTo($fakePe, 0x9A) # characteristics
+            [BitConverter]::GetBytes([uint16]0x0102).CopyTo($fakePe, 0x80 + 22) # characteristics
+            [BitConverter]::GetBytes([uint16]0x010B).CopyTo($fakePe, 0x80 + 24) # PE32 magic
             [BitConverter]::GetBytes([uint16]2).CopyTo($fakePe, 0x80 + 92) # GUI subsystem
             [IO.File]::WriteAllBytes((Join-Path $dir 'MC HiRes Bridge.exe'), $fakePe)
 
             $fakeDll = New-Object byte[] 512
             [Array]::Copy($fakePe, $fakeDll, 512)
-            [BitConverter]::GetBytes([uint16]0x2102).CopyTo($fakeDll, 0x9A) # DLL flag
+            [BitConverter]::GetBytes([uint16]0x2102).CopyTo($fakeDll, 0x80 + 22) # DLL flag
             [IO.File]::WriteAllBytes((Join-Path $dir 'flac24_override.dll'), $fakeDll)
         }
 
@@ -369,7 +370,7 @@ function Invoke-SelfTest {
     foreach ($tc in $cases) {
         $stage = Join-Path $baseTemp $tc.Id
         Initialize-CleanStaging $stage
-        & $tc.Setup $stage
+        & $tc.Setup $stage | Out-Null
 
         $rep = Test-PackageContents $stage
         $match = ($rep.IsValid -eq $tc.Expected)
