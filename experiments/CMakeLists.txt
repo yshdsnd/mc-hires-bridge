@@ -15,6 +15,12 @@ target_link_libraries(eos_transition_tests PRIVATE minhook ole32 strmiids uuid u
 target_compile_definitions(eos_transition_tests PRIVATE UNICODE _UNICODE TESTING_HEADLESS)
 enable_testing()
 add_test(NAME eos_transition_tests COMMAND eos_transition_tests)
+
+add_executable(dsee_unified_tests dsee_unified/tests/dsee_unified_tests.cpp)
+target_include_directories(dsee_unified_tests PRIVATE dsee_unified)
+target_link_libraries(dsee_unified_tests PRIVATE ole32 strmiids uuid user32)
+target_compile_definitions(dsee_unified_tests PRIVATE UNICODE _UNICODE TESTING_HEADLESS)
+add_test(NAME dsee_unified_tests COMMAND dsee_unified_tests)
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
   # Reuse the production FLAC implementation; experimental EOS transition hooks are compiled only here.
   add_library(flac24_eos_experiment SHARED "${PROJECT_SOURCE_DIR}/src/bridge/flac24_override.cpp")
@@ -36,6 +42,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
   target_include_directories(flac24_async_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" eos_transition)
   target_link_libraries(flac24_async_experiment PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32 dsound dxguid)
   target_compile_definitions(flac24_async_experiment PRIVATE UNICODE _UNICODE EXPERIMENT_EOS_TRANSITION EXPERIMENT_ASYNC_VIRTUAL_PAUSE EXPERIMENT_PAUSE_DIAGNOSTICS)
+  # Target for Issue #42: DSEE HX unified 24-bit experiment
+  add_library(flac24_dsee_experiment SHARED "${PROJECT_SOURCE_DIR}/src/bridge/flac24_override.cpp")
+  target_include_directories(flac24_dsee_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" "${PROJECT_SOURCE_DIR}/src/bridge" dsee_unified)
+  target_link_libraries(flac24_dsee_experiment PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32 dsound dxguid)
+  target_compile_definitions(flac24_dsee_experiment PRIVATE UNICODE _UNICODE EXPERIMENT_DSEE_UNIFIED)
   # Reuse the production FLAC implementation; WAV hooks are compiled only here.
   add_library(flac24_wav192_experiment SHARED EXCLUDE_FROM_ALL "${PROJECT_SOURCE_DIR}/src/bridge/flac24_override.cpp")
   target_include_directories(flac24_wav192_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" wav192)

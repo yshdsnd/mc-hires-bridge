@@ -15,6 +15,10 @@
 #ifdef EXPERIMENT_EOS_TRANSITION
 #include "eos_transition.h"
 #endif
+#ifdef EXPERIMENT_DSEE_UNIFIED
+#include "dsee_unified_config.h"
+#include "dsee_unified_route.h"
+#endif
 
 using Setter=HRESULT(STDMETHODCALLTYPE*)(IUnknown*,DWORD);
 static Setter original=nullptr;
@@ -26,7 +30,9 @@ static SRWLOCK sourcesLock=SRWLOCK_INIT;
 static std::map<IBaseFilter*,bool> appliedSources;
 static void rememberSource(IUnknown* self,bool applied){IBaseFilter* f=nullptr;if(SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&f)))){AcquireSRWLockExclusive(&sourcesLock);if(appliedSources.size()>=64&&appliedSources.find(f)==appliedSources.end())appliedSources.erase(appliedSources.begin());appliedSources[f]=applied;ReleaseSRWLockExclusive(&sourcesLock);f->Release();}}
 static bool sourceApplied(IBaseFilter* f){CLSID cls{},flac;CLSIDFromString(L"{028A95AA-C956-4874-AD10-C657DB1B00F4}",&flac);if(FAILED(f->GetClassID(&cls)))return false;
-#ifdef EXPERIMENT_WAV192
+#ifdef EXPERIMENT_DSEE_UNIFIED
+    if(cls!=flac&&cls!=dseeUnified::dseeId)return false;
+#elif defined(EXPERIMENT_WAV192)
     if(cls!=flac&&!wav192::isParser(cls))return false;
 #else
     if(cls!=flac)return false;
@@ -40,7 +46,13 @@ static bool knownCaller(void* returnAddress){HMODULE m=nullptr;if(!GetModuleHand
 static bool isNativeSupported24(IUnknown* self){
     IBaseFilter* f=nullptr;if(FAILED(self->QueryInterface(IID_PPV_ARGS(&f))))return false;IEnumPins* pins=nullptr;bool found=false;if(SUCCEEDED(f->EnumPins(&pins))){IPin* p=nullptr;while(pins->Next(1,&p,nullptr)==S_OK){PIN_DIRECTION direction;p->QueryDirection(&direction);IEnumMediaTypes* types=nullptr;if(direction==PINDIR_OUTPUT&&SUCCEEDED(p->EnumMediaTypes(&types))){AM_MEDIA_TYPE* mt=nullptr;if(types->Next(1,&mt,nullptr)==S_OK){if(mt->majortype==MEDIATYPE_Audio&&mt->subtype==MEDIASUBTYPE_PCM&&mt->formattype==FORMAT_WaveFormatEx&&mt->cbFormat>=16&&mt->pbFormat){WAVEFORMATEX wave{};memcpy(&wave,mt->pbFormat,min(size_t(mt->cbFormat),sizeof(wave)));found=supportedFlacRate(wave.nSamplesPerSec)&&wave.wBitsPerSample==24&&wave.nChannels==2;}if(mt->cbFormat)CoTaskMemFree(mt->pbFormat);if(mt->pUnk)mt->pUnk->Release();CoTaskMemFree(mt);}types->Release();}p->Release();if(found)break;}pins->Release();}f->Release();return found;
 }
+#ifdef EXPERIMENT_DSEE_UNIFIED
+static bool supportedOutputRate(DWORD rate){
+    return rate==44100||rate==48000||rate==88200||rate==96000||rate==176400||rate==192000;
+}
+#else
 static bool supportedOutputRate(DWORD rate){return supportedFlacRate(rate);}
+#endif
 using Run=HRESULT(STDMETHODCALLTYPE*)(IMediaControl*);
 using FilterRun=HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*,REFERENCE_TIME);
 static Run originalRun=nullptr;static FilterRun originalFilterRun=nullptr;
@@ -50,6 +62,9 @@ static void updateStatus(IUnknown* object,HRESULT result);
 #endif
 #ifdef EXPERIMENT_EOS_TRANSITION
 #include "eos_transition_hooks.inl"
+#endif
+#ifdef EXPERIMENT_DSEE_UNIFIED
+#include "dsee_unified_hooks.inl"
 #endif
 static HRESULT STDMETHODCALLTYPE setterHook(IUnknown* self,DWORD value){
     auto caller=_ReturnAddress();
@@ -84,6 +99,9 @@ static HRESULT STDMETHODCALLTYPE runHook(IMediaControl* self){
 #ifdef EXPERIMENT_WAV192
     WavScope scope;if(scope.outer){auto check=prepareWav(self);if(FAILED(check))return check;}
 #endif
+#ifdef EXPERIMENT_DSEE_UNIFIED
+    dseeUnified::DseeScope dseeScope;if(dseeScope.outer){dseeUnified::prepareDseeGraph(self);}
+#endif
 #ifdef EXPERIMENT_EOS_TRANSITION
     HRESULT deferHr = S_OK;
     if (handleEosControlRun(self, _ReturnAddress(), &deferHr)) {
@@ -96,6 +114,9 @@ static HRESULT STDMETHODCALLTYPE runHook(IMediaControl* self){
 static HRESULT STDMETHODCALLTYPE filterRunHook(IMediaFilter* self,REFERENCE_TIME time){
 #ifdef EXPERIMENT_WAV192
     WavScope scope;if(scope.outer){auto check=prepareWav(self);if(FAILED(check))return check;}
+#endif
+#ifdef EXPERIMENT_DSEE_UNIFIED
+    dseeUnified::DseeScope dseeScope;if(dseeScope.outer){dseeUnified::prepareDseeGraph(self);}
 #endif
 #ifdef EXPERIMENT_EOS_TRANSITION
     onEosFilterRun(self, _ReturnAddress(), time);
@@ -122,6 +143,9 @@ static DWORD WINAPI start(void*){
     if(source){auto v=*reinterpret_cast<void***>(source);auto base=reinterpret_cast<ULONG_PTR>(module);auto dos=reinterpret_cast<IMAGE_DOS_HEADER*>(module);auto nt=reinterpret_cast<IMAGE_NT_HEADERS*>(base+dos->e_lfanew);bool known=nt->FileHeader.TimeDateStamp==0x63EB12C3&&reinterpret_cast<ULONG_PTR>(v[7])-base==0x1860;if(known&&MH_Initialize()==MH_OK){auto status=MH_CreateHook(v[7],reinterpret_cast<void*>(setterHook),reinterpret_cast<void**>(&original));record("CREATE_HOOK",0,0,HRESULT(status));bool ready=status==MH_OK&&setupRunHooks();
 #ifdef EXPERIMENT_WAV192
 ready=ready&&setupDseeHook();
+#endif
+#ifdef EXPERIMENT_DSEE_UNIFIED
+ready=ready&&dseeUnified::setupDseeUnifiedHook();
 #endif
 if(ready){HMODULE pinned=nullptr;GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(v[7]),&pinned);status=MH_EnableHook(MH_ALL_HOOKS);}else status=MH_ERROR_NOT_CREATED;hr=status==MH_OK?S_OK:E_FAIL;}else hr=E_NOINTERFACE;source->Release();}
     if(SUCCEEDED(co))CoUninitialize();record(SUCCEEDED(hr)?"READY":"FAILED",0,0,hr);bridgeStatus::state.store(SUCCEEDED(hr)?bridgeStatus::State::Ready:bridgeStatus::State::Off);startup.complete(SUCCEEDED(hr));bridgeStatus::runUi(ownModule);return SUCCEEDED(hr)?0:2;
