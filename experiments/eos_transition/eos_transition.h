@@ -77,7 +77,21 @@ struct GraphState {
     uint32_t seamlessTransitionCount = 0;
     ResetReason lastResetReason = ResetReason::NewSegment;
 
-    bool isPauseDeferralActive() const { return pauseDeferralStatus == PauseDeferralStatus::Active; }
+    struct DeferredSeekParams {
+        bool valid = false;
+        LONGLONG current = 0;
+        DWORD currentFlags = 0;
+        LONGLONG stop = 0;
+        DWORD stopFlags = 0;
+    };
+
+    bool virtualPauseActive = false;
+    DeferredSeekParams deferredSeek;
+    bool deferredDsStop = false;
+    bool deferredGraphStop = false;
+
+    bool isVirtualPauseActive() const { return virtualPauseActive; }
+    bool isPauseDeferralActive() const { return virtualPauseActive || pauseDeferralStatus == PauseDeferralStatus::Active; }
     bool isCancelled() const {
         return pauseDeferralStatus == PauseDeferralStatus::CancelledStop ||
                pauseDeferralStatus == PauseDeferralStatus::CancelledSeek ||
@@ -334,9 +348,87 @@ public:
     void cancelFormatChangePause(void* graphKey, PauseDeferralStatus status) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
+        s.virtualPauseActive = false;
+        s.formatChangePauseDeferred = false;
+        s.pauseDeferralStatus = status;
+        s.deferredSeek = GraphState::DeferredSeekParams{};
+        s.deferredDsStop = false;
+        s.deferredGraphStop = false;
+        s.eosPending = false;
+    }
+
+    void markVirtualPauseActive(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.virtualPauseActive = true;
+        s.formatChangePauseDeferred = true;
+        s.pauseDeferralStatus = PauseDeferralStatus::Active;
+        s.deferredSeek = GraphState::DeferredSeekParams{};
+        s.deferredDsStop = false;
+        s.deferredGraphStop = false;
+    }
+
+    bool isVirtualPauseActive(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->virtualPauseActive : false;
+    }
+
+    bool hasAnyVirtualPauseActive() const {
+        for (const auto& kv : graphs_) {
+            if (kv.second.virtualPauseActive) return true;
+        }
+        return false;
+    }
+
+    void deferAutomaticSeek(void* graphKey, LONGLONG current, DWORD currentFlags, LONGLONG stop, DWORD stopFlags) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.deferredSeek.valid = true;
+        s.deferredSeek.current = current;
+        s.deferredSeek.currentFlags = currentFlags;
+        s.deferredSeek.stop = stop;
+        s.deferredSeek.stopFlags = stopFlags;
+    }
+
+    bool hasDeferredSeek(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->deferredSeek.valid : false;
+    }
+
+    bool popDeferredSeek(void* graphKey, GraphState::DeferredSeekParams& outSeek) {
+        if (!graphKey) return false;
+        auto& s = ensureGraph(graphKey);
+        if (!s.deferredSeek.valid) return false;
+        outSeek = s.deferredSeek;
+        s.deferredSeek = GraphState::DeferredSeekParams{};
+        return true;
+    }
+
+    void onVirtualPauseCompleted(void* graphKey, PauseDeferralStatus status = PauseDeferralStatus::CompletedDrain) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.virtualPauseActive = false;
+        s.formatChangePauseCompleted = true;
         s.formatChangePauseDeferred = false;
         s.pauseDeferralStatus = status;
         s.eosPending = false;
+    }
+
+    void cancelVirtualPause(void* graphKey, PauseDeferralStatus status) {
+        cancelFormatChangePause(graphKey, status);
+    }
+
+    void clearDeferredActions(void* graphKey) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.deferredSeek = GraphState::DeferredSeekParams{};
+        s.deferredDsStop = false;
+        s.deferredGraphStop = false;
+    }
+
+    bool isCancelled(void* graphKey) const {
+        const auto* s = findGraph(graphKey);
+        return s ? s->isCancelled() : false;
     }
 
     void markFormatChangeStopDeferred(void* graphKey) {
@@ -442,6 +534,10 @@ private:
         s.formatChangeStopDeferred = false;
         s.formatChangeCompleted = false;
         s.preReadDecision = PreReadDecision::Unknown;
+        s.virtualPauseActive = false;
+        s.deferredSeek = GraphState::DeferredSeekParams{};
+        s.deferredDsStop = false;
+        s.deferredGraphStop = false;
         s.eosPending = false;
         s.eosDelivered = false;
         s.lastResetReason = reason;

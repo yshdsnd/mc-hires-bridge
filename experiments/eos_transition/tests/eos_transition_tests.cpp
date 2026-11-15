@@ -32,6 +32,7 @@ void check(bool cond, const char* expr, int line) {
 #define CHECK(expr) check((expr), #expr, __LINE__)
 
 #include "conflict_entry_point_tests.h"
+#include "async_transition_tests.h"
 
 // Test 1: Arbitrary durations and seek offsets (no fixed 23s threshold)
 void testArbitraryDurationsAndOffsets() {
@@ -2123,9 +2124,12 @@ int main() {
     // Issue #30 Control Entry Point Conflict Verification Tests
     conflictTests::runAllConflictEntryPointTests();
 
+    // Issue #33 Non-blocking Virtual Pause & Deferral Tests
+    asyncTests::runAllAsyncTransitionTests();
+
     if (SUCCEEDED(co)) CoUninitialize();
     if (g_failures == 0) {
-        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 / #28 / #30 EOS TRANSITION TESTS PASSED ===\n");
+        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 / #28 / #30 / #33 EOS TRANSITION TESTS PASSED ===\n");
         return 0;
     }
     std::printf("=== %d TEST ASSERTION(S) FAILED ===\n", g_failures);

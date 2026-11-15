@@ -31,6 +31,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
   target_include_directories(flac24_pause_diagnostic PRIVATE "${PROJECT_SOURCE_DIR}/src/common" eos_transition)
   target_link_libraries(flac24_pause_diagnostic PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32 dsound dxguid)
   target_compile_definitions(flac24_pause_diagnostic PRIVATE UNICODE _UNICODE EXPERIMENT_EOS_TRANSITION EXPERIMENT_PAUSE_DIAGNOSTICS)
+  # Target for Issue #33 non-blocking virtual pause prototype
+  add_library(flac24_async_experiment SHARED "${PROJECT_SOURCE_DIR}/src/bridge/flac24_override.cpp")
+  target_include_directories(flac24_async_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" eos_transition)
+  target_link_libraries(flac24_async_experiment PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32 dsound dxguid)
+  target_compile_definitions(flac24_async_experiment PRIVATE UNICODE _UNICODE EXPERIMENT_EOS_TRANSITION EXPERIMENT_ASYNC_VIRTUAL_PAUSE EXPERIMENT_PAUSE_DIAGNOSTICS)
   # Reuse the production FLAC implementation; WAV hooks are compiled only here.
   add_library(flac24_wav192_experiment SHARED EXCLUDE_FROM_ALL "${PROJECT_SOURCE_DIR}/src/bridge/flac24_override.cpp")
   target_include_directories(flac24_wav192_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" wav192)
