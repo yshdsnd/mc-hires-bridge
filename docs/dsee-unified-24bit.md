@@ -496,8 +496,3 @@ The table below details the exact audio routing and filter behavior across all s
 | **Live Sony Filter Pin Acceptance** | Headless (Music Center 2.7.4 installation) | Covered (Test 7.5: DirectSoundRender accepts 44.1k/48k/88.2k/96k/176.4k/192k at 16/24-bit). |
 | **Acoustic Real-Device Playback (Listening)** | Real Machine (Codex / Live Hardware) | **Handed over to Codex**: Audible playback confirmation across AAC, MP3, ALAC tracks in Music Center 2.7.4 GUI. |
 | **Production DLL Integration** | Repository Main / Release | **Deferred**: Merged into production build only after Issue #21 real-machine listening confirmation is complete. |
-
-
-
-
-
