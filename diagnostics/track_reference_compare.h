@@ -372,6 +372,103 @@ inline void findTemplatePeaks(
     }
 }
 
+// Computes best Pearson correlation in a small window around target offset
+inline double findBestPcc(
+    const std::vector<float>& signal,
+    size_t targetOffset,
+    size_t jitterFrames,
+    const std::vector<float>& tpl,
+    double tplMean,
+    double tplStdDev) {
+
+    if (tpl.empty()) return 0.0;
+    const size_t M = tpl.size();
+    if (signal.size() < M) return 0.0;
+
+    const size_t start = (targetOffset > jitterFrames) ? (targetOffset - jitterFrames) : 0;
+    const size_t end = std::min(signal.size() - M, targetOffset + jitterFrames);
+    if (start > end) return 0.0;
+
+    double bestScore = -1.0;
+    for (size_t pos = start; pos <= end; ++pos) {
+        double score = computePccAt(signal, pos, tpl, tplMean, tplStdDev);
+        if (score > bestScore) bestScore = score;
+    }
+    return bestScore;
+}
+
+struct ProbeDef {
+    double offsetMs;
+    double durationMs;
+};
+
+// Verifies whether loopback signal following candidatePos continues along R2 across multi-stage probes
+inline bool verifyContinuation(
+    const std::vector<float>& sig,
+    size_t candidatePos,
+    const std::vector<float>& r2,
+    size_t r2Start,
+    uint32_t rate,
+    double threshold,
+    size_t& outMatchedProbes,
+    size_t& outTotalProbes,
+    double& outAvgScore) {
+
+    // Multi-stage probe checkpoints along Track 2 (150ms, 300ms, 600ms, 1000ms, 1400ms)
+    const ProbeDef probes[] = {
+        { 150.0, 100.0 },
+        { 300.0, 100.0 },
+        { 600.0, 150.0 },
+        { 1000.0, 200.0 },
+        { 1400.0, 200.0 }
+    };
+
+    outMatchedProbes = 0;
+    outTotalProbes = 0;
+    outAvgScore = 0.0;
+    double totalScoreSum = 0.0;
+
+    const size_t jitterFrames = static_cast<size_t>(5.0 * rate / 1000.0);
+
+    for (const auto& pr : probes) {
+        const size_t offsetFrames = static_cast<size_t>(pr.offsetMs * rate / 1000.0);
+        const size_t durFrames = static_cast<size_t>(pr.durationMs * rate / 1000.0);
+
+        if (r2Start + offsetFrames + durFrames > r2.size() ||
+            candidatePos + offsetFrames + durFrames > sig.size()) {
+            continue;
+        }
+
+        const size_t tplStart = r2Start + offsetFrames;
+        if (tplStart + durFrames > r2.size()) continue;
+
+        std::vector<float> probeTpl(durFrames);
+        std::memcpy(probeTpl.data(), r2.data() + tplStart, durFrames * sizeof(float));
+
+        double sumP = 0.0, sumP2 = 0.0;
+        for (float v : probeTpl) { sumP += v; sumP2 += v * v; }
+        const double meanP = sumP / static_cast<double>(durFrames);
+        const double varP = (sumP2 / static_cast<double>(durFrames)) - (meanP * meanP);
+        if (varP <= 1e-12) continue;
+        const double stdDevP = std::sqrt(varP);
+
+        outTotalProbes++;
+        double bestPcc = findBestPcc(sig, candidatePos + offsetFrames, jitterFrames, probeTpl, meanP, stdDevP);
+        totalScoreSum += std::max(0.0, bestPcc);
+
+        if (bestPcc >= threshold) {
+            outMatchedProbes++;
+        }
+    }
+
+    if (outTotalProbes == 0) return false;
+    outAvgScore = totalScoreSum / static_cast<double>(outTotalProbes);
+
+    if (outTotalProbes == 1) return (outMatchedProbes == 1 && outAvgScore >= threshold);
+    if (outTotalProbes == 2) return (outMatchedProbes == 2 && outAvgScore >= (threshold - 0.05));
+    return (outMatchedProbes * 4 >= outTotalProbes * 3) && (outAvgScore >= (threshold - 0.05));
+}
+
 // Extracts active audio template (skipping any initial silence in reference)
 inline std::vector<float> extractTemplate(
     const std::vector<float>& src,
@@ -503,7 +600,7 @@ inline MatchResult evaluateLoopback(
         res.tailComplete = (res.missingTailMs <= cfg.tailToleranceMs);
     }
 
-    // 3. Evaluate Next Track (Track 2) Cue Occurrences & Duplicate Start
+    // 3. Evaluate Next Track (Track 2) Cue Occurrences & Trajectory Verification
     // Find active start of ref2 (skip initial zero-padding if any)
     size_t ref2ActiveStart = 0;
     while (ref2ActiveStart < r2.size() && std::abs(r2[ref2ActiveStart]) < 0.001f) {
@@ -511,19 +608,165 @@ inline MatchResult evaluateLoopback(
     }
     const std::vector<float> t2Head = extractTemplate(r2, ref2ActiveStart, headTplFrames);
 
-    // Search for Track 2 start after Track 1 tail
+    // Search for Track 2 start candidates after Track 1 tail
     const size_t t2SearchStart = (res.track1MatchedEndMs > 100.0)
                                      ? static_cast<size_t>((res.track1MatchedEndMs - 100.0) * cfg.analysisRate / 1000.0)
                                      : t1StartInLoop;
     const size_t t2SearchEnd = sig.size();
 
-    std::vector<size_t> t2Peaks;
-    std::vector<double> t2Scores;
-    findTemplatePeaks(sig, t2SearchStart, t2SearchEnd, t2Head, cfg.correlationThreshold, minSepFrames, t2Peaks, t2Scores);
+    std::vector<size_t> candidatePeaks;
+    std::vector<double> candidateScores;
+    findTemplatePeaks(sig, t2SearchStart, t2SearchEnd, t2Head, cfg.correlationThreshold, minSepFrames, candidatePeaks, candidateScores);
 
-    res.nextTrackCueCount = static_cast<uint32_t>(t2Peaks.size());
-    for (size_t p : t2Peaks) {
-        res.nextTrackCueTimestampsMs.push_back(static_cast<double>(p) * 1000.0 / cfg.analysisRate);
+    if (candidatePeaks.empty()) {
+        res.nextTrackCueCount = 0;
+        if (sig.size() <= t2SearchStart + headTplFrames) {
+            res.verdict = "PENDING";
+            res.notes = "Insufficient loopback duration after Track 1 to detect next track onset (判定保留)";
+        } else {
+            res.verdict = "FAIL";
+            res.notes = "Next track start not detected";
+        }
+        return res;
+    }
+
+    // Identify the continuous playback anchor (p_cont) via multi-stage continuation probes along Track 2
+    size_t bestContIdx = static_cast<size_t>(-1);
+    double bestContScore = -1.0;
+    size_t maxTestedProbes = 0;
+
+    for (size_t i = 0; i < candidatePeaks.size(); ++i) {
+        const size_t p = candidatePeaks[i];
+        size_t matched = 0, total = 0;
+        double avgScore = 0.0;
+        bool verified = verifyContinuation(sig, p, r2, ref2ActiveStart, cfg.analysisRate, cfg.correlationThreshold, matched, total, avgScore);
+        if (total > maxTestedProbes) maxTestedProbes = total;
+        if (verified && avgScore > bestContScore) {
+            bestContScore = avgScore;
+            bestContIdx = i;
+        }
+    }
+
+    if (bestContIdx == static_cast<size_t>(-1)) {
+        // No candidate confirmed as continuous playback.
+        // Check whether this is due to insufficient recording length (evidence shortage -> PENDING / 判定保留)
+        const size_t requiredContFrames = static_cast<size_t>(250.0 * cfg.analysisRate / 1000.0);
+        if (maxTestedProbes == 0 || (sig.size() - candidatePeaks[0] < requiredContFrames)) {
+            res.verdict = "PENDING";
+            res.notes = "Insufficient loopback duration after next track onset to confirm continuous playback trajectory (判定保留)";
+            return res;
+        }
+        res.nextTrackCueCount = static_cast<uint32_t>(candidatePeaks.size());
+        for (size_t p : candidatePeaks) {
+            const size_t cueStart = (p >= ref2ActiveStart) ? (p - ref2ActiveStart) : 0;
+            res.nextTrackCueTimestampsMs.push_back(static_cast<double>(cueStart) * 1000.0 / cfg.analysisRate);
+        }
+        res.verdict = "FAIL";
+        res.notes = "Next track onset detected but playback discontinued without continuous trajectory";
+        return res;
+    }
+
+    const size_t p_cont = candidatePeaks[bestContIdx];
+    res.maxConfidence = std::max(res.maxConfidence, bestContScore);
+
+    // Differentiate between:
+    // (a) Ongoing similar fragments / repeating rhythm motifs (通常再生中の似た断片) -> part of continuous trajectory, not cues
+    // (b) True short restart / duplicate cueing (真の短い再スタート) -> aborted prior cues or subsequent restarts
+    std::vector<size_t> finalCues;
+    const size_t jitterFrames = static_cast<size_t>(5.0 * cfg.analysisRate / 1000.0);
+
+    for (size_t i = 0; i < candidatePeaks.size(); ++i) {
+        const size_t p = candidatePeaks[i];
+
+        if (p == p_cont) {
+            finalCues.push_back(p);
+            continue;
+        }
+
+        if (p > p_cont) {
+            // Candidate occurs AFTER confirmed continuous start.
+            // Check if loopback at p is explained by ongoing continuous playback trajectory from p_cont:
+            const size_t offsetFromCont = p - p_cont;
+            if (ref2ActiveStart + offsetFromCont + headTplFrames <= r2.size()) {
+                std::vector<float> trajTpl = extractTemplate(r2, ref2ActiveStart + offsetFromCont, headTplFrames);
+                double sumT = 0.0, sumT2 = 0.0;
+                for (float v : trajTpl) { sumT += v; sumT2 += v * v; }
+                const double meanT = sumT / static_cast<double>(headTplFrames);
+                const double varT = (sumT2 / static_cast<double>(headTplFrames)) - (meanT * meanT);
+                double trajPcc = 0.0;
+                if (varT > 1e-12) {
+                    const double stdDevT = std::sqrt(varT);
+                    trajPcc = findBestPcc(sig, p, jitterFrames, trajTpl, meanT, stdDevT);
+                }
+
+                size_t matched = 0, total = 0;
+                double avgScore = 0.0;
+                bool restartsFromZero = verifyContinuation(sig, p, r2, ref2ActiveStart, cfg.analysisRate, cfg.correlationThreshold, matched, total, avgScore);
+
+                if (trajPcc >= (cfg.correlationThreshold - 0.15) && !restartsFromZero) {
+                    // Confirmed as ongoing similar fragment / repeating beat along trajectory (not a restart)
+                    continue;
+                }
+
+                if (restartsFromZero && trajPcc < 0.50) {
+                    // True subsequent restart from 0
+                    finalCues.push_back(p);
+                    continue;
+                }
+            }
+
+            // Fallback: if it verifies continuation from 0 and does not match ongoing trajectory
+            size_t matched = 0, total = 0;
+            double avgScore = 0.0;
+            if (verifyContinuation(sig, p, r2, ref2ActiveStart, cfg.analysisRate, cfg.correlationThreshold, matched, total, avgScore)) {
+                finalCues.push_back(p);
+            }
+        } else {
+            // Candidate occurs BEFORE confirmed continuous start (p < p_cont).
+            // Check if this is an aborted prior cue (真の短い再スタート):
+            if (p_cont - p < minSepFrames) {
+                // Within separation window of p_cont, considered part of same transient
+                continue;
+            }
+
+            // Check multi-interval consistency of head template (複数区間の連続した整合):
+            // Divide head into two sequential halves [0..50ms] and [50..100ms]
+            const size_t halfFrames = headTplFrames / 2;
+            if (ref2ActiveStart + headTplFrames <= r2.size()) {
+                std::vector<float> head1 = extractTemplate(r2, ref2ActiveStart, halfFrames);
+                std::vector<float> head2 = extractTemplate(r2, ref2ActiveStart + halfFrames, halfFrames);
+
+                double mean1 = 0.0, var1 = 0.0;
+                for (float v : head1) mean1 += v;
+                mean1 /= static_cast<double>(halfFrames);
+                for (float v : head1) var1 += (v - mean1) * (v - mean1);
+                var1 /= static_cast<double>(halfFrames);
+                double stdDev1 = (var1 > 1e-12) ? std::sqrt(var1) : 0.0;
+
+                double mean2 = 0.0, var2 = 0.0;
+                for (float v : head2) mean2 += v;
+                mean2 /= static_cast<double>(halfFrames);
+                for (float v : head2) var2 += (v - mean2) * (v - mean2);
+                var2 /= static_cast<double>(halfFrames);
+                double stdDev2 = (var2 > 1e-12) ? std::sqrt(var2) : 0.0;
+
+                double pcc1 = (stdDev1 > 0.0) ? findBestPcc(sig, p, jitterFrames, head1, mean1, stdDev1) : 0.0;
+                double pcc2 = (stdDev2 > 0.0) ? findBestPcc(sig, p + halfFrames, jitterFrames, head2, mean2, stdDev2) : 0.0;
+
+                if (pcc1 >= 0.50 && pcc2 >= 0.50 && ((pcc1 + pcc2) * 0.5) >= (cfg.correlationThreshold - 0.05)) {
+                    // Confirmed genuine aborted prior cue
+                    finalCues.push_back(p);
+                }
+            }
+        }
+    }
+
+    std::sort(finalCues.begin(), finalCues.end());
+    res.nextTrackCueCount = static_cast<uint32_t>(finalCues.size());
+    res.nextTrackCueTimestampsMs.clear();
+    for (size_t p : finalCues) {
+        const size_t cueStart = (p >= ref2ActiveStart) ? (p - ref2ActiveStart) : 0;
+        res.nextTrackCueTimestampsMs.push_back(static_cast<double>(cueStart) * 1000.0 / cfg.analysisRate);
     }
 
     // 4. Formulate Verdict
@@ -580,9 +823,17 @@ inline trackRegression::Record toRegressionRecord(
     return r;
 }
 
-// Synthesizes a test reference waveform with dynamic frequency modulation (chirp)
-// This guarantees a single, sharp autocorrelation peak without periodic ambiguity.
-inline AudioBuffer synthesizeReferenceTrack(uint32_t rate, double durationSec, double baseFreq, double modRate, bool antiPhase = false) {
+// Synthesizes a test reference waveform with dynamic frequency modulation (chirp).
+// Optionally embeds recurring rhythm transient motifs (e.g. at 0ms, 120ms, 160ms, 1000ms)
+// to verify trajectory continuity vs false cue rejection under realistic musical structures.
+inline AudioBuffer synthesizeReferenceTrack(
+    uint32_t rate,
+    double durationSec,
+    double baseFreq,
+    double modRate,
+    bool antiPhase = false,
+    bool addRepeatingMotifs = false) {
+
     AudioBuffer b;
     b.sampleRate = rate;
     b.channels = 2;
@@ -591,10 +842,25 @@ inline AudioBuffer synthesizeReferenceTrack(uint32_t rate, double durationSec, d
 
     for (size_t i = 0; i < frames; ++i) {
         const double t = static_cast<double>(i) / static_cast<double>(rate);
-        // Frequency sweep ensures sharp, unique cross-correlation peak
         const double chirpFreq = baseFreq + 400.0 * (t / durationSec);
-        const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                            0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
+        double wave = 0.60 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
+                      0.20 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
+
+        if (addRepeatingMotifs) {
+            // Embed recurring rhythm transient motifs at 0ms, 120ms, 160ms, 1000ms
+            auto addPulse = [&](double pulseStartSec) {
+                if (t >= pulseStartSec && t < pulseStartSec + 0.050) {
+                    const double pt = t - pulseStartSec;
+                    const double env = std::exp(-pt / 0.012);
+                    wave += 0.50 * env * std::sin(2.0 * 3.14159265358979323846 * 880.0 * pt);
+                }
+            };
+            addPulse(0.0);
+            addPulse(0.120);
+            addPulse(0.160);
+            addPulse(1.000);
+        }
+
         const float left = static_cast<float>(wave * 0.40);
         const float right = antiPhase ? -left : left;
         b.samples[i * 2] = left;
@@ -603,140 +869,76 @@ inline AudioBuffer synthesizeReferenceTrack(uint32_t rate, double durationSec, d
     return b;
 }
 
-// Appends reference-based synthetic test cases to regression suite (TC-4.1 to TC-4.4)
+// Appends reference-based synthetic test cases to regression suite (TC-4.1 to TC-4.6)
 inline void appendSyntheticReferenceTests(std::vector<trackRegression::Record>& suite) {
     // Generate reference tracks:
     // Ref 1: 44.1 kHz / 16-bit representation (3.0s, base 997 Hz chirp)
     AudioBuffer ref1 = synthesizeReferenceTrack(44100, 3.0, 997.0, 1.0, false);
-    // Ref 2: 48.0 kHz / 24-bit representation (2.0s, base 1750 Hz chirp, antiPhase)
-    AudioBuffer ref2 = synthesizeReferenceTrack(48000, 2.0, 1750.0, 1.0, true);
+    // Ref 2: 48.0 kHz / 24-bit representation (2.0s, base 1750 Hz chirp, antiPhase, with repeating rhythm motifs)
+    AudioBuffer ref2 = synthesizeReferenceTrack(48000, 2.0, 1750.0, 1.0, true, true);
 
     const uint32_t loopRate = 192000;
     const size_t leadSilenceFrames = loopRate / 5; // 200 ms leading silence
     const size_t gapSilenceFrames = loopRate / 20;  // 50 ms gap
 
-    // --- TC-4.1: Normal Transition (正常) ---
-    // Loopback: [200ms silence] + [Ref1 full (3.0s)] + [50ms silence] + [Ref2 single start (1.5s)]
+    AudioBuffer ref1_192 = synthesizeReferenceTrack(loopRate, 3.0, 997.0, 1.0, false);
+    AudioBuffer ref2_192 = synthesizeReferenceTrack(loopRate, 2.0, 1750.0, 1.0, true, true);
+
+    auto appendSamples = [](AudioBuffer& dst, const AudioBuffer& src, size_t maxFrames) {
+        size_t frames = std::min(maxFrames, src.frameCount());
+        dst.samples.insert(dst.samples.end(), src.samples.begin(), src.samples.begin() + frames * 2);
+    };
+
+    // --- TC-4.1: Normal Transition with Repeating Motifs (通常再生中の似た断片) ---
+    // Loopback: [200ms silence] + [Ref1 full (3.0s)] + [50ms silence] + [Ref2 continuous (1.5s)]
+    // Evaluates that ongoing peaks at +120ms, +160ms, +1000ms are confirmed as continuous trajectory (1 cue)
     {
         AudioBuffer loop;
         loop.sampleRate = loopRate;
         loop.channels = 2;
         loop.samples.resize(leadSilenceFrames * 2, 0.0f);
-
-        const size_t t1Frames192 = static_cast<size_t>(3.0 * loopRate);
-        for (size_t i = 0; i < t1Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 997.0 + 400.0 * (t / 3.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(val);
-        }
-
-        for (size_t i = 0; i < gapSilenceFrames * 2; ++i) loop.samples.push_back(0.0f);
-
-        const size_t t2Frames192 = static_cast<size_t>(1.5 * loopRate);
-        for (size_t i = 0; i < t2Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
 
         MatchResult m = evaluateLoopback(loop, ref1, ref2);
-        suite.push_back(toRegressionRecord("TC-4.1", "4. Ref-Based Normal", "44.1k/16b -> 48k/24b", m));
+        suite.push_back(toRegressionRecord("TC-4.1", "4. Ref-Based Normal (Motifs)", "44.1k/16b -> 48k/24b", m));
     }
 
-    // --- TC-4.2: Tail Truncation (~300ms tail missing) ---
-    // Loopback: [200ms silence] + [Ref1 cut to 2.7s] + [50ms silence] + [Ref2 single start (1.5s)]
+    // --- TC-4.2: Tail Truncation with Repeating Motifs (~300ms tail missing) ---
+    // Loopback: [200ms silence] + [Ref1 cut to 2.7s] + [50ms silence] + [Ref2 continuous (1.5s)]
+    // Evaluates that tail truncation is isolated and repeating motifs do not generate false duplicate cues
     {
         AudioBuffer loop;
         loop.sampleRate = loopRate;
         loop.channels = 2;
         loop.samples.resize(leadSilenceFrames * 2, 0.0f);
-
-        const size_t t1CutFrames192 = static_cast<size_t>(2.7 * loopRate); // 300 ms truncated
-        for (size_t i = 0; i < t1CutFrames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 997.0 + 400.0 * (t / 3.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(val);
-        }
-
-        for (size_t i = 0; i < gapSilenceFrames * 2; ++i) loop.samples.push_back(0.0f);
-
-        const size_t t2Frames192 = static_cast<size_t>(1.5 * loopRate);
-        for (size_t i = 0; i < t2Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
+        appendSamples(loop, ref1_192, static_cast<size_t>(2.7 * loopRate));
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
 
         MatchResult m = evaluateLoopback(loop, ref1, ref2);
-        suite.push_back(toRegressionRecord("TC-4.2", "4. Ref-Based Cutoff", "44.1k/16b -> 48k/24b", m));
+        suite.push_back(toRegressionRecord("TC-4.2", "4. Ref-Based Cutoff (Motifs)", "44.1k/16b -> 48k/24b", m));
     }
 
-    // --- TC-4.3: Duplicate Start / Cueing (二重頭出し) ---
+    // --- TC-4.3: True Short Restart / Duplicate Cueing (真の短い再スタート) ---
     // Loopback: [200ms silence] + [Ref1 full (3.0s)] + [50ms silence] + [Ref2 start 120ms] + [Ref2 restarts from 0 and plays 1.5s]
+    // Evaluates that aborted initial cue at T0 and continuous start at T1 are correctly detected (2 cues)
     {
         AudioBuffer loop;
         loop.sampleRate = loopRate;
         loop.channels = 2;
         loop.samples.resize(leadSilenceFrames * 2, 0.0f);
-
-        const size_t t1Frames192 = static_cast<size_t>(3.0 * loopRate);
-        for (size_t i = 0; i < t1Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 997.0 + 400.0 * (t / 3.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(val);
-        }
-
-        for (size_t i = 0; i < gapSilenceFrames * 2; ++i) loop.samples.push_back(0.0f);
-
-        // First cue of Ref2: plays for 120 ms
-        const size_t firstCueFrames = static_cast<size_t>(0.12 * loopRate);
-        for (size_t i = 0; i < firstCueFrames; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
-
-        // Second cue of Ref2: restarted from beginning, plays for 1.5s
-        const size_t t2Frames192 = static_cast<size_t>(1.5 * loopRate);
-        for (size_t i = 0; i < t2Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(0.12 * loopRate)); // First aborted cue: 120ms
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));  // Second restarted cue: 1.5s
 
         MatchResult m = evaluateLoopback(loop, ref1, ref2);
         suite.push_back(toRegressionRecord("TC-4.3", "4. Ref-Based Double Cue", "44.1k/16b -> 48k/24b", m));
     }
 
-    // --- TC-4.4: Loopback Discontinuity / Low Confidence -> PENDING (判定保留) ---
+    // --- TC-4.4: Loopback Discontinuity -> PENDING (判定保留) ---
     {
         AudioBuffer loop;
         loop.sampleRate = loopRate;
@@ -744,17 +946,48 @@ inline void appendSyntheticReferenceTests(std::vector<trackRegression::Record>& 
         loop.samples.resize(leadSilenceFrames * 2, 0.0f);
 
         MatchConfig cfg;
-        cfg.forcePending = true; // Simulating discontinuity flag
+        cfg.forcePending = true;
 
         MatchResult m = evaluateLoopback(loop, ref1, ref2, cfg);
         suite.push_back(toRegressionRecord("TC-4.4", "4. Ref-Based Discontinuity", "44.1k/16b -> 48k/24b", m));
+    }
+
+    // --- TC-4.5: Cross-Format Pair of Same Song (同じ楽曲の異形式ペア) ---
+    // Ref 1: 44.1k/16b representation; Ref 2: 48k/24b representation of the same musical piece
+    // Verifies that format/depth differences between reference WAV and 192k loopback do not induce false cues
+    {
+        AudioBuffer loop;
+        loop.sampleRate = loopRate;
+        loop.channels = 2;
+        loop.samples.resize(leadSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
+
+        MatchResult m = evaluateLoopback(loop, ref1, ref2);
+        suite.push_back(toRegressionRecord("TC-4.5", "4. Ref-Based Cross-Format", "44.1k/16b -> 48k/24b", m));
+    }
+
+    // --- TC-4.6: Insufficient Loopback Duration -> PENDING (判定保留) ---
+    // Loopback ends shortly (150ms) after Track 2 onset; onset is matched but trajectory cannot be confirmed
+    {
+        AudioBuffer loop;
+        loop.sampleRate = loopRate;
+        loop.channels = 2;
+        loop.samples.resize(leadSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(0.15 * loopRate)); // Truncated capture (only 150ms into T2)
+
+        MatchResult m = evaluateLoopback(loop, ref1, ref2);
+        suite.push_back(toRegressionRecord("TC-4.6", "4. Ref-Based Short Capture", "44.1k/16b -> 48k/24b", m));
     }
 }
 
 // Generates synthetic WAV and raw test fixtures on disk for offline/CLI validation
 inline bool generateFixtures(const std::string& dir) {
     AudioBuffer ref1 = synthesizeReferenceTrack(44100, 3.0, 997.0, 1.0, false);
-    AudioBuffer ref2 = synthesizeReferenceTrack(48000, 2.0, 1750.0, 1.0, true);
+    AudioBuffer ref2 = synthesizeReferenceTrack(48000, 2.0, 1750.0, 1.0, true, true);
 
     std::string ref1Path = dir + "/ref1_44k16b.wav";
     std::string ref2Path = dir + "/ref2_48k24b.wav";
@@ -765,33 +998,23 @@ inline bool generateFixtures(const std::string& dir) {
     const size_t leadSilenceFrames = loopRate / 5;
     const size_t gapSilenceFrames = loopRate / 20;
 
-    // Normal
+    AudioBuffer ref1_192 = synthesizeReferenceTrack(loopRate, 3.0, 997.0, 1.0, false);
+    AudioBuffer ref2_192 = synthesizeReferenceTrack(loopRate, 2.0, 1750.0, 1.0, true, true);
+
+    auto appendSamples = [](AudioBuffer& dst, const AudioBuffer& src, size_t maxFrames) {
+        size_t frames = std::min(maxFrames, src.frameCount());
+        dst.samples.insert(dst.samples.end(), src.samples.begin(), src.samples.begin() + frames * 2);
+    };
+
+    // Normal (with repeating motifs)
     {
         AudioBuffer loop;
         loop.sampleRate = loopRate;
         loop.channels = 2;
         loop.samples.resize(leadSilenceFrames * 2, 0.0f);
-        const size_t t1Frames192 = static_cast<size_t>(3.0 * loopRate);
-        for (size_t i = 0; i < t1Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 997.0 + 400.0 * (t / 3.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(val);
-        }
-        for (size_t i = 0; i < gapSilenceFrames * 2; ++i) loop.samples.push_back(0.0f);
-        const size_t t2Frames192 = static_cast<size_t>(1.5 * loopRate);
-        for (size_t i = 0; i < t2Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
         writeRawFloat32(dir + "/loopback_normal_192k.raw", loop);
     }
 
@@ -801,27 +1024,9 @@ inline bool generateFixtures(const std::string& dir) {
         loop.sampleRate = loopRate;
         loop.channels = 2;
         loop.samples.resize(leadSilenceFrames * 2, 0.0f);
-        const size_t t1CutFrames192 = static_cast<size_t>(2.7 * loopRate);
-        for (size_t i = 0; i < t1CutFrames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 997.0 + 400.0 * (t / 3.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(val);
-        }
-        for (size_t i = 0; i < gapSilenceFrames * 2; ++i) loop.samples.push_back(0.0f);
-        const size_t t2Frames192 = static_cast<size_t>(1.5 * loopRate);
-        for (size_t i = 0; i < t2Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
+        appendSamples(loop, ref1_192, static_cast<size_t>(2.7 * loopRate));
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
         writeRawFloat32(dir + "/loopback_cutoff_192k.raw", loop);
     }
 
@@ -831,37 +1036,10 @@ inline bool generateFixtures(const std::string& dir) {
         loop.sampleRate = loopRate;
         loop.channels = 2;
         loop.samples.resize(leadSilenceFrames * 2, 0.0f);
-        const size_t t1Frames192 = static_cast<size_t>(3.0 * loopRate);
-        for (size_t i = 0; i < t1Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 997.0 + 400.0 * (t / 3.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(val);
-        }
-        for (size_t i = 0; i < gapSilenceFrames * 2; ++i) loop.samples.push_back(0.0f);
-        const size_t firstCueFrames = static_cast<size_t>(0.12 * loopRate);
-        for (size_t i = 0; i < firstCueFrames; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
-        const size_t t2Frames192 = static_cast<size_t>(1.5 * loopRate);
-        for (size_t i = 0; i < t2Frames192; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(loopRate);
-            const double chirpFreq = 1750.0 + 400.0 * (t / 2.0);
-            const double wave = 0.70 * std::sin(2.0 * 3.14159265358979323846 * chirpFreq * t) +
-                                0.30 * std::sin(4.0 * 3.14159265358979323846 * chirpFreq * t);
-            const float val = static_cast<float>(wave * 0.40);
-            loop.samples.push_back(val);
-            loop.samples.push_back(-val);
-        }
+        appendSamples(loop, ref1_192, ref1_192.frameCount());
+        loop.samples.resize(loop.samples.size() + gapSilenceFrames * 2, 0.0f);
+        appendSamples(loop, ref2_192, static_cast<size_t>(0.12 * loopRate));
+        appendSamples(loop, ref2_192, static_cast<size_t>(1.5 * loopRate));
         writeRawFloat32(dir + "/loopback_doublecue_192k.raw", loop);
     }
 

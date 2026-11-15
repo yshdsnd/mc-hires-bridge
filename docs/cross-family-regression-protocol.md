@@ -201,10 +201,13 @@ This is the primary automated mode for evaluating 192kHz/stereo float32 raw loop
 - **Leading Silence Tolerance**: Automatically scans and correlates Track 1, tolerating arbitrary recording lead-in silence before playback begins.
 - **DSEE / Rate Conversion Invariance**: Resamples streams to a standard 24kHz baseband domain. Because DSEE HX operates primarily above 16kHz and Windows shared mixer performs linear/bandlimited resampling, normalized cross-correlation ($\rho \ge 0.65$) reliably matches baseband acoustic features without requiring bit-for-bit identity.
 - **Track 1 Tail Verification**: Identifies the exact matched end position of Track 1 and detects any truncation ($\Delta t > 50\text{ ms}$).
-- **Duplicate Cueing Detection (次曲二重頭出し判定)**: Scans the transition window for Track 2's opening signature (100ms template):
-  - Exactly 1 peak: Single start (**PASS**).
-  - 2 or more peaks: Duplicate cueing / restart detected (**FAIL**). Reports cue count and millisecond timestamps.
-  - 0 peaks or ambiguous correlation (< 0.50): Insufficient evidence (**PENDING / 判定保留**).
+- **Duplicate Cueing & Trajectory Continuity Detection (次曲二重頭出しと再生軌道追従判定, Issue #51)**:
+  Scans the transition window for Track 2 opening candidates (100ms head template) and validates playback trajectories across multiple time intervals:
+  - **Multi-Stage Trajectory Confirmation (複数区間の連続した整合)**: Confirms the continuous playback anchor ($p_{\text{cont}}$) via multi-stage continuation checkpoints (e.g., at 150ms, 300ms, 600ms, 1000ms, 1400ms).
+  - **Ongoing Similar Fragments Rejection (通常再生中の似た断片の除外)**: Peaks occurring after $p_{\text{cont}}$ (e.g. rhythm pulses or repeated chords at +118.9ms, +159.3ms, and later bars) are checked against the expected progression along $R_2$. If they follow the ongoing song trajectory and fail restart-from-zero continuation probes, they are confirmed as natural song progression and excluded from the cue count.
+  - **True Short Restart Detection (真の短い再スタートの検出)**: An aborted initial start before $p_{\text{cont}}$ is verified via multi-interval head consistency ([0..50ms] and [50..100ms] sequential correlation). When an aborted start and restarted continuous start both exist, duplicate cueing is reported with cue timestamps (**FAIL**).
+  - **Single Verified Start**: Exactly 1 verified cue with intact continuous trajectory (**PASS**).
+  - **Evidence Shortage (証拠不足 / 判定保留)**: Insufficient loopback duration after onset, low correlation (< 0.50), or transition boundary discontinuity (**PENDING / 判定保留**).
 
 ##### Mode B: Legacy Frame-Count PCM Evaluation
 For evaluating raw PCM files where exact total frame counts are predefined:
