@@ -1051,6 +1051,59 @@ void testIssue44NegotiationMatrix() {
     }
 }
 
+void testDirectSoundRenderPinInspection() {
+    std::printf("[TEST 12] Live DirectSoundRender & FilterGraph Key Inspection (Issue #45)...\n");
+
+    // 1. Check FilterGraph COM canonical identity vs IGraphBuilder*
+    {
+        Microsoft::WRL::ComPtr<IGraphBuilder> graph;
+        HRESULT hr = CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&graph));
+        CHECK(SUCCEEDED(hr));
+        if (SUCCEEDED(hr)) {
+            Microsoft::WRL::ComPtr<IUnknown> unk;
+            hr = graph->QueryInterface(IID_PPV_ARGS(&unk));
+            CHECK(SUCCEEDED(hr));
+            void* pGraph = graph.Get();
+            void* pUnk = unk.Get();
+            CHECK(pGraph != nullptr);
+            CHECK(pUnk != nullptr);
+            // On real DirectShow CFilterGraph, unk != pGraph due to multiple inheritance vtable layout.
+            // Both must be accommodated by canonical key resolution.
+        }
+    }
+
+    // 2. Check CLSID_DSoundRender pin and IMemInputPin
+    {
+        Microsoft::WRL::ComPtr<IBaseFilter> dsRender;
+        HRESULT hr = CoCreateInstance(CLSID_DSoundRender, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dsRender));
+        CHECK(SUCCEEDED(hr));
+        if (SUCCEEDED(hr)) {
+            Microsoft::WRL::ComPtr<IEnumPins> e;
+            hr = dsRender->EnumPins(&e);
+            CHECK(SUCCEEDED(hr));
+            Microsoft::WRL::ComPtr<IPin> p;
+            int inputPins = 0;
+            while (e->Next(1, &p, nullptr) == S_OK) {
+                PIN_DIRECTION dir{};
+                p->QueryDirection(&dir);
+                if (dir == PINDIR_INPUT) {
+                    inputPins++;
+                    Microsoft::WRL::ComPtr<IMemInputPin> mem;
+                    HRESULT hrMem = p->QueryInterface(IID_PPV_ARGS(&mem));
+                    CHECK(SUCCEEDED(hrMem));
+                    CHECK(mem != nullptr);
+                    if (mem) {
+                        auto memVtable = *reinterpret_cast<void***>(mem.Get());
+                        CHECK(memVtable[6] != nullptr); // Receive slot
+                    }
+                }
+                p.Reset();
+            }
+            CHECK(inputPins == 1);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1079,6 +1132,8 @@ int main() {
     testCrossFamilyLimitation();
     std::fflush(stdout);
     testIssue44NegotiationMatrix();
+    std::fflush(stdout);
+    testDirectSoundRenderPinInspection();
     std::fflush(stdout);
 
     CoUninitialize();

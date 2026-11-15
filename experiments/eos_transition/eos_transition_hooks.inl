@@ -750,11 +750,23 @@ static IPin* findDownstreamInputPinFromGraph(IFilterGraph* graph) {
     return dsPin;
 }
 
+inline void onEosEqBypassed(IUnknown* graphObj, bool bypassed) {
+    if (!graphObj) return;
+    void* canonicalKey = graphKeyFromObject(graphObj);
+    void* rawKey = reinterpret_cast<void*>(graphObj);
+    AcquireSRWLockExclusive(&eosLock);
+    if (canonicalKey) {
+        eosTracker.setEqBypassed(canonicalKey, bypassed);
+    }
+    if (rawKey && rawKey != canonicalKey) {
+        eosTracker.setEqBypassed(rawKey, bypassed);
+    }
+    ReleaseSRWLockExclusive(&eosLock);
+}
+
 inline void onEosEqBypassed(void* graphKey, bool bypassed) {
     if (!graphKey) return;
-    AcquireSRWLockExclusive(&eosLock);
-    eosTracker.setEqBypassed(graphKey, bypassed);
-    ReleaseSRWLockExclusive(&eosLock);
+    onEosEqBypassed(reinterpret_cast<IUnknown*>(graphKey), bypassed);
 }
 
 static IPin* findEqInputPinInGraph(IPin* seamlessPin) {
@@ -942,21 +954,36 @@ static HRESULT STDMETHODCALLTYPE dsRenderReceiveHook(IMemInputPin* self, IMediaS
         }
         if (bypassed) {
             bool deliverEos = false;
+            uint64_t totalDown = 0, targetB = 0;
+            uint32_t gen = 0;
             AcquireSRWLockExclusive(&eosLock);
             const auto* gCheck = eosTracker.findGraph(key);
             if (gCheck && gCheck->upstreamSamples == 0) {
                 eosTracker.onUpstreamSample(key, static_cast<uint32_t>(len), hasTime, sStart, sEnd);
             }
             deliverEos = eosTracker.onDownstreamSample(key, static_cast<uint32_t>(len), hasTime, sStart, sEnd);
+            const auto* gAfter = eosTracker.findGraph(key);
+            if (gAfter) {
+                totalDown = gAfter->downstreamBytes;
+                targetB = gAfter->targetBytes;
+                gen = gAfter->transitionGeneration;
+            }
             ReleaseSRWLockExclusive(&eosLock);
+
+            if (g_diagEnabled) {
+                static thread_local uint64_t s_lastLogBytes = 0;
+                if (totalDown == static_cast<uint64_t>(len) || (totalDown - s_lastLogBytes >= 96000 * 6) || deliverEos) {
+                    s_lastLogBytes = totalDown;
+                    recordDiag("DSRENDER_SAMPLE_PROGRESS", key, _ReturnAddress(), gen,
+                               (static_cast<uint64_t>(static_cast<DWORD>(totalDown)) << 32) | static_cast<DWORD>(targetB),
+                               deliverEos ? S_OK : S_FALSE);
+                }
+            }
+
             if (deliverEos && originalDsRenderEos) {
                 IPin* pin = nullptr;
                 if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&pin))) && pin) {
                     EosHookScope scope;
-                    uint32_t gen = 0;
-                    AcquireSRWLockShared(&eosLock);
-                    gen = eosTracker.getTransitionGeneration(key);
-                    ReleaseSRWLockShared(&eosLock);
                     recordDiag("EOS_ENTER_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(sEnd / 10000), S_OK);
                     auto eosHr = originalDsRenderEos(pin);
                     record("EOS_DELIVERED_DOWNSTREAM", static_cast<DWORD>(sEnd / 10000), static_cast<DWORD>(len), eosHr);
@@ -1230,16 +1257,59 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
         }
 
         LONGLONG c = 0, s = 0;
-        if (seeking && SUCCEEDED(seeking->GetCurrentPosition(&c)) &&
-            SUCCEEDED(seeking->GetStopPosition(&s))) {
-            if (c >= s && s > 0) {
-                exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
-                break;
-            }
+        bool posValid = (seeking && SUCCEEDED(seeking->GetCurrentPosition(&c)) &&
+                         SUCCEEDED(seeking->GetStopPosition(&s)));
+        bool posReached = posValid && (c >= s && s > 0);
+
+        bool reachedPcmTarget = false;
+        bool eosDelivered = false;
+        uint64_t downB = 0, targetB = 0;
+        uint32_t sRate = 0;
+        WORD sBits = 0, sCh = 0;
+        AcquireSRWLockShared(&eosLock);
+        const auto* curG = eosTracker.findGraph(key);
+        if (curG) {
+            reachedPcmTarget = eosTracker.hasDownstreamReachedTarget(key);
+            eosDelivered = curG->eosDelivered;
+            downB = curG->downstreamBytes;
+            targetB = curG->targetBytes;
+            sRate = curG->sampleRate;
+            sBits = curG->bitsPerSample;
+            sCh = curG->channels;
+        }
+        ReleaseSRWLockShared(&eosLock);
+
+        DWORD dsPlayCursor = 0, dsWriteCursor = 0, dsStatus = 0;
+        HRESULT hrDsPos = E_POINTER, hrDsStat = E_POINTER;
+        bool hasDs = safeQueryDirectSoundBuffer(dsBuf, &dsPlayCursor, &dsWriteCursor, &dsStatus, &hrDsPos, &hrDsStat);
+        bool dsStopped = hasDs && SUCCEEDED(hrDsStat) && !(dsStatus & DSBSTATUS_PLAYING);
+
+        if (posReached) {
+            exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
+            break;
+        }
+        if (reachedPcmTarget && dsStopped) {
+            exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
+            break;
         }
 
         if (GetTickCount() - startTick >= maxWait) {
-            exitStatus = eosTransition::PauseDeferralStatus::TimedOut;
+            bool rendererCompleted = posReached || dsStopped ||
+                                     (eosDelivered && posValid && (s > c) && ((s - c) <= 500000LL));
+            if (rendererCompleted || (eosDelivered && (downB > 0))) {
+                exitStatus = eosTransition::PauseDeferralStatus::CompletedDrain;
+                recordDiag("DRAIN_VERIFY_DIAGNOSTIC_DEFICIT", key, caller,
+                           static_cast<DWORD>(downB), static_cast<DWORD>(targetB),
+                           S_OK);
+            } else {
+                exitStatus = eosTransition::PauseDeferralStatus::TimedOut;
+                uint32_t frameBytes = (sBits / 8) * (sCh > 0 ? sCh : 2);
+                DWORD missingTailMs = (posValid && s > c) ? static_cast<DWORD>((s - c) / 10000) :
+                                      ((sRate > 0 && frameBytes > 0 && targetB > downB) ? static_cast<DWORD>((targetB - downB) * 1000 / (sRate * frameBytes)) : 0);
+                recordDiag("DRAIN_VERIFY_TAIL_TRUNCATED", key, caller,
+                           missingTailMs, static_cast<DWORD>(targetB - downB),
+                           E_FAIL);
+            }
             break;
         }
 
@@ -2269,14 +2339,16 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
     if (!ok) return false;
 
     IBaseFilter* dsRender = nullptr;
+    bool dsHookOk = false;
     if (SUCCEEDED(CoCreateInstance(CLSID_DSoundRender, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dsRender))) && dsRender) {
-        hookPinMethods(dsRender,
-                       dsRenderReceiveHook, &originalDsRenderReceive,
-                       dsRenderEosHook, &originalDsRenderEos,
-                       dsRenderBeginFlushHook, &originalDsRenderBeginFlush,
-                       dsRenderEndFlushHook, &originalDsRenderEndFlush,
-                       dsRenderNewSegmentHook, &originalDsRenderNewSegment);
+        dsHookOk = hookPinMethods(dsRender,
+                                  dsRenderReceiveHook, &originalDsRenderReceive,
+                                  dsRenderEosHook, &originalDsRenderEos,
+                                  dsRenderBeginFlushHook, &originalDsRenderBeginFlush,
+                                  dsRenderEndFlushHook, &originalDsRenderEndFlush,
+                                  dsRenderNewSegmentHook, &originalDsRenderNewSegment);
         dsRender->Release();
     }
+    eosDiag::getHookStatusReporter().report("DirectSoundRender.Pin", dsHookOk ? "OK" : "FAILED", dsHookOk ? S_OK : E_FAIL);
     return true;
 }

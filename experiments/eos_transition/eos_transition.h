@@ -222,7 +222,11 @@ public:
     bool isEqBypassed(void* graphKey) {
         if (!graphKey) return false;
         auto* s = findGraph(graphKey);
-        return s ? s->eqBypassed : false;
+        if (s) return s->eqBypassed;
+        for (const auto& kv : graphs_) {
+            if (kv.second.active24 && kv.second.eqBypassed) return true;
+        }
+        return false;
     }
 
     // Called on 0x31E7A (next-track pre-read setter) when the graph key is known,
@@ -442,8 +446,10 @@ public:
     void markFormatChangePauseDeferred(void* graphKey) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
+        s.transitionGeneration++;
         s.formatChangePauseDeferred = true;
         s.pauseDeferralStatus = PauseDeferralStatus::Active;
+        s.transition.generation = s.transitionGeneration;
     }
 
     void onFormatChangePauseCompleted(void* graphKey, PauseDeferralStatus status = PauseDeferralStatus::CompletedDrain) {

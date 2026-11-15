@@ -227,3 +227,53 @@ When `SeamlessFilter` is absent in Topology B:
 3. In `dsRenderEosHook`: when `upstreamEosCount == 0`, `onUpstreamEndOfStream` is synthesized before `onDownstreamEndOfStream`.
 4. This ensures `isFormatChangePending` is properly set, enabling synchronous track-tail pause deferral (`deferFormatChangePause`) to protect track tails across format transitions (e.g. 44.1kHz ↔ 48kHz or 24-bit ↔ 16-bit).
 
+---
+
+## 10. Issue #45: Downstream PCM Measurement Across EQ Topologies and Diagnostic Distinction
+
+### 10.1 Root Cause of 0 / Target Bytes PCM Counter in Prior Measurements
+
+In Issue #43 measurements, on the preceding track's EQ bypass graph, `DRAIN_HEARTBEAT_PCM` reported `0 / 13,248,000 B` continuously during the deferral window until timing out after ~2.92 seconds.
+
+Investigation identified the root cause:
+1. In COM, DirectShow's `CFilterGraph` implements multiple interfaces (`IGraphBuilder`, `IMediaControl`, `IFilterGraph`, etc.) via multiple inheritance.
+2. `QueryInterface(IID_IUnknown)` returns the canonical identity pointer of the COM object (`unk`), which on MSVC is offset from `IGraphBuilder*` (`0x13C1B88` vs `0x13C1B40`, offset +0x48).
+3. `prepareDseeGraph` invoked `onEosEqBypassed(graph.Get(), bypassed)`, recording the bypass state on `graph.Get()` (`IGraphBuilder*`).
+4. Meanwhile, `dsRenderReceiveHook` determined the graph key via `graphKeyFromMemPin(self) -> graphKeyFromGraph(fi.pGraph)`, which queries `IUnknown` and obtained `unk` (`0x13C1B88`).
+5. As a result, `eosTracker.isEqBypassed(key)` evaluated to `false` on the canonical key. `dsRenderReceiveHook` skipped recording downstream samples, and because EQ was bypassed, `eqReceiveHook` was never called either. `downstreamBytes` remained at 0 while `targetBytes` was 13,248,000.
+
+### 10.2 Dual Canonical Resolution and Fallback
+
+1. **`onEosEqBypassed`**:
+   Accepts `IUnknown* graphObj` and queries `graphKeyFromObject(graphObj)` to resolve the canonical `IUnknown*` key. It registers `setEqBypassed(canonicalKey, bypassed)` and redundantly registers the raw interface pointer `setEqBypassed(rawKey, bypassed)`.
+2. **`isEqBypassed` Fallback**:
+   If exact key matching misses, `isEqBypassed` inspects any active 24-bit graph with `eqBypassed == true`, ensuring `dsRenderReceiveHook` never misses the bypass state.
+3. **Pin Hook Telemetry**:
+   `setupEosTransitionHooks` now explicitly validates and reports `DirectSoundRender.Pin` hook status (`OK`/`FAILED`) through `eosDiag::getHookStatusReporter()`.
+4. **Progress Telemetry**:
+   `dsRenderReceiveHook` records `DSRENDER_SAMPLE_PROGRESS` correlating track transition generation (`gen`), cumulative downstream bytes, target bytes, and EOS state.
+
+### 10.3 Distinction between Diagnostic Deficit ("診断未達") and Track Tail Truncation ("曲末欠落")
+
+In synchronous mode (`deferFormatChangePause`), completion is evaluated using two-stage drain verification:
+1. **Renderer Output Evaluation**:
+   - `c >= s && s > 0` (DirectShow reference clock reached or passed stop position).
+   - DirectSound buffer status indicates buffer playback has stopped (`!(dsStatus & DSBSTATUS_PLAYING)`).
+   - DirectSound buffer cursor reached end of audio data.
+2. **Classification on Deferral Timeout**:
+   - If renderer finished playing (or was within 50ms tolerance with EOS delivered):
+     - Classified as **`DIAGNOSTIC_DEFICIT` (診断未達)**: `recordDiag("DRAIN_VERIFY_DIAGNOSTIC_DEFICIT", ...)`.
+     - Audio hardware successfully output all audio samples to completion (missing tail: `0 ms`).
+     - `exitStatus` is marked `CompletedDrain`.
+   - If renderer was stopped while still actively playing prior to stop position / EOS:
+     - Classified as **`TRACK_TAIL_TRUNCATED` (曲末欠落)**: `recordDiag("DRAIN_VERIFY_TAIL_TRUNCATED", missingTailMs, ...)`.
+     - Missing tail duration is precisely calculated and reported.
+
+### 10.4 Bi-Directional Transitions and Track 2 Tail Verification
+
+`flac24_dsee_experiment` supports:
+- Track 1 -> Track 2 (e.g. 48kHz/24bit -> 48kHz/16bit): Topology A EQ bypass, downstream PCM tracking, full drain.
+- Track 2 -> Track 3 (Track 2's own tail): Topology B EQ bypass, downstream PCM tracking, full drain.
+- Reverse order (e.g. 48kHz/16bit -> 48kHz/24bit): Topology B -> Topology A/B transitions with symmetrical tail protection and single-start playback.
+
+

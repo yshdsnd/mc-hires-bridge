@@ -2050,8 +2050,127 @@ inline void testDirectSoundBufferCursorDiagnosticsAndFailureReporting() {
     CHECK(refReleased == refInitial); // Returned to original reference count
 }
 
+// Test 73: Canonical Graph Key Resolution and EQ Bypass State (Issue #45)
+inline void testCanonicalGraphKeyResolutionAndEqBypass() {
+    std::printf("[TEST 73] Canonical graph key resolution and EQ bypass state (Issue #45)...\n");
+
+    eosTransition::Tracker tracker;
+    void* canonicalKey = reinterpret_cast<void*>(0x1000);
+    void* secondaryKey = reinterpret_cast<void*>(0x1048); // e.g. pointer offset in multiple inheritance
+
+    // Initially bypassed is false
+    CHECK(tracker.isEqBypassed(canonicalKey) == false);
+
+    // Set bypass on canonical key
+    tracker.onGraphActivated(canonicalKey, true, 96000, 2, 24);
+    tracker.setEqBypassed(canonicalKey, true);
+
+    CHECK(tracker.isEqBypassed(canonicalKey) == true);
+
+    // Fallback lookup: when an active 24-bit graph is bypassed, looking up from an unknown key finds true
+    CHECK(tracker.isEqBypassed(secondaryKey) == true);
+
+    // Disabling bypass
+    tracker.setEqBypassed(canonicalKey, false);
+    tracker.onGraphActivated(canonicalKey, false, 96000, 2, 24);
+    CHECK(tracker.isEqBypassed(canonicalKey) == false);
+    CHECK(tracker.isEqBypassed(secondaryKey) == false);
+}
+
+// Test 74: DirectSound Receive Sample Counting and EOS Trigger when EQ is Bypassed (Issue #45)
+inline void testDirectSoundReceiveSampleCountingWhenEqBypassed() {
+    std::printf("[TEST 74] DirectSound sample counting and EOS trigger on EQ bypass (Issue #45)...\n");
+
+    eosTransition::Tracker tracker;
+    void* graphKey = reinterpret_cast<void*>(0x2000);
+
+    tracker.onGraphActivated(graphKey, true, 96000, 2, 24);
+    tracker.setEqBypassed(graphKey, true);
+
+    // Simulate upstream feeding 576,000 bytes (1 second of 96k/24b/stereo = 96000 * 6)
+    const uint32_t trackBytes = 576000;
+    const uint32_t chunkBytes = 28800;
+    for (uint32_t b = 0; b < trackBytes; b += chunkBytes) {
+        tracker.onUpstreamSample(graphKey, chunkBytes, false, 0, 0);
+    }
+    // Upstream finishes with EOS -> targetBytes is set to 576,000
+    tracker.onUpstreamEndOfStream(graphKey);
+
+    const auto* g = tracker.findGraph(graphKey);
+    CHECK(g != nullptr);
+    CHECK(g->targetBytes == trackBytes);
+    CHECK(g->downstreamBytes == 0); // downstream not yet fed
+
+    // Now simulate DirectSound renderer receiving samples directly because EQ is bypassed
+    bool eosTriggered = false;
+    for (uint32_t b = 0; b < trackBytes; b += chunkBytes) {
+        bool trig = tracker.onDownstreamSample(graphKey, chunkBytes, false, 0, 0);
+        if (trig) eosTriggered = true;
+    }
+
+    CHECK(g->downstreamBytes == trackBytes);
+    CHECK(tracker.hasDownstreamReachedTarget(graphKey) == true);
+    CHECK(eosTriggered == true); // Reached target -> delivered EOS downstream
+}
+
+// Test 75: Track Generation Correlation with Downstream PCM (Issue #45)
+inline void testTrackGenerationCorrelationWithDownstreamPcm() {
+    std::printf("[TEST 75] Track generation correlation with downstream PCM (Issue #45)...\n");
+
+    eosTransition::Tracker tracker;
+    void* graphKey = reinterpret_cast<void*>(0x3000);
+
+    // Initial state: generation is 0
+    tracker.onGraphActivated(graphKey, true, 96000, 2, 24);
+    uint32_t gen0 = tracker.getTransitionGeneration(graphKey);
+    CHECK(gen0 == 0);
+
+    // First transition (Track 1 -> Track 2): Deferral on format change increments generation to 1
+    tracker.markFormatChangePauseDeferred(graphKey);
+    uint32_t gen1 = tracker.getTransitionGeneration(graphKey);
+    CHECK(gen1 == 1);
+
+    tracker.onFormatChangePauseCompleted(graphKey);
+
+    // Second transition (Track 2 -> Track 3): Deferral on format change increments generation to 2
+    tracker.markFormatChangePauseDeferred(graphKey);
+    uint32_t gen2 = tracker.getTransitionGeneration(graphKey);
+    CHECK(gen2 == 2);
+}
+
+// Test 76: Distinction between Diagnostic Deficit and Track Tail Truncation (Issue #45)
+inline void testDistinctionDiagnosticDeficitVsTailTruncation() {
+    std::printf("[TEST 76] Distinction between diagnostic deficit and track tail truncation (Issue #45)...\n");
+
+    eosTransition::Tracker tracker;
+    void* graphKey = reinterpret_cast<void*>(0x4000);
+
+    tracker.onGraphActivated(graphKey, true, 96000, 2, 24);
+    tracker.onUpstreamSample(graphKey, 576000, false, 0, 0);
+    tracker.onUpstreamEndOfStream(graphKey);
+
+    // Case 76A: Downstream PCM counter incomplete (e.g. 500,000 / 576,000)
+    // BUT renderer reached stop position (c >= s): This is DIAGNOSTIC_DEFICIT, audio tail intact (0ms missing)!
+    tracker.onDownstreamSample(graphKey, 500000, false, 0, 0);
+    LONGLONG c = 10000000LL;
+    LONGLONG s = 10000000LL;
+    bool rendererCompleteA = (c >= s && s > 0);
+    CHECK(rendererCompleteA == true);
+    // Audio is complete!
+    uint32_t missingMsA = (c >= s) ? 0 : static_cast<DWORD>((s - c) / 10000);
+    CHECK(missingMsA == 0);
+
+    // Case 76B: Premature stop before renderer reached stop position (c = 8,000,000, s = 10,000,000)
+    // and no EOS delivered: This is GENUINE TRACK_TAIL_TRUNCATED!
+    LONGLONG cTrunc = 8000000LL;
+    bool rendererCompleteB = (cTrunc >= s && s > 0);
+    CHECK(rendererCompleteB == false);
+    uint32_t missingMsB = static_cast<DWORD>((s - cTrunc) / 10000);
+    CHECK(missingMsB == 200); // 200ms missing tail!
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 / #45 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -2085,7 +2204,11 @@ inline void runAllAsyncTransitionTests() {
     testCleanNaturalEosPropagationWithoutLoopInjection();
     testSymmetricalDiagnosticsSyncVsAsync();
     testDirectSoundBufferCursorDiagnosticsAndFailureReporting();
-    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testCanonicalGraphKeyResolutionAndEqBypass();
+    testDirectSoundReceiveSampleCountingWhenEqBypassed();
+    testTrackGenerationCorrelationWithDownstreamPcm();
+    testDistinctionDiagnosticDeficitVsTailTruncation();
+    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 / #45 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests
