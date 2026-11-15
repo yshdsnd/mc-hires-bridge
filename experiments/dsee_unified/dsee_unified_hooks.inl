@@ -81,7 +81,10 @@ static HRESULT STDMETHODCALLTYPE dseeUnifiedSetterHook(IUnknown* self, DseeConfi
         return hr;
     }
 
-    WORD decBits = getActiveDecoderBits().load();
+    WORD decBits = (codec == CodecType::Flac) ? getActiveDecoderBits().load() : static_cast<WORD>(config.inputBits);
+    if (codec != CodecType::Flac) {
+        resetActiveDecoderBits();
+    }
     DseeConfig adjusted{};
     if (!computeUnifiedDseeConfig(config, adjusted, g_harmonizeMode, decBits)) {
         auto hr = originalDsee(self, config);

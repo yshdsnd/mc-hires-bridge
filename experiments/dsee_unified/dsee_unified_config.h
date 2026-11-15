@@ -48,8 +48,11 @@ inline CodecType identifyCodecFromModule(const wchar_t* moduleName) {
     if (!moduleName) return CodecType::Unknown;
     if (_wcsicmp(moduleName, L"OpcFlac.dll") == 0) return CodecType::Flac;
     if (_wcsicmp(moduleName, L"OpcMp4.dll") == 0) return CodecType::Aac; // AAC/ALAC shared container module
+    if (_wcsicmp(moduleName, L"OpcAac.dll") == 0) return CodecType::Aac;
+    if (_wcsicmp(moduleName, L"OpcAlac.dll") == 0) return CodecType::Alac;
     if (_wcsicmp(moduleName, L"OpcWavEx.dll") == 0) return CodecType::Wav;
     if (_wcsicmp(moduleName, L"OpcCd3.dll") == 0) return CodecType::Mp3; // CD / MP3 engine
+    if (_wcsicmp(moduleName, L"OpcMp3.dll") == 0) return CodecType::Mp3;
     if (_wcsicmp(moduleName, L"OpcApe.dll") == 0) return CodecType::Flac;
     return CodecType::Unknown;
 }
@@ -95,6 +98,10 @@ inline std::atomic<WORD>& getActiveDecoderBits() {
 
 inline void setActiveDecoderBits(WORD bits) {
     getActiveDecoderBits().store(bits);
+}
+
+inline void resetActiveDecoderBits() {
+    getActiveDecoderBits().store(0);
 }
 
 inline HarmonizeMode initHarmonizeModeFromEnv() {

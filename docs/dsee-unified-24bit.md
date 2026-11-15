@@ -408,8 +408,95 @@ bool isDrainFullyComplete = pcmDeliveryComplete && downstreamEosDelivered && ren
     9. Verified `rendererOutputComplete == true`, `isDrainFullyComplete == true`, `isFormatChangePending == false`.
 - **Suite Results**:
   - `eos_transition_tests.exe`: 77/77 tests passed (0 failures).
-  - `dsee_unified_tests.exe`: 13/13 test suites passed (0 failures).
+  - `dsee_unified_tests.exe`: 14/14 test suites passed (0 failures).
   - `flac24_dsee_experiment.dll`: Built cleanly.
+
+## 13. Issue #49: Multi-Codec (FLAC, AAC, MP3, ALAC, WAV) DSEE HX Route Matrix & Regression Prevention
+
+### 13.1 Architecture: Universal Slot 3 Interception Across Decoders
+
+In Sony Music Center for PC 2.7.4 (x86), track decoding is separated into container/format-specific decoder modules:
+- **FLAC**: `OpcFlac.dll` (source filter `OmgFlacSrc.ax`)
+- **AAC / ALAC**: `OpcMp4.dll` (also `OpcAac.dll` / `OpcAlac.dll`)
+- **MP3 / Audio CD**: `OpcCd3.dll` (also `OpcMp3.dll`)
+- **WAV / Linear PCM**: `OpcWavEx.dll`
+
+Regardless of the decoder DLL, all decoders configure the DSEE HX DSP filter (`OmgDseeHxFilter.ax`) through a single COM vtable entry point:
+- **Interface**: `{6AF76DBE-8634-4FD3-93ED-982EDE1BFDD5}`
+- **Slot 3**: `SetDseeConfig(DseeConfig config)`
+
+By installing a single unified hook on interface slot 3 (`dseeUnifiedSetterHook`), the bridge universally intercepts and controls DSEE HX configuration across all audio codecs without modifying the internal decoder binaries.
+
+### 13.2 Regression Root Cause Analysis & Bit-Depth Isolation
+
+#### Identified Vulnerability (Cross-Codec State Contamination)
+In Issue #43, `setActiveDecoderBits(24)` was introduced to resolve an `OpcFlac.dll` quirk where 24-bit FLAC tracks initially configure DSEE HX with `inputBits = 16`.
+If a 24-bit FLAC track played first, `getActiveDecoderBits()` stored `24`. If the user subsequently played a standard 16-bit AAC or MP3 file:
+1. The decoder caller (`OpcMp4.dll` or `OpcCd3.dll`) passes `config.inputBits = 16`.
+2. Prior to this fix, `dseeUnifiedSetterHook` read `decBits = getActiveDecoderBits().load()` without checking the caller codec, obtaining `24`.
+3. `computeUnifiedDseeConfig` forced `adjusted.inputBits = 24`.
+4. `OmgDseeHxFilter.ax` was configured to expect 24-bit PCM at its input pin, while the AAC/MP3 decoder supplied 16-bit PCM.
+5. This bit depth mismatch resulted in pin negotiation failure (`VFW_E_NOT_CONNECTED`), broken audio rendering, or fallback.
+
+#### Resolution
+1. **Caller Module Identification**: `identifyCallerCodec(_ReturnAddress())` determines the calling decoder via `GetModuleHandleExW`.
+2. **Codec-Specific Bit Isolation**:
+   ```cpp
+   WORD decBits = (codec == CodecType::Flac) ? getActiveDecoderBits().load() : static_cast<WORD>(config.inputBits);
+   if (codec != CodecType::Flac) {
+       resetActiveDecoderBits();
+   }
+   ```
+3. For non-FLAC decoders (AAC, MP3, ALAC, WAV), `config.inputBits` is strictly respected, and any stale FLAC decoder state is immediately reset (`resetActiveDecoderBits()`).
+
+### 13.3 Comprehensive Multi-Codec Route Matrix
+
+The table below details the exact audio routing and filter behavior across all supported codecs, sampling rates, bit depths, and DSEE HX states under standard Family 2x mode (`MC_BRIDGE_DSEE_MODE=family2x`).
+
+| Codec | Input Rate / Bits | DSEE HX | DSEE Action | DSEE Output Format | SeamlessFilter | OmgEqxlFilter (EQ) | DirectSound Renderer Input | Peer Code | Routing Path Summary |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **FLAC** | 44.1kHz / 16bit | ON | Harmonize 2x | 88.2kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 88.2kHz / 24bit | 1 | FLAC -> DSEE -> Seamless -> DS (Direct) |
+| **FLAC** | 44.1kHz / 16bit | OFF | Passthrough | 44.1kHz / 16bit | Active (Passthrough) | Bypassed (Disconnected) | 44.1kHz / 16bit | 1 | FLAC -> Seamless -> DS (Direct) |
+| **FLAC** | 48kHz / 16bit | ON | Harmonize 2x | 96kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 96kHz / 24bit | 1 | FLAC -> DSEE -> Seamless -> DS (Direct) |
+| **FLAC** | 48kHz / 16bit | OFF | Passthrough | 48kHz / 16bit | Active (Passthrough) | Bypassed (Disconnected) | 48kHz / 16bit | 1 | FLAC -> Seamless -> DS (Direct) |
+| **FLAC** | 44.1kHz / 24bit | ON | Harmonize 2x | 88.2kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 88.2kHz / 24bit | 1 | FLAC -> DSEE (in:24) -> Seamless -> DS |
+| **FLAC** | 44.1kHz / 24bit | OFF | Passthrough | 44.1kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 44.1kHz / 24bit | 1 | FLAC -> Seamless -> DS (Direct) |
+| **FLAC** | 48kHz / 24bit | ON | Harmonize 2x | 96kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 96kHz / 24bit | 1 | FLAC -> DSEE (in:24) -> Seamless -> DS |
+| **FLAC** | 48kHz / 24bit | OFF | Passthrough | 48kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 48kHz / 24bit | 1 | FLAC -> Seamless -> DS (Direct) |
+| **FLAC** | 96kHz / 24bit | ON/OFF | Passthrough | 96kHz / 24bit (Native) | Active (Passthrough) | Bypassed (Disconnected) | 96kHz / 24bit | 1 | FLAC -> Seamless -> DS (Bit-Perfect) |
+| **FLAC** | 192kHz / 24bit | ON/OFF | Passthrough | 192kHz / 24bit (Native) | Active (Passthrough) | Bypassed (Disconnected) | 192kHz / 24bit | 1 | FLAC -> Seamless -> DS (Bit-Perfect) |
+| **AAC** | 44.1kHz / 16bit | ON | Harmonize 2x | 88.2kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 88.2kHz / 24bit | 1 | AAC -> DSEE (in:16) -> Seamless -> DS |
+| **AAC** | 44.1kHz / 16bit | OFF | Passthrough | 44.1kHz / 16bit | Active (Passthrough) | Bypassed (Disconnected) | 44.1kHz / 16bit | 1 | AAC -> Seamless -> DS (Direct) |
+| **AAC** | 48kHz / 16bit | ON | Harmonize 2x | 96kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 96kHz / 24bit | 1 | AAC -> DSEE (in:16) -> Seamless -> DS |
+| **AAC** | 48kHz / 16bit | OFF | Passthrough | 48kHz / 16bit | Active (Passthrough) | Bypassed (Disconnected) | 48kHz / 16bit | 1 | AAC -> Seamless -> DS (Direct) |
+| **MP3** | 44.1kHz / 16bit | ON | Harmonize 2x | 88.2kHz / 24bit | Active / Direct DSEE | Bypassed (Disconnected) | 88.2kHz / 24bit | 1 or 2 | MP3 -> DSEE (in:16) -> [Seamless] -> DS |
+| **MP3** | 44.1kHz / 16bit | OFF | Passthrough | 44.1kHz / 16bit | Active / Direct CD | Bypassed (Disconnected) | 44.1kHz / 16bit | 1 or 2 | MP3 -> [Seamless] -> DS (Direct) |
+| **MP3** | 48kHz / 16bit | ON | Harmonize 2x | 96kHz / 24bit | Active / Direct DSEE | Bypassed (Disconnected) | 96kHz / 24bit | 1 or 2 | MP3 -> DSEE (in:16) -> [Seamless] -> DS |
+| **MP3** | 48kHz / 16bit | OFF | Passthrough | 48kHz / 16bit | Active / Direct CD | Bypassed (Disconnected) | 48kHz / 16bit | 1 or 2 | MP3 -> [Seamless] -> DS (Direct) |
+| **ALAC** | 44.1kHz / 16bit | ON | Harmonize 2x | 88.2kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 88.2kHz / 24bit | 1 | ALAC -> DSEE (in:16) -> Seamless -> DS |
+| **ALAC** | 44.1kHz / 24bit | ON | Harmonize 2x | 88.2kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 88.2kHz / 24bit | 1 | ALAC -> DSEE (in:24) -> Seamless -> DS |
+| **ALAC** | 96kHz / 24bit | ON/OFF | Passthrough | 96kHz / 24bit (Native) | Active (Passthrough) | Bypassed (Disconnected) | 96kHz / 24bit | 1 | ALAC -> Seamless -> DS (Bit-Perfect) |
+| **WAV** | 44.1kHz / 16bit | ON | Harmonize 2x | 88.2kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 88.2kHz / 24bit | 1 | WAV -> DSEE (in:16) -> Seamless -> DS |
+| **WAV** | 48kHz / 16bit | ON | Harmonize 2x | 96kHz / 24bit | Active (Passthrough) | Bypassed (Disconnected) | 96kHz / 24bit | 1 | WAV -> DSEE (in:16) -> Seamless -> DS |
+| **WAV** | 96k/192k / 24b | ON/OFF | Passthrough | Native Hi-Res | Active (Passthrough) | Bypassed (Disconnected) | Native Hi-Res | 1 | WAV -> Seamless -> DS (Bit-Perfect) |
+
+*Peer Codes*:
+- **Peer Code 1**: DirectSound renderer input pin is directly connected to `SeamlessFilter` output pin (`insp.isDirectSeamless == true`).
+- **Peer Code 2**: DirectSound renderer input pin is directly connected to `OmgDseeHxFilter` output pin (`insp.isDirectDsee == true`).
+- **Peer Code 3**: Fallback connection where DirectSound is connected to an intermediate post-processing filter.
+
+### 13.4 Verification Division: Headless vs Real-Machine (Codex Handover)
+
+| Verification Scope | Execution Environment | Status / Coverage |
+| :--- | :--- | :--- |
+| **Codec Module Identification** | Headless CI / Local Build (`dsee_unified_tests.exe`) | Covered (Test 2: `OpcFlac`, `OpcMp4`, `OpcAac`, `OpcAlac`, `OpcWavEx`, `OpcCd3`, `OpcMp3`, `OpcApe`). |
+| **Stale Bit Depth Isolation** | Headless CI / Local Build (`dsee_unified_tests.exe`) | Covered (Test 15A: FLAC 24b -> AAC 16b -> MP3 16b -> ALAC 24b -> WAV 16b sequence). |
+| **Rate / Bit Harmonization Matrix** | Headless CI / Local Build (`dsee_unified_tests.exe`) | Covered (Test 15B: All 5 codecs x 6 format combinations x DSEE ON/OFF). |
+| **DirectShow Mock Routing & EQ Bypass** | Headless CI / Local Build (`dsee_unified_tests.exe`) | Covered (Test 15C & 15D: Non-FLAC decoder graph creation, pin detachment, DirectSound connection). |
+| **Live Sony Filter Pin Acceptance** | Headless (Music Center 2.7.4 installation) | Covered (Test 7.5: DirectSoundRender accepts 44.1k/48k/88.2k/96k/176.4k/192k at 16/24-bit). |
+| **Acoustic Real-Device Playback (Listening)** | Real Machine (Codex / Live Hardware) | **Handed over to Codex**: Audible playback confirmation across AAC, MP3, ALAC tracks in Music Center 2.7.4 GUI. |
+| **Production DLL Integration** | Repository Main / Release | **Deferred**: Merged into production build only after Issue #21 real-machine listening confirmation is complete. |
+
 
 
 

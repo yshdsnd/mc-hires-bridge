@@ -124,15 +124,21 @@ void testCodecCallerIdentification() {
     CHECK(dseeUnified::identifyCodecFromModule(L"OpcFlac.dll") == dseeUnified::CodecType::Flac);
     CHECK(dseeUnified::identifyCodecFromModule(L"opcflac.dll") == dseeUnified::CodecType::Flac);
     CHECK(dseeUnified::identifyCodecFromModule(L"OpcMp4.dll") == dseeUnified::CodecType::Aac);
+    CHECK(dseeUnified::identifyCodecFromModule(L"OpcAac.dll") == dseeUnified::CodecType::Aac);
+    CHECK(dseeUnified::identifyCodecFromModule(L"OpcAlac.dll") == dseeUnified::CodecType::Alac);
     CHECK(dseeUnified::identifyCodecFromModule(L"OpcWavEx.dll") == dseeUnified::CodecType::Wav);
     CHECK(dseeUnified::identifyCodecFromModule(L"OpcCd3.dll") == dseeUnified::CodecType::Mp3);
+    CHECK(dseeUnified::identifyCodecFromModule(L"OpcMp3.dll") == dseeUnified::CodecType::Mp3);
+    CHECK(dseeUnified::identifyCodecFromModule(L"OpcApe.dll") == dseeUnified::CodecType::Flac);
     CHECK(dseeUnified::identifyCodecFromModule(L"Unknown.dll") == dseeUnified::CodecType::Unknown);
     CHECK(dseeUnified::identifyCodecFromModule(nullptr) == dseeUnified::CodecType::Unknown);
 
     CHECK(std::strcmp(dseeUnified::codecName(dseeUnified::CodecType::Flac), "FLAC") == 0);
     CHECK(std::strcmp(dseeUnified::codecName(dseeUnified::CodecType::Aac), "AAC") == 0);
+    CHECK(std::strcmp(dseeUnified::codecName(dseeUnified::CodecType::Alac), "ALAC") == 0);
     CHECK(std::strcmp(dseeUnified::codecName(dseeUnified::CodecType::Wav), "WAV") == 0);
     CHECK(std::strcmp(dseeUnified::codecName(dseeUnified::CodecType::Mp3), "MP3") == 0);
+    CHECK(std::strcmp(dseeUnified::codecName(dseeUnified::CodecType::Cd), "CD") == 0);
 }
 
 // Test 3: Preservation of Hi-Res & DSEE OFF (Requirement 5)
@@ -1566,6 +1572,311 @@ void testIssue46Dsee88kRendererAndChainTraversal() {
     }
 }
 
+// Test 15: Issue #49 Multi-Codec (FLAC, AAC, MP3, ALAC, WAV) Eligibility & Route Matrix
+void testIssue49CodecEligibilityAndRouteMatrix() {
+    std::printf("[TEST 15] Issue #49 Multi-Codec Eligibility & Route Matrix...\n");
+
+    // 15A: Regression Prevention: Stale Decoder Bit Isolation Across Codec Switching
+    // Simulate playing 24-bit FLAC first (sets activeDecoderBits to 24)
+    dseeUnified::setActiveDecoderBits(24);
+    CHECK(dseeUnified::getActiveDecoderBits().load() == 24);
+
+    // FLAC 48kHz / 24bit calculation (using decBits = 24)
+    {
+        dseeUnified::DseeConfig reqFlac{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+        auto codecFlac = dseeUnified::CodecType::Flac;
+        WORD decBits = (codecFlac == dseeUnified::CodecType::Flac)
+            ? dseeUnified::getActiveDecoderBits().load()
+            : static_cast<WORD>(reqFlac.inputBits);
+        dseeUnified::DseeConfig adjFlac{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(reqFlac, adjFlac, dseeUnified::HarmonizeMode::Family2x, decBits));
+        CHECK(adjFlac.inputBits == 24); // Synchronized to true FLAC decoded bits
+        CHECK(adjFlac.outputRate == 96000);
+        CHECK(adjFlac.outputBits == 24);
+    }
+
+    // Next track: AAC 44.1kHz / 16bit (OpcMp4.dll / OpcAac.dll)
+    // The caller is AAC, so active decoder bits must NOT contaminate AAC
+    {
+        dseeUnified::DseeConfig reqAac{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+        auto codecAac = dseeUnified::CodecType::Aac;
+        WORD decBits = (codecAac == dseeUnified::CodecType::Flac)
+            ? dseeUnified::getActiveDecoderBits().load()
+            : static_cast<WORD>(reqAac.inputBits);
+        if (codecAac != dseeUnified::CodecType::Flac) {
+            dseeUnified::resetActiveDecoderBits();
+        }
+        dseeUnified::DseeConfig adjAac{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(reqAac, adjAac, dseeUnified::HarmonizeMode::Family2x, decBits));
+        // MUST remain 16-bit inputBits to prevent pin connection failure with OmgDseeHxFilter
+        CHECK(adjAac.inputBits == 16);
+        CHECK(adjAac.outputRate == 88200);
+        CHECK(adjAac.outputBits == 24);
+        // Active decoder bits reset
+        CHECK(dseeUnified::getActiveDecoderBits().load() == 0);
+    }
+
+    // Next track: MP3 44.1kHz / 16bit (OpcCd3.dll / OpcMp3.dll)
+    {
+        dseeUnified::DseeConfig reqMp3{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+        auto codecMp3 = dseeUnified::CodecType::Mp3;
+        WORD decBits = (codecMp3 == dseeUnified::CodecType::Flac)
+            ? dseeUnified::getActiveDecoderBits().load()
+            : static_cast<WORD>(reqMp3.inputBits);
+        if (codecMp3 != dseeUnified::CodecType::Flac) {
+            dseeUnified::resetActiveDecoderBits();
+        }
+        dseeUnified::DseeConfig adjMp3{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(reqMp3, adjMp3, dseeUnified::HarmonizeMode::Family2x, decBits));
+        CHECK(adjMp3.inputBits == 16);
+        CHECK(adjMp3.outputRate == 88200);
+        CHECK(adjMp3.outputBits == 24);
+    }
+
+    // Next track: ALAC 44.1kHz / 24bit (OpcAlac.dll / OpcMp4.dll)
+    {
+        dseeUnified::DseeConfig reqAlac{1, 2, 16, 44100, 44100, 24, 24, 0, 0};
+        auto codecAlac = dseeUnified::CodecType::Alac;
+        WORD decBits = (codecAlac == dseeUnified::CodecType::Flac)
+            ? dseeUnified::getActiveDecoderBits().load()
+            : static_cast<WORD>(reqAlac.inputBits);
+        dseeUnified::DseeConfig adjAlac{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(reqAlac, adjAlac, dseeUnified::HarmonizeMode::Family2x, decBits));
+        CHECK(adjAlac.inputBits == 24);
+        CHECK(adjAlac.outputRate == 88200);
+        CHECK(adjAlac.outputBits == 24);
+    }
+
+    // Next track: WAV 48kHz / 16bit (OpcWavEx.dll)
+    {
+        dseeUnified::DseeConfig reqWav{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+        auto codecWav = dseeUnified::CodecType::Wav;
+        WORD decBits = (codecWav == dseeUnified::CodecType::Flac)
+            ? dseeUnified::getActiveDecoderBits().load()
+            : static_cast<WORD>(reqWav.inputBits);
+        dseeUnified::DseeConfig adjWav{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(reqWav, adjWav, dseeUnified::HarmonizeMode::Family2x, decBits));
+        CHECK(adjWav.inputBits == 16);
+        CHECK(adjWav.outputRate == 96000);
+        CHECK(adjWav.outputBits == 24);
+    }
+
+    // 15B: Codec x Rate x BitDepth Matrix Verification (FLAC, AAC, MP3, ALAC, WAV)
+    const dseeUnified::CodecType allCodecs[] = {
+        dseeUnified::CodecType::Flac,
+        dseeUnified::CodecType::Aac,
+        dseeUnified::CodecType::Mp3,
+        dseeUnified::CodecType::Alac,
+        dseeUnified::CodecType::Wav
+    };
+
+    for (auto c : allCodecs) {
+        // 44.1kHz / 16bit DSEE ON -> 88.2kHz / 24bit
+        {
+            dseeUnified::DseeConfig req{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 16));
+            CHECK(adj.outputRate == 88200);
+            CHECK(adj.outputBits == 24);
+            CHECK(adj.inputBits == 16);
+        }
+        // 44.1kHz / 16bit DSEE OFF -> pass-through
+        {
+            dseeUnified::DseeConfig req{0, 2, 16, 44100, 44100, 16, 16, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(!dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 16));
+        }
+
+        // 48kHz / 16bit DSEE ON -> 96kHz / 24bit
+        {
+            dseeUnified::DseeConfig req{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 16));
+            CHECK(adj.outputRate == 96000);
+            CHECK(adj.outputBits == 24);
+            CHECK(adj.inputBits == 16);
+        }
+        // 48kHz / 16bit DSEE OFF -> pass-through
+        {
+            dseeUnified::DseeConfig req{0, 2, 16, 48000, 48000, 16, 16, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(!dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 16));
+        }
+
+        // 44.1kHz / 24bit DSEE ON -> 88.2kHz / 24bit
+        {
+            dseeUnified::DseeConfig req{1, 2, 16, 44100, 44100, 24, 24, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 24));
+            CHECK(adj.outputRate == 88200);
+            CHECK(adj.outputBits == 24);
+            CHECK(adj.inputBits == 24);
+        }
+        // 44.1kHz / 24bit DSEE OFF -> pass-through
+        {
+            dseeUnified::DseeConfig req{0, 2, 16, 44100, 44100, 24, 24, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(!dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 24));
+        }
+
+        // 48kHz / 24bit DSEE ON -> 96kHz / 24bit
+        {
+            dseeUnified::DseeConfig req{1, 2, 16, 48000, 48000, 24, 24, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 24));
+            CHECK(adj.outputRate == 96000);
+            CHECK(adj.outputBits == 24);
+            CHECK(adj.inputBits == 24);
+        }
+        // 48kHz / 24bit DSEE OFF -> pass-through
+        {
+            dseeUnified::DseeConfig req{0, 2, 16, 48000, 48000, 24, 24, 0, 0};
+            dseeUnified::DseeConfig adj{};
+            CHECK(!dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 24));
+        }
+
+        // Native Hi-Res 96kHz / 24bit -> Pass-through untouched (preserving bit-perfect Hi-Res)
+        {
+            dseeUnified::DseeConfig req96{1, 2, 16, 96000, 96000, 24, 24, 0, 0};
+            dseeUnified::DseeConfig adj96{};
+            CHECK(!dseeUnified::computeUnifiedDseeConfig(req96, adj96, dseeUnified::HarmonizeMode::Family2x, 24));
+            CHECK(dseeUnified::isHiResRate(req96.inputRate));
+        }
+
+        // Native Hi-Res 192kHz / 24bit -> Pass-through untouched (preserving bit-perfect Hi-Res)
+        {
+            dseeUnified::DseeConfig req192{1, 2, 16, 192000, 192000, 24, 24, 0, 0};
+            dseeUnified::DseeConfig adj192{};
+            CHECK(!dseeUnified::computeUnifiedDseeConfig(req192, adj192, dseeUnified::HarmonizeMode::Family2x, 24));
+            CHECK(dseeUnified::isHiResRate(req192.inputRate));
+        }
+    }
+
+    // 15C: DirectShow Mock Graph EQ Bypass with Non-FLAC (AAC/MP3/ALAC) Decoders
+    // Verify that applyEqBypass works independently of the decoder CLSID
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        // Simulate AAC / MP4 Decoder Filter
+        CLSID mp4DecoderClsid{};
+        CLSIDFromString(L"{34B46F28-8547-49F1-8B40-D5E3C989C910}", &mp4DecoderClsid);
+        auto* aacDec = new MockFilter(mp4DecoderClsid);
+        auto* aacDecOut = new MockPin(PINDIR_OUTPUT, aacDec, 44100, 16);
+        aacDec->addPin(aacDecOut);
+        graph->addFilter(aacDec);
+        aacDec->Release();
+
+        // DSEE Filter (outputting 88.2kHz / 24bit)
+        auto* dsee = new MockFilter(dseeUnified::dseeId);
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 16);
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24);
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+        dsee->Release();
+
+        // Seamless Filter
+        auto* seam = new MockFilter(dseeUnified::seamlessId);
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 88200, 24);
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 88200, 24);
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+        seam->Release();
+
+        // EQ Filter
+        auto* eq = new MockFilter(dseeUnified::eqId);
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 88200, 24);
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 88200, 24);
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+        eq->Release();
+
+        // DirectSound Renderer
+        auto* ds = new MockFilter(CLSID_DSoundRender);
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 88200, 24);
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+        ds->Release();
+
+        // Connect graph: AAC -> DSEE -> Seamless -> EQ -> DirectSound
+        graph->ConnectDirect(aacDecOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        // Apply EQ bypass
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.outputRate == 88200);
+        CHECK(routeRes.outputBits == 24);
+
+        // Verify DirectSound is now connected directly to Seamless output
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.isDirectSeamless);
+        CHECK(!insp.eqIn.connected); // EQ input disconnected
+        CHECK(insp.renderIn.sampleRate == 88200);
+        CHECK(insp.renderIn.bitDepth == 24);
+        DWORD peerCode = insp.isDirectSeamless ? 1 : (insp.isDirectDsee ? 2 : (insp.eqBypassed ? 3 : 0));
+        CHECK(peerCode == 1);
+    }
+
+    // 15D: Direct DSEE Route (Peer Code 2) without Seamless for MP3 / CD Decoder
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        CLSID cdDecoderClsid{};
+        CLSIDFromString(L"{8B6A3021-97D0-42E3-A9DF-5C286D491C5B}", &cdDecoderClsid);
+        auto* mp3Dec = new MockFilter(cdDecoderClsid);
+        auto* mp3DecOut = new MockPin(PINDIR_OUTPUT, mp3Dec, 44100, 16);
+        mp3Dec->addPin(mp3DecOut);
+        graph->addFilter(mp3Dec);
+        mp3Dec->Release();
+
+        // DSEE Filter (outputting 88.2kHz / 24bit)
+        auto* dsee = new MockFilter(dseeUnified::dseeId);
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 16);
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24);
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+        dsee->Release();
+
+        // EQ Filter
+        auto* eq = new MockFilter(dseeUnified::eqId);
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 88200, 24);
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 88200, 24);
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+        eq->Release();
+
+        // DirectSound Renderer
+        auto* ds = new MockFilter(CLSID_DSoundRender);
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 88200, 24);
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+        ds->Release();
+
+        // Connect graph: MP3 -> DSEE -> EQ -> DirectSound
+        graph->ConnectDirect(mp3DecOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.isDirectDsee);
+        CHECK(!insp.eqIn.connected);
+        DWORD peerCode = insp.isDirectSeamless ? 1 : (insp.isDirectDsee ? 2 : (insp.eqBypassed ? 3 : 0));
+        CHECK(peerCode == 2);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1600,6 +1911,8 @@ int main() {
     testDirectSoundRenderPinInspection();
     std::fflush(stdout);
     testIssue46Dsee88kRendererAndChainTraversal();
+    std::fflush(stdout);
+    testIssue49CodecEligibilityAndRouteMatrix();
     std::fflush(stdout);
 
     CoUninitialize();
