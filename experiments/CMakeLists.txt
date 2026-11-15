@@ -42,11 +42,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
   target_include_directories(flac24_async_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" eos_transition)
   target_link_libraries(flac24_async_experiment PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32 dsound dxguid)
   target_compile_definitions(flac24_async_experiment PRIVATE UNICODE _UNICODE EXPERIMENT_EOS_TRANSITION EXPERIMENT_ASYNC_VIRTUAL_PAUSE EXPERIMENT_PAUSE_DIAGNOSTICS)
-  # Target for Issue #42: DSEE HX unified 24-bit experiment
+  # Target for Issue #42 & #43: DSEE HX unified 24-bit experiment with synchronous pause-deferral
   add_library(flac24_dsee_experiment SHARED "${PROJECT_SOURCE_DIR}/src/bridge/flac24_override.cpp")
-  target_include_directories(flac24_dsee_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" "${PROJECT_SOURCE_DIR}/src/bridge" dsee_unified)
+  target_include_directories(flac24_dsee_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" "${PROJECT_SOURCE_DIR}/src/bridge" dsee_unified eos_transition)
   target_link_libraries(flac24_dsee_experiment PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32 dsound dxguid)
-  target_compile_definitions(flac24_dsee_experiment PRIVATE UNICODE _UNICODE EXPERIMENT_DSEE_UNIFIED)
+  target_compile_definitions(flac24_dsee_experiment PRIVATE UNICODE _UNICODE EXPERIMENT_DSEE_UNIFIED EXPERIMENT_EOS_TRANSITION)
   # Reuse the production FLAC implementation; WAV hooks are compiled only here.
   add_library(flac24_wav192_experiment SHARED EXCLUDE_FROM_ALL "${PROJECT_SOURCE_DIR}/src/bridge/flac24_override.cpp")
   target_include_directories(flac24_wav192_experiment PRIVATE "${PROJECT_SOURCE_DIR}/src/common" wav192)

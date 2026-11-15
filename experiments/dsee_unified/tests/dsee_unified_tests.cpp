@@ -247,7 +247,7 @@ public:
     IPin* connectedTo = nullptr;
     AM_MEDIA_TYPE mt{};
 
-    MockPin(PIN_DIRECTION d, IBaseFilter* f) : dir(d), filter(f) {
+    MockPin(PIN_DIRECTION d, IBaseFilter* f, DWORD rate = 88200, WORD bits = 24) : dir(d), filter(f) {
         mt.majortype = MEDIATYPE_Audio;
         mt.subtype = MEDIASUBTYPE_PCM;
         mt.formattype = FORMAT_WaveFormatEx;
@@ -256,10 +256,10 @@ public:
         auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
         w->wFormatTag = WAVE_FORMAT_PCM;
         w->nChannels = 2;
-        w->nSamplesPerSec = 88200;
-        w->wBitsPerSample = 24;
-        w->nBlockAlign = 6;
-        w->nAvgBytesPerSec = 88200 * 6;
+        w->nSamplesPerSec = rate;
+        w->wBitsPerSample = bits;
+        w->nBlockAlign = (bits / 8) * 2;
+        w->nAvgBytesPerSec = rate * w->nBlockAlign;
     }
     ~MockPin() {
         if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
@@ -738,6 +738,162 @@ void testLiveSonyFilterIfAvailable() {
     FreeLibrary(module);
 }
 
+// Test 8: Decoder Bit Depth Synchronization & 48k Formats (Issue #43)
+void testDecoderBitsSyncAndUnifiedFormats() {
+    std::printf("[TEST 8] Decoder Bit Depth Synchronization & 48k Formats...\n");
+
+    // 8A: 48kHz / 16bit input
+    dseeUnified::setActiveDecoderBits(16);
+    dseeUnified::DseeConfig req16{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+    dseeUnified::DseeConfig adj16{};
+    CHECK(dseeUnified::computeUnifiedDseeConfig(req16, adj16, dseeUnified::HarmonizeMode::Target96k));
+    CHECK(adj16.inputBits == 16);
+    CHECK(adj16.outputRate == 96000);
+    CHECK(adj16.outputBits == 24);
+
+    // 8B: 48kHz / 24bit native FLAC where OpcFlac requested 16-bit inputBits
+    dseeUnified::setActiveDecoderBits(24);
+    dseeUnified::DseeConfig req24_mismatch{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+    dseeUnified::DseeConfig adj24{};
+    CHECK(dseeUnified::computeUnifiedDseeConfig(req24_mismatch, adj24, dseeUnified::HarmonizeMode::Target96k));
+    // Synchronized inputBits must be 24
+    CHECK(adj24.inputBits == 24);
+    CHECK(adj24.outputRate == 96000);
+    CHECK(adj24.outputBits == 24);
+
+    // Both reach identical renderer format
+    CHECK(adj16.outputRate == adj24.outputRate);
+    CHECK(adj16.outputBits == adj24.outputBits);
+
+    // 8C: Native24b mode (48kHz / 24bit output)
+    dseeUnified::DseeConfig adj16_native{};
+    dseeUnified::DseeConfig adj24_native{};
+    CHECK(dseeUnified::computeUnifiedDseeConfig(req16, adj16_native, dseeUnified::HarmonizeMode::Native24b, 16));
+    CHECK(dseeUnified::computeUnifiedDseeConfig(req24_mismatch, adj24_native, dseeUnified::HarmonizeMode::Native24b, 24));
+    CHECK(adj16_native.outputRate == 48000);
+    CHECK(adj16_native.outputBits == 24);
+    CHECK(adj24_native.outputRate == 48000);
+    CHECK(adj24_native.outputBits == 24);
+    CHECK(adj16_native.outputRate == adj24_native.outputRate);
+}
+
+// Test 9: Full Graph Format Inspection Coverage (Issue #43)
+void testGraphInspectionCoverage() {
+    std::printf("[TEST 9] Full Graph Format Inspection Coverage...\n");
+
+    Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+    // Source (FLAC)
+    CLSID flacClsid{};
+    CLSIDFromString(L"{028A95AA-C956-4874-AD10-C657DB1B00F4}", &flacClsid);
+    auto* src = new MockFilter(flacClsid);
+    auto* srcOut = new MockPin(PINDIR_OUTPUT, src, 48000, 24);
+    src->addPin(srcOut);
+    graph->addFilter(src);
+    src->Release();
+
+    // DSEE
+    auto* dsee = new MockFilter(dseeUnified::dseeId);
+    auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 48000, 24);
+    auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 96000, 24);
+    dsee->addPin(dseeIn);
+    dsee->addPin(dseeOut);
+    graph->addFilter(dsee);
+    dsee->Release();
+
+    // Seamless
+    auto* seam = new MockFilter(dseeUnified::seamlessId);
+    auto* seamIn = new MockPin(PINDIR_INPUT, seam, 96000, 24);
+    auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 96000, 24);
+    seam->addPin(seamIn);
+    seam->addPin(seamOut);
+    graph->addFilter(seam);
+    seam->Release();
+
+    // EQ
+    auto* eq = new MockFilter(dseeUnified::eqId);
+    auto* eqIn = new MockPin(PINDIR_INPUT, eq, 96000, 24);
+    auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 96000, 24);
+    eq->addPin(eqIn);
+    eq->addPin(eqOut);
+    graph->addFilter(eq);
+    eq->Release();
+
+    // DirectSound
+    auto* ds = new MockFilter(CLSID_DSoundRender);
+    auto* dsIn = new MockPin(PINDIR_INPUT, ds, 96000, 24);
+    ds->addPin(dsIn);
+    graph->addFilter(ds);
+    ds->Release();
+
+    // Connect pipeline: FLAC -> DSEE -> Seamless -> EQ -> DirectSound
+    srcOut->ReceiveConnection(dseeIn, nullptr);
+    dseeIn->ReceiveConnection(srcOut, nullptr);
+    dseeOut->ReceiveConnection(seamIn, nullptr);
+    seamIn->ReceiveConnection(dseeOut, nullptr);
+    seamOut->ReceiveConnection(eqIn, nullptr);
+    eqIn->ReceiveConnection(seamOut, nullptr);
+    eqOut->ReceiveConnection(dsIn, nullptr);
+    dsIn->ReceiveConnection(eqOut, nullptr);
+
+    // Inspect
+    dseeUnified::GraphInspection insp{};
+    CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+
+    // Verify 5 stages
+    CHECK(insp.decodePcm.present && insp.decodePcm.connected);
+    CHECK(insp.decodePcm.sampleRate == 48000 && insp.decodePcm.bitDepth == 24);
+
+    CHECK(insp.dseeIn.present && insp.dseeIn.connected);
+    CHECK(insp.dseeIn.sampleRate == 48000 && insp.dseeIn.bitDepth == 24);
+    CHECK(insp.dseeOut.present && insp.dseeOut.connected);
+    CHECK(insp.dseeOut.sampleRate == 96000 && insp.dseeOut.bitDepth == 24);
+
+    CHECK(insp.seamlessIn.present && insp.seamlessIn.connected);
+    CHECK(insp.seamlessIn.sampleRate == 96000 && insp.seamlessIn.bitDepth == 24);
+    CHECK(insp.seamlessOut.present && insp.seamlessOut.connected);
+    CHECK(insp.seamlessOut.sampleRate == 96000 && insp.seamlessOut.bitDepth == 24);
+
+    CHECK(insp.eqIn.present && insp.eqIn.connected);
+    CHECK(insp.eqIn.sampleRate == 96000 && insp.eqIn.bitDepth == 24);
+    CHECK(insp.eqOut.present && insp.eqOut.connected);
+    CHECK(insp.eqOut.sampleRate == 96000 && insp.eqOut.bitDepth == 24);
+
+    CHECK(insp.renderIn.present && insp.renderIn.connected);
+    CHECK(insp.renderIn.sampleRate == 96000 && insp.renderIn.bitDepth == 24);
+    CHECK(!insp.isDirectSeamless);
+
+    // Apply EQ bypass and inspect again
+    auto bypassRes = dseeUnified::applyEqBypass(graph.Get());
+    CHECK(bypassRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+
+    dseeUnified::GraphInspection inspBypassed{};
+    CHECK(dseeUnified::inspectGraphFormats(graph.Get(), inspBypassed));
+    CHECK(inspBypassed.isDirectSeamless);
+    CHECK(inspBypassed.eqIn.present && !inspBypassed.eqIn.connected);
+    CHECK(inspBypassed.renderIn.present && inspBypassed.renderIn.connected);
+    CHECK(inspBypassed.renderIn.sampleRate == 96000 && inspBypassed.renderIn.bitDepth == 24);
+}
+
+// Test 10: Cross-Family (44.1k vs 48k) Alignment Boundary (Issue #43)
+void testCrossFamilyLimitation() {
+    std::printf("[TEST 10] Cross-Family (44.1k vs 48k) Alignment Boundary...\n");
+
+    dseeUnified::DseeConfig req44{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+    dseeUnified::DseeConfig req48{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+
+    // Family2x gives 88.2k vs 96k (different rates)
+    dseeUnified::DseeConfig adj44_2x{}, adj48_2x{};
+    CHECK(dseeUnified::computeUnifiedDseeConfig(req44, adj44_2x, dseeUnified::HarmonizeMode::Family2x));
+    CHECK(dseeUnified::computeUnifiedDseeConfig(req48, adj48_2x, dseeUnified::HarmonizeMode::Family2x));
+    CHECK(adj44_2x.outputRate != adj48_2x.outputRate);
+
+    // Target96k gives 96k for 48k
+    dseeUnified::DseeConfig adj48_96k{};
+    CHECK(dseeUnified::computeUnifiedDseeConfig(req48, adj48_96k, dseeUnified::HarmonizeMode::Target96k));
+    CHECK(adj48_96k.outputRate == 96000);
+}
+
 } // namespace
 
 int main() {
@@ -758,6 +914,12 @@ int main() {
     testDirectShowEqBypassMock();
     std::fflush(stdout);
     testLiveSonyFilterIfAvailable();
+    std::fflush(stdout);
+    testDecoderBitsSyncAndUnifiedFormats();
+    std::fflush(stdout);
+    testGraphInspectionCoverage();
+    std::fflush(stdout);
+    testCrossFamilyLimitation();
     std::fflush(stdout);
 
     CoUninitialize();

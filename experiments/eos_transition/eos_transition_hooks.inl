@@ -196,6 +196,12 @@ static PinOneFn originalEqBeginFlush = nullptr;
 static PinOneFn originalEqEndFlush = nullptr;
 static PinSegmentFn originalEqNewSegment = nullptr;
 
+static MemReceiveFn originalDsRenderReceive = nullptr;
+static PinOneFn originalDsRenderEos = nullptr;
+static PinOneFn originalDsRenderBeginFlush = nullptr;
+static PinOneFn originalDsRenderEndFlush = nullptr;
+static PinSegmentFn originalDsRenderNewSegment = nullptr;
+
 static ControlPauseFn originalControlPause = nullptr;
 static ControlStopFn originalControlStop = nullptr;
 static FilterPauseFn originalFilterPause = nullptr;
@@ -701,6 +707,56 @@ static IPin* findEqInputPinFromGraph(IFilterGraph* graph) {
     return foundPin;
 }
 
+static IPin* findDownstreamInputPinFromGraph(IFilterGraph* graph) {
+    if (!graph) return nullptr;
+    // 1. If EQ is present and connected, use EQ input pin
+    IPin* eqPin = findEqInputPinFromGraph(graph);
+    if (eqPin) {
+        IPin* peer = nullptr;
+        if (SUCCEEDED(eqPin->ConnectedTo(&peer)) && peer) {
+            peer->Release();
+            return eqPin;
+        }
+        eqPin->Release();
+    }
+
+    // 2. If EQ is bypassed or not present, find DirectSoundRender input pin
+    IEnumFilters* filters = nullptr;
+    IPin* dsPin = nullptr;
+    if (SUCCEEDED(graph->EnumFilters(&filters)) && filters) {
+        IBaseFilter* f = nullptr;
+        while (filters->Next(1, &f, nullptr) == S_OK) {
+            CLSID cls{};
+            if (SUCCEEDED(f->GetClassID(&cls)) && cls == CLSID_DSoundRender) {
+                IEnumPins* pins = nullptr;
+                if (SUCCEEDED(f->EnumPins(&pins)) && pins) {
+                    IPin* p = nullptr;
+                    while (pins->Next(1, &p, nullptr) == S_OK) {
+                        PIN_DIRECTION dir{};
+                        if (SUCCEEDED(p->QueryDirection(&dir)) && dir == PINDIR_INPUT) {
+                            dsPin = p;
+                            break;
+                        }
+                        p->Release();
+                    }
+                    pins->Release();
+                }
+            }
+            f->Release();
+            if (dsPin) break;
+        }
+        filters->Release();
+    }
+    return dsPin;
+}
+
+inline void onEosEqBypassed(void* graphKey, bool bypassed) {
+    if (!graphKey) return;
+    AcquireSRWLockExclusive(&eosLock);
+    eosTracker.setEqBypassed(graphKey, bypassed);
+    ReleaseSRWLockExclusive(&eosLock);
+}
+
 static IPin* findEqInputPinInGraph(IPin* seamlessPin) {
     if (!seamlessPin) return nullptr;
     PIN_INFO pi{};
@@ -763,15 +819,24 @@ static HRESULT STDMETHODCALLTYPE seamlessEosHook(IPin* self) {
         ReleaseSRWLockExclusive(&eosLock);
         record("EOS_UPSTREAM", 0, deliverNow ? 1 : 0, hr);
         recordDiag("EOS_UPSTREAM_PROCESSED", key, caller, gen, deliverNow ? 1 : 0, hr);
-        if (deliverNow && originalEqEos) {
-            IPin* eqPin = findEqInputPinInGraph(self);
-            if (eqPin) {
+        if (deliverNow) {
+            IPin* downPin = nullptr;
+            PIN_INFO pi{};
+            if (SUCCEEDED(self->QueryPinInfo(&pi)) && pi.pFilter) {
+                FILTER_INFO fi{};
+                if (SUCCEEDED(pi.pFilter->QueryFilterInfo(&fi)) && fi.pGraph) {
+                    downPin = findDownstreamInputPinFromGraph(fi.pGraph);
+                    fi.pGraph->Release();
+                }
+                pi.pFilter->Release();
+            }
+            if (downPin) {
                 EosHookScope scope;
                 recordDiag("EOS_ENTER_DOWNSTREAM_FROM_SEAMLESS", key, caller, gen, 0, S_OK);
-                auto eqHr = originalEqEos(eqPin);
-                record("EOS_DELIVERED_IMMEDIATE", 0, 1, eqHr);
-                recordDiag("EOS_LEAVE_DOWNSTREAM_FROM_SEAMLESS", key, caller, gen, 0, eqHr);
-                eqPin->Release();
+                auto downHr = downPin->EndOfStream();
+                record("EOS_DELIVERED_IMMEDIATE", 0, 1, downHr);
+                recordDiag("EOS_LEAVE_DOWNSTREAM_FROM_SEAMLESS", key, caller, gen, 0, downHr);
+                downPin->Release();
             }
         }
     }
@@ -827,27 +892,161 @@ static HRESULT STDMETHODCALLTYPE eqReceiveHook(IMemInputPin* self, IMediaSample*
     auto hr = originalEqReceive(self, sample);
     if (!inEosHook && SUCCEEDED(hr) && len > 0) {
         void* key = graphKeyFromMemPin(self);
-        bool deliverEos = false;
-        AcquireSRWLockExclusive(&eosLock);
-        deliverEos = eosTracker.onDownstreamSample(key, static_cast<uint32_t>(len), hasTime, sStart, sEnd);
-        ReleaseSRWLockExclusive(&eosLock);
-        if (deliverEos && originalEqEos) {
-            IPin* pin = nullptr;
-            if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&pin))) && pin) {
-                EosHookScope scope;
-                uint32_t gen = 0;
-                AcquireSRWLockShared(&eosLock);
-                gen = eosTracker.getTransitionGeneration(key);
-                ReleaseSRWLockShared(&eosLock);
-                recordDiag("EOS_ENTER_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(sEnd / 10000), S_OK);
-                auto eosHr = originalEqEndOfStream(pin);
-                record("EOS_DELIVERED_DOWNSTREAM", static_cast<DWORD>(sEnd / 10000), static_cast<DWORD>(len), eosHr);
-                recordDiag("EOS_LEAVE_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(len), eosHr);
-                pin->Release();
+        bool bypassed = false;
+        if (key) {
+            AcquireSRWLockShared(&eosLock);
+            bypassed = eosTracker.isEqBypassed(key);
+            ReleaseSRWLockShared(&eosLock);
+        }
+        if (!bypassed) {
+            bool deliverEos = false;
+            AcquireSRWLockExclusive(&eosLock);
+            deliverEos = eosTracker.onDownstreamSample(key, static_cast<uint32_t>(len), hasTime, sStart, sEnd);
+            ReleaseSRWLockExclusive(&eosLock);
+            if (deliverEos && originalEqEos) {
+                IPin* pin = nullptr;
+                if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&pin))) && pin) {
+                    EosHookScope scope;
+                    uint32_t gen = 0;
+                    AcquireSRWLockShared(&eosLock);
+                    gen = eosTracker.getTransitionGeneration(key);
+                    ReleaseSRWLockShared(&eosLock);
+                    recordDiag("EOS_ENTER_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(sEnd / 10000), S_OK);
+                    auto eosHr = originalEqEndOfStream(pin);
+                    record("EOS_DELIVERED_DOWNSTREAM", static_cast<DWORD>(sEnd / 10000), static_cast<DWORD>(len), eosHr);
+                    recordDiag("EOS_LEAVE_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(len), eosHr);
+                    pin->Release();
+                }
             }
         }
     }
     return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE dsRenderReceiveHook(IMemInputPin* self, IMediaSample* sample) {
+    long len = 0;
+    REFERENCE_TIME sStart = 0, sEnd = 0;
+    bool hasTime = false;
+    if (!inEosHook && sample) {
+        len = sample->GetActualDataLength();
+        hasTime = SUCCEEDED(sample->GetTime(&sStart, &sEnd));
+    }
+    auto hr = originalDsRenderReceive ? originalDsRenderReceive(self, sample) : S_OK;
+    if (!inEosHook && SUCCEEDED(hr) && len > 0) {
+        void* key = graphKeyFromMemPin(self);
+        bool bypassed = false;
+        if (key) {
+            AcquireSRWLockShared(&eosLock);
+            bypassed = eosTracker.isEqBypassed(key);
+            ReleaseSRWLockShared(&eosLock);
+        }
+        if (bypassed) {
+            bool deliverEos = false;
+            AcquireSRWLockExclusive(&eosLock);
+            deliverEos = eosTracker.onDownstreamSample(key, static_cast<uint32_t>(len), hasTime, sStart, sEnd);
+            ReleaseSRWLockExclusive(&eosLock);
+            if (deliverEos && originalDsRenderEos) {
+                IPin* pin = nullptr;
+                if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&pin))) && pin) {
+                    EosHookScope scope;
+                    uint32_t gen = 0;
+                    AcquireSRWLockShared(&eosLock);
+                    gen = eosTracker.getTransitionGeneration(key);
+                    ReleaseSRWLockShared(&eosLock);
+                    recordDiag("EOS_ENTER_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(sEnd / 10000), S_OK);
+                    auto eosHr = originalDsRenderEos(pin);
+                    record("EOS_DELIVERED_DOWNSTREAM", static_cast<DWORD>(sEnd / 10000), static_cast<DWORD>(len), eosHr);
+                    recordDiag("EOS_LEAVE_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(len), eosHr);
+                    pin->Release();
+                }
+            }
+        }
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE dsRenderEosHook(IPin* self) {
+    void* key = graphKeyFromPin(self);
+    void* caller = _ReturnAddress();
+    uint32_t gen = 0;
+    bool bypassed = false;
+    if (key) {
+        AcquireSRWLockShared(&eosLock);
+        bypassed = eosTracker.isEqBypassed(key);
+        gen = eosTracker.getTransitionGeneration(key);
+        ReleaseSRWLockShared(&eosLock);
+    }
+    if (!bypassed) {
+        return originalDsRenderEos ? originalDsRenderEos(self) : S_OK;
+    }
+
+    if (inEosHook) {
+        recordDiag("EOS_ENTER_DSRENDER_INTERNAL", key, caller, gen, 1, S_OK);
+        auto hr = originalDsRenderEos ? originalDsRenderEos(self) : S_OK;
+        recordDiag("EOS_LEAVE_DSRENDER_INTERNAL", key, caller, gen, 1, hr);
+        return hr;
+    }
+
+    recordDiag("EOS_ENTER_DSRENDER_PROPAGATED", key, caller, gen, 0, S_OK);
+    bool allow = true;
+    AcquireSRWLockExclusive(&eosLock);
+    allow = eosTracker.onDownstreamEndOfStream(key);
+    ReleaseSRWLockExclusive(&eosLock);
+    if (!allow) {
+        record("EOS_DUPLICATE_SUPPRESSED", 0, 0, S_OK);
+        recordDiag("EOS_DUPLICATE_SUPPRESSED", key, caller, gen, 0, S_OK);
+        return S_OK;
+    }
+    auto hr = originalDsRenderEos ? originalDsRenderEos(self) : S_OK;
+    record("EOS_PASSTHROUGH_DOWNSTREAM", 0, 1, hr);
+    recordDiag("EOS_LEAVE_DSRENDER_PROPAGATED", key, caller, gen, 0, hr);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE dsRenderBeginFlushHook(IPin* self) {
+    if (!inEosHook) {
+        void* key = graphKeyFromPin(self);
+        bool bypassed = false;
+        if (key) {
+            AcquireSRWLockShared(&eosLock);
+            bypassed = eosTracker.isEqBypassed(key);
+            ReleaseSRWLockShared(&eosLock);
+        }
+        if (bypassed) {
+            void* caller = _ReturnAddress();
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.onBeginFlush(key);
+            uint32_t gen = eosTracker.getTransitionGeneration(key);
+            ReleaseSRWLockExclusive(&eosLock);
+            recordDiag("DSRENDER_BEGIN_FLUSH", key, caller, gen, 0, S_OK);
+        }
+    }
+    return originalDsRenderBeginFlush ? originalDsRenderBeginFlush(self) : S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dsRenderEndFlushHook(IPin* self) {
+    if (!inEosHook) {
+        void* key = graphKeyFromPin(self);
+        bool bypassed = false;
+        if (key) {
+            AcquireSRWLockShared(&eosLock);
+            bypassed = eosTracker.isEqBypassed(key);
+            ReleaseSRWLockShared(&eosLock);
+        }
+        if (bypassed) {
+            void* caller = _ReturnAddress();
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.onEndFlush(key);
+            uint32_t gen = eosTracker.getTransitionGeneration(key);
+            ReleaseSRWLockExclusive(&eosLock);
+            recordDiag("DSRENDER_END_FLUSH", key, caller, gen, 0, S_OK);
+        }
+    }
+    return originalDsRenderEndFlush ? originalDsRenderEndFlush(self) : S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dsRenderNewSegmentHook(IPin* self, REFERENCE_TIME tStart, REFERENCE_TIME tStop, double rate) {
+    return originalDsRenderNewSegment ? originalDsRenderNewSegment(self, tStart, tStop, rate) : S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE eqEosHook(IPin* self) {
@@ -924,8 +1123,8 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
     IDirectSoundBuffer* dsBuf = nullptr;
     if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&graph))) && graph) {
         dsBuf = findDirectSoundBufferFromGraph(graph);
-        IPin* eqPin = findEqInputPinFromGraph(graph);
-        if (eqPin) {
+        IPin* downPin = findDownstreamInputPinFromGraph(graph);
+        if (downPin) {
             bool deliverNow = false;
             AcquireSRWLockExclusive(&eosLock);
             const auto* g = eosTracker.findGraph(key);
@@ -934,19 +1133,19 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
                 eosTracker.onDownstreamEndOfStream(key);
             }
             ReleaseSRWLockExclusive(&eosLock);
-            if (deliverNow && originalEqEos) {
+            if (deliverNow) {
                 uint32_t gen = 0;
                 AcquireSRWLockShared(&eosLock);
                 gen = eosTracker.getTransitionGeneration(key);
                 ReleaseSRWLockShared(&eosLock);
-                recordDiag("EQ_EOS_CALL_ENTER", key, caller, gen, 0, S_OK);
+                recordDiag("DOWNSTREAM_EOS_CALL_ENTER", key, caller, gen, 0, S_OK);
                 DWORD eosStart = GetTickCount();
                 EosHookScope scope;
-                auto eqHr = originalEqEndOfStream(eqPin);
+                auto downHr = downPin->EndOfStream();
                 DWORD eosDuration = GetTickCount() - eosStart;
-                recordDiag("EQ_EOS_CALL_LEAVE", key, caller, eosDuration, gen, eqHr);
+                recordDiag("DOWNSTREAM_EOS_CALL_LEAVE", key, caller, eosDuration, gen, downHr);
             }
-            eqPin->Release();
+            downPin->Release();
         }
         graph->Release();
     }
@@ -1702,11 +1901,11 @@ static HRESULT STDMETHODCALLTYPE controlStopHook(IMediaControl* self) {
             eosTracker.markFormatChangeStopDeferred(key);
             ReleaseSRWLockExclusive(&eosLock);
 
-            // 1. Deliver EOS once to EQ if not yet delivered
+            // 1. Deliver EOS once to downstream if not yet delivered
             IFilterGraph* graph = nullptr;
             if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&graph))) && graph) {
-                IPin* eqPin = findEqInputPinFromGraph(graph);
-                if (eqPin) {
+                IPin* downPin = findDownstreamInputPinFromGraph(graph);
+                if (downPin) {
                     bool deliverNow = false;
                     AcquireSRWLockExclusive(&eosLock);
                     const auto* gCheck = eosTracker.findGraph(key);
@@ -1715,12 +1914,12 @@ static HRESULT STDMETHODCALLTYPE controlStopHook(IMediaControl* self) {
                         eosTracker.onDownstreamEndOfStream(key);
                     }
                     ReleaseSRWLockExclusive(&eosLock);
-                    if (deliverNow && originalEqEos) {
+                    if (deliverNow) {
                         EosHookScope scope;
-                        originalEqEndOfStream(eqPin);
+                        downPin->EndOfStream();
                         recordDiag("EOS_DELIVERED_DEFERRED_STOP", key, caller, 0, 1, S_OK);
                     }
-                    eqPin->Release();
+                    downPin->Release();
                 }
                 graph->Release();
             }
@@ -2059,5 +2258,17 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
                         eqEndFlushHook, &originalEqEndFlush,
                         eqNewSegmentHook, &originalEqNewSegment);
     eq->Release();
-    return ok;
+    if (!ok) return false;
+
+    IBaseFilter* dsRender = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_DSoundRender, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dsRender))) && dsRender) {
+        hookPinMethods(dsRender,
+                       dsRenderReceiveHook, &originalDsRenderReceive,
+                       dsRenderEosHook, &originalDsRenderEos,
+                       dsRenderBeginFlushHook, &originalDsRenderBeginFlush,
+                       dsRenderEndFlushHook, &originalDsRenderEndFlush,
+                       dsRenderNewSegmentHook, &originalDsRenderNewSegment);
+        dsRender->Release();
+    }
+    return true;
 }

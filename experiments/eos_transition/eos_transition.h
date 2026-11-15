@@ -82,6 +82,7 @@ struct GraphState {
     uint64_t downstreamBytes = 0;
     REFERENCE_TIME downstreamLastEndTime = -1;
     bool downstreamHasTimestamp = false;
+    bool eqBypassed = false;
 
     LONGLONG stopPosition = 0;
     LONGLONG currentPosition = 0;
@@ -210,6 +211,18 @@ public:
         if (!active24) {
             s.eosPending = false;
         }
+    }
+
+    void setEqBypassed(void* graphKey, bool bypassed) {
+        if (!graphKey) return;
+        auto& s = ensureGraph(graphKey);
+        s.eqBypassed = bypassed;
+    }
+
+    bool isEqBypassed(void* graphKey) {
+        if (!graphKey) return false;
+        auto* s = findGraph(graphKey);
+        return s ? s->eqBypassed : false;
     }
 
     // Called on 0x31E7A (next-track pre-read setter) when the graph key is known,

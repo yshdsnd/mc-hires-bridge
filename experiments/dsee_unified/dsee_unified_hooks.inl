@@ -1,5 +1,5 @@
 #pragma once
-// DSEE Unified 24-bit hooks for Issue #42.
+// DSEE Unified 24-bit hooks for Issue #42 and #43.
 // Included only when EXPERIMENT_DSEE_UNIFIED is defined.
 #include "dsee_unified_config.h"
 #include "dsee_unified_route.h"
@@ -8,7 +8,7 @@ namespace dseeUnified {
 
 using DseeSetter = HRESULT(STDMETHODCALLTYPE*)(IUnknown*, DseeConfig);
 static DseeSetter originalDsee = nullptr;
-static HarmonizeMode g_harmonizeMode = HarmonizeMode::Family2x;
+static HarmonizeMode g_harmonizeMode = HarmonizeMode::Target96k;
 static GraphTracker g_graphTracker;
 static thread_local bool g_inPrepareGraph = false;
 
@@ -24,9 +24,33 @@ inline GraphTracker& getGraphTracker() {
     return g_graphTracker;
 }
 
+inline void recordGraphInspection(const GraphInspection& insp, uint32_t gen) {
+    record("GRAPH_GEN", gen, insp.isDirectSeamless ? 1 : 0, S_OK);
+    record("GRAPH_DECODE_PCM", insp.decodePcm.sampleRate, insp.decodePcm.bitDepth, HRESULT(insp.decodePcm.channels));
+    if (insp.dseeIn.present) {
+        record("GRAPH_DSEE_IN", insp.dseeIn.sampleRate, insp.dseeIn.bitDepth, HRESULT(insp.dseeIn.channels));
+        record("GRAPH_DSEE_OUT", insp.dseeOut.sampleRate, insp.dseeOut.bitDepth, HRESULT(insp.dseeOut.channels));
+    } else {
+        record("GRAPH_DSEE_ABSENT", gen, 0, S_FALSE);
+    }
+    record("GRAPH_SEAMLESS_IN", insp.seamlessIn.sampleRate, insp.seamlessIn.bitDepth, HRESULT(insp.seamlessIn.channels));
+    record("GRAPH_SEAMLESS_OUT", insp.seamlessOut.sampleRate, insp.seamlessOut.bitDepth, HRESULT(insp.seamlessOut.channels));
+    if (insp.eqIn.present && insp.eqIn.connected) {
+        record("GRAPH_EQ_IN", insp.eqIn.sampleRate, insp.eqIn.bitDepth, HRESULT(insp.eqIn.channels));
+        record("GRAPH_EQ_OUT", insp.eqOut.sampleRate, insp.eqOut.bitDepth, HRESULT(insp.eqOut.channels));
+    } else if (insp.eqIn.present && !insp.eqIn.connected) {
+        record("GRAPH_EQ_BYPASSED", gen, 0, S_OK);
+    } else {
+        record("GRAPH_EQ_ABSENT", gen, 0, S_OK);
+    }
+    record("GRAPH_RENDER_IN", insp.renderIn.sampleRate, insp.renderIn.bitDepth, HRESULT(insp.renderIn.channels));
+    record("GRAPH_RENDER_PEER", insp.isDirectSeamless ? 1 : 0, 0, S_OK);
+}
+
 static HRESULT STDMETHODCALLTYPE dseeUnifiedSetterHook(IUnknown* self, DseeConfig config) {
     void* caller = _ReturnAddress();
     CodecType codec = identifyCallerCodec(caller);
+    g_harmonizeMode = initHarmonizeModeFromEnv();
 
     record("DSEE_REQ_IN", config.inputRate, config.inputBits, HRESULT(config.mode));
     record("DSEE_REQ_OUT", config.outputRate, config.outputBits, HRESULT(codec));
@@ -45,12 +69,17 @@ static HRESULT STDMETHODCALLTYPE dseeUnifiedSetterHook(IUnknown* self, DseeConfi
         return hr;
     }
 
+    WORD decBits = getActiveDecoderBits().load();
     DseeConfig adjusted{};
-    if (!computeUnifiedDseeConfig(config, adjusted, g_harmonizeMode)) {
+    if (!computeUnifiedDseeConfig(config, adjusted, g_harmonizeMode, decBits)) {
         auto hr = originalDsee(self, config);
         rememberSource(self, false);
         record("DSEE_PASS_THROUGH", config.outputRate, config.outputBits, hr);
         return hr;
+    }
+
+    if (config.inputBits != adjusted.inputBits) {
+        record("DSEE_IN_BITS_SYNC", config.inputBits, adjusted.inputBits, S_OK);
     }
 
     auto hr = originalDsee(self, adjusted);
@@ -82,6 +111,11 @@ static HRESULT prepareDseeGraph(IUnknown* object) {
                             "DSEE_EQ_SKIPPED";
     record(eventName, routeRes.outputRate, routeRes.outputBits, routeRes.change);
 
+#ifdef EXPERIMENT_EOS_TRANSITION
+    bool bypassed = (routeRes.outcome == RouteOutcome::Bypassed || routeRes.outcome == RouteOutcome::AlreadyBypassed);
+    onEosEqBypassed(graph.Get(), bypassed);
+#endif
+
     // Track graph lifecycle: recreated vs reused
     if (routeRes.outputRate > 0) {
         auto trans = g_graphTracker.onGraphEvent(graph.Get(), routeRes.outputRate, routeRes.outputBits, CodecType::Unknown);
@@ -92,6 +126,12 @@ static HRESULT prepareDseeGraph(IUnknown* object) {
         } else if (trans == GraphTransitionType::ReusedFormatSwitched) {
             record("GRAPH_REUSED", routeRes.outputRate, routeRes.outputBits, S_FALSE);
         }
+    }
+
+    // Inspect and record negotiated audio formats on all 5 graph stages for this generation
+    GraphInspection insp{};
+    if (inspectGraphFormats(graph.Get(), insp)) {
+        recordGraphInspection(insp, g_graphTracker.generation);
     }
 
     return S_OK;

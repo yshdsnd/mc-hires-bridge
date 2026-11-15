@@ -69,7 +69,11 @@ static void updateStatus(IUnknown* object,HRESULT result);
 static HRESULT STDMETHODCALLTYPE setterHook(IUnknown* self,DWORD value){
     auto caller=_ReturnAddress();
     bool known=knownCaller(caller);
-    bool eligible=value==16&&known&&bridgeStatus::directSoundSelected()&&isNativeSupported24(self);
+    bool isNative24 = isNativeSupported24(self);
+    bool eligible=value==16&&known&&bridgeStatus::directSoundSelected()&&isNative24;
+#ifdef EXPERIMENT_DSEE_UNIFIED
+    dseeUnified::setActiveDecoderBits(isNative24 ? 24 : 16);
+#endif
     if(!eligible){auto hr=original(self,value);rememberSource(self,false);record("PASS_THROUGH",value,value,hr);
 #ifdef EXPERIMENT_EOS_TRANSITION
         if(known)onEosSetterDecision(self,caller,false,hr);

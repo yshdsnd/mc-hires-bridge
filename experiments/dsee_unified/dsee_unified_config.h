@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <atomic>
 
 namespace dseeUnified {
 
@@ -78,16 +79,45 @@ inline bool isHiResRate(DWORD rate) {
     return rate >= 88200;
 }
 
-// Harmonization mode for Issue #42
+// Harmonization mode for Issue #42 and #43
 enum class HarmonizeMode {
-    Family2x,   // 44.1k -> 88.2k/24b, 48k -> 96k/24b (integer 2x within family)
-    Common96k,  // Request 96k/24b (48k -> 96k/24b; 44.1k DSEE internal integer multiple 176.4k/24b)
+    Target96k,  // Target 96k/24b (48k -> 96k/24b; 44.1k DSEE internal multiple 176.4k/24b)
+    Common96k = Target96k,
     Native24b,  // 44.1k -> 44.1k/24b, 48k -> 48k/24b (bit-depth expansion without rate change)
+    Family2x,   // 44.1k -> 88.2k/24b, 48k -> 96k/24b (integer 2x within family)
     Family4x    // 44.1k -> 176.4k/24b, 48k -> 192k/24b (maximum 4x integer upsampling)
 };
 
+inline std::atomic<WORD>& getActiveDecoderBits() {
+    static std::atomic<WORD> s_bits{0};
+    return s_bits;
+}
+
+inline void setActiveDecoderBits(WORD bits) {
+    getActiveDecoderBits().store(bits);
+}
+
+inline HarmonizeMode initHarmonizeModeFromEnv() {
+    wchar_t buf[32]{};
+    DWORD n = GetEnvironmentVariableW(L"MC_BRIDGE_DSEE_MODE", buf, 32);
+    if (n > 0) {
+        if (_wcsicmp(buf, L"native24") == 0 || _wcsicmp(buf, L"native24b") == 0 || _wcsicmp(buf, L"native") == 0) {
+            return HarmonizeMode::Native24b;
+        } else if (_wcsicmp(buf, L"family2x") == 0 || _wcsicmp(buf, L"2x") == 0) {
+            return HarmonizeMode::Family2x;
+        } else if (_wcsicmp(buf, L"family4x") == 0 || _wcsicmp(buf, L"4x") == 0) {
+            return HarmonizeMode::Family4x;
+        } else if (_wcsicmp(buf, L"96k") == 0 || _wcsicmp(buf, L"target96k") == 0 || _wcsicmp(buf, L"common96k") == 0) {
+            return HarmonizeMode::Target96k;
+        }
+    }
+    return HarmonizeMode::Target96k;
+}
+
 // Computes adjusted DseeConfig for 44.1kHz/48kHz PCM when DSEE HX is ON
-inline bool computeUnifiedDseeConfig(const DseeConfig& req, DseeConfig& adjusted, HarmonizeMode mode = HarmonizeMode::Family2x) {
+inline bool computeUnifiedDseeConfig(const DseeConfig& req, DseeConfig& adjusted,
+                                     HarmonizeMode mode = HarmonizeMode::Target96k,
+                                     WORD actualInputBits = 0) {
     // Only adjust when DSEE HX is ON and input is 44.1kHz or 48kHz
     if (req.mode != 1) return false;
     if (!isTargetInputRate(req.inputRate)) return false;
@@ -98,9 +128,15 @@ inline bool computeUnifiedDseeConfig(const DseeConfig& req, DseeConfig& adjusted
     adjusted.outputBits = 24;
     adjusted.format = 16; // Standard parameterization format
 
+    // Synchronize inputBits with true decoded PCM bit depth to avoid 16-bit DSEE mismatch on 24-bit tracks
+    WORD trueBits = actualInputBits ? actualInputBits : getActiveDecoderBits().load();
+    if (trueBits == 16 || trueBits == 24) {
+        adjusted.inputBits = trueBits;
+    }
+
     switch (mode) {
-        case HarmonizeMode::Common96k:
-            // Issue #42 test: Request 96kHz/24bit common specification
+        case HarmonizeMode::Target96k:
+            // Issue #42 / #43: Request 96kHz/24bit (for 48k: exact 96kHz/24bit; for 44.1k: DSEE DSP clamps to 176.4k/24bit)
             adjusted.outputRate = 96000;
             break;
         case HarmonizeMode::Native24b:

@@ -120,6 +120,64 @@ The hook immediately passes the configuration directly to `originalDsee` untouch
 ## 7. Diagnostic and Build Integration
 
 - **Target `flac24_dsee_experiment`**:
-  Experimental DLL implementing DSEE HX unified 24-bit hooks.
+  Experimental DLL implementing DSEE HX unified 24-bit hooks combined with synchronous track-tail preservation (`MC_BRIDGE_PAUSE_MODE=defer`).
 - **Target `dsee_unified_tests`**:
-  Headless automated test executable covering configuration logic, codec identification, Hi-Res bypass, constraint verification, mock DirectShow graph routing & rollback, and live Sony filter negotiation.
+  Headless automated test executable covering configuration logic, codec identification, Hi-Res bypass, constraint verification, mock DirectShow graph routing & rollback, live Sony filter negotiation, decoder bit depth synchronization, and 5-stage graph format inspection.
+
+---
+
+## 8. Issue #43: Pipeline Format Correlation, 24-bit Input Synchronization, and Synchronous Track-Tail Integration
+
+### 8.1 Format Inspection Across All Five Pipeline Stages
+
+To eliminate ambiguity between setter return values (`S_OK`), status badge display (`HR-BR ON`), and actual audio hardware formats, `inspectGraphFormats` and `recordGraphInspection` correlate negotiated `WAVEFORMATEX` parameters across every active stage in the same graph generation:
+
+```
+[Decoded PCM Source] -> [DSEE HX In / Out] -> [Seamless In / Out] -> [EQ In / Out] -> [DirectSound Render In]
+```
+
+Diagnostics emitted for each track transition generation (`gen`):
+- `GRAPH_GEN`: Current graph transition generation and active graph pointer.
+- `GRAPH_DECODE_PCM`: Decoded PCM output format from source filter (e.g. `OmgFlacSrc`).
+- `GRAPH_DSEE_IN` / `GRAPH_DSEE_OUT`: DSEE HX filter input and output pin connection formats. If DSEE is bypassed/absent, `GRAPH_DSEE_ABSENT` is emitted.
+- `GRAPH_SEAMLESS_IN` / `GRAPH_SEAMLESS_OUT`: Seamless buffer filter input and output formats.
+- `GRAPH_EQ_IN` / `GRAPH_EQ_OUT`: Graphic Equalizer input and output formats. When bypassed, `GRAPH_EQ_BYPASSED` is emitted.
+- `GRAPH_RENDER_IN`: Actual connection media type on `CLSID_DSoundRender` input pin.
+- `GRAPH_RENDER_PEER`: Indicates peer connection: `1` for direct connection from SeamlessFilter, `0` via EQ.
+
+### 8.2 Root Cause and Resolution of 24-bit Native FLAC DSEE Mismatch
+
+#### Root Cause
+1. During graph construction, `OpcFlac.dll` initialized `OmgDseeHxFilter` via slot 3 with `config.inputBits = 16` based on the default DirectSound profile before `setterHook` intercepted `OmgFlacSrc` to override decoding to 24-bit.
+2. Because DSEE HX received `inputBits = 16`, `OmgDseeHxFilter` configured its internal DSP and input pin for 16-bit PCM.
+3. When `OmgFlacSrc` delivered 24-bit PCM, `OmgDseeHxFilter::ReceiveConnection` rejected the media type (`0x80040207`).
+4. `OpcFlac.dll` fell back to bypassing DSEE entirely, wiring `OmgFlacSrc -> SeamlessFilter` directly (outputting 48kHz/24bit native without DSEE HX).
+
+#### Resolution
+- `setActiveDecoderBits(24)` is recorded in `setterHook` as soon as native 24-bit capability is detected.
+- `computeUnifiedDseeConfig` checks `getActiveDecoderBits()` and synchronizes `adjusted.inputBits = 24`.
+- `dseeUnifiedSetterHook` logs `DSEE_IN_BITS_SYNC 16 24` and configures `OmgDseeHxFilter` with `inputBits = 24`.
+- Both 48kHz/16-bit and 48kHz/24-bit FLAC tracks now negotiate through `OmgDseeHxFilter` and arrive at the exact same renderer format:
+  - Default / `MC_BRIDGE_DSEE_MODE=96k`: **`96000 Hz, 24-bit, 2ch`**
+  - `MC_BRIDGE_DSEE_MODE=native24`: **`48000 Hz, 24-bit, 2ch`**
+
+### 8.3 Single Experimental DLL with Synchronous Track-Tail Preservation (`MC_BRIDGE_PAUSE_MODE=defer`)
+
+In `flac24_dsee_experiment`:
+1. Both `EXPERIMENT_DSEE_UNIFIED` and `EXPERIMENT_EOS_TRANSITION` are compiled together into a single DLL.
+2. When EQ is bypassed, `OmgEqxlFilter.ax` receives 0 samples. To keep downstream sample accounting functional:
+   - DirectSoundRender input pin (`CLSID_DSoundRender`) is hooked with `dsRenderReceiveHook`, `dsRenderEosHook`, `dsRenderBeginFlushHook`, and `dsRenderEndFlushHook`.
+   - When `isEqBypassed` is true, downstream sample counts (`downstreamBytes`) are incremented on `DirectSoundRender::Receive`.
+   - Synchronous track-tail deferral (`deferFormatChangePause`) tracks downstream PCM consumption directly at the renderer input and unblocks naturally at the track tail.
+3. When DSEE is OFF or for native Hi-Res audio, existing routing is untouched (`applyEqBypass` is skipped and standard downstream paths operate normally).
+
+### 8.4 Cross-Family (44.1kHz vs 48kHz) Common Sample Rate Analysis
+
+- The user clarified that `Family2x` (88.2kHz vs 96kHz) is **not** a common sample rate.
+- Investigation confirmed that Sony's `OmgDseeHxFilter.ax` internal DSP algorithm is an integer-ratio polyphase upsampler:
+  - 44.1kHz can only upsample to 44.1k, 88.2k, or 176.4k.
+  - 48.0kHz can only upsample to 48.0k, 96.0k, or 192.0k.
+- Setting `outputRate = 96000` for 44.1kHz causes DSEE HX to reject fractional resampling and clamp to 176.4kHz/24-bit.
+- **Architectural Conclusion**: To achieve a single, truly unified sample rate across 44.1kHz and 48kHz (e.g. universal 96kHz or 192kHz output for all tracks):
+  - An external DirectShow Resampler filter (such as Microsoft's standard Audio Resampler DSP / MFT or custom sinc-interpolator) must be inserted between `SeamlessFilter` and `DirectSoundRender`.
+  - Within each rate family (e.g. 48kHz/16bit and 48kHz/24bit), DSEE HX natively unifies both to 24-bit without requiring an external resampler.

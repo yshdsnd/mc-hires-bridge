@@ -13,6 +13,8 @@ using Microsoft::WRL::ComPtr;
 inline const CLSID dseeId = {0xa481d160, 0xab4d, 0x4b97, {0x93, 0xfe, 0xc1, 0xf4, 0xb4, 0xb7, 0x81, 0xdf}};
 inline const CLSID seamlessId = {0x6af73f1f, 0x1266, 0x46e6, {0x9a, 0x36, 0xee, 0x75, 0xe4, 0xba, 0x10, 0xbb}};
 inline const CLSID eqId = {0x5c968488, 0x5e35, 0x4cfe, {0x98, 0xa1, 0xa5, 0x1c, 0x83, 0x87, 0x97, 0xdb}};
+inline const CLSID flacId = {0x028a95aa, 0xc956, 0x4874, {0xad, 0x10, 0xc6, 0x57, 0xdb, 0x1b, 0x00, 0xf4}};
+inline const CLSID wavParserId = {0xd9ce8cdc, 0xb4e2, 0x45b6, {0x8e, 0xe9, 0x09, 0xde, 0x2b, 0x40, 0x6e, 0x60}};
 
 struct RouteType {
     AM_MEDIA_TYPE value{};
@@ -48,7 +50,29 @@ struct RouteResult {
     WORD outputChannels = 0;
 };
 
+struct FormatStage {
+    bool present = false;
+    bool connected = false;
+    DWORD sampleRate = 0;
+    WORD bitDepth = 0;
+    WORD channels = 0;
+};
+
+struct GraphInspection {
+    FormatStage decodePcm;
+    FormatStage dseeIn;
+    FormatStage dseeOut;
+    FormatStage seamlessIn;
+    FormatStage seamlessOut;
+    FormatStage eqIn;
+    FormatStage eqOut;
+    FormatStage renderIn;
+    bool eqBypassed = false;
+    bool isDirectSeamless = false;
+};
+
 inline ComPtr<IPin> findUniquePin(IBaseFilter* filter, PIN_DIRECTION wanted) {
+    if (!filter) return {};
     ComPtr<IEnumPins> pins;
     if (FAILED(filter->EnumPins(&pins))) return {};
     ComPtr<IPin> p, found;
@@ -63,21 +87,108 @@ inline ComPtr<IPin> findUniquePin(IBaseFilter* filter, PIN_DIRECTION wanted) {
     return found;
 }
 
-// Bypasses OmgEqxlFilter (EQ) so SeamlessFilter outputs directly to DirectSound
+inline bool readPinAudioFormat(IPin* pin, FormatStage& stage) {
+    if (!pin) return false;
+    stage.present = true;
+    ComPtr<IPin> peer;
+    if (SUCCEEDED(pin->ConnectedTo(&peer)) && peer) {
+        stage.connected = true;
+    }
+    AM_MEDIA_TYPE mt{};
+    if (SUCCEEDED(pin->ConnectionMediaType(&mt))) {
+        if (mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
+            auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
+            stage.sampleRate = w->nSamplesPerSec;
+            stage.bitDepth = w->wBitsPerSample;
+            stage.channels = w->nChannels;
+        }
+        if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+        if (mt.pUnk) mt.pUnk->Release();
+        return stage.connected;
+    }
+    return false;
+}
+
+// Inspects negotiated audio formats across all 5 DirectShow graph stages:
+// Decode PCM -> DSEE In/Out -> Seamless In/Out -> EQ In/Out -> DirectSound In
+inline bool inspectGraphFormats(IGraphBuilder* graph, GraphInspection& out) {
+    if (!graph) return false;
+    out = GraphInspection{};
+
+    ComPtr<IEnumFilters> enumFilters;
+    if (FAILED(graph->EnumFilters(&enumFilters)) || !enumFilters) return false;
+
+    ComPtr<IBaseFilter> decoderFilter, dseeFilter, seamFilter, eqFilter, dsFilter;
+    ComPtr<IBaseFilter> f;
+    while (enumFilters->Next(1, &f, nullptr) == S_OK) {
+        CLSID id{};
+        if (SUCCEEDED(f->GetClassID(&id))) {
+            if (id == dseeId) dseeFilter = f;
+            else if (id == seamlessId) seamFilter = f;
+            else if (id == eqId) eqFilter = f;
+            else if (id == CLSID_DSoundRender) dsFilter = f;
+            else if (id == flacId || id == wavParserId) decoderFilter = f;
+            else if (!decoderFilter) {
+                // If not identified by known CLSID, check if output pin provides PCM audio
+                auto outPin = findUniquePin(f.Get(), PINDIR_OUTPUT);
+                FormatStage probe{};
+                if (readPinAudioFormat(outPin.Get(), probe) && probe.sampleRate > 0) {
+                    decoderFilter = f;
+                }
+            }
+        }
+        f.Reset();
+    }
+
+    if (decoderFilter) {
+        auto outPin = findUniquePin(decoderFilter.Get(), PINDIR_OUTPUT);
+        readPinAudioFormat(outPin.Get(), out.decodePcm);
+    }
+    if (dseeFilter) {
+        auto inPin = findUniquePin(dseeFilter.Get(), PINDIR_INPUT);
+        auto outPin = findUniquePin(dseeFilter.Get(), PINDIR_OUTPUT);
+        readPinAudioFormat(inPin.Get(), out.dseeIn);
+        readPinAudioFormat(outPin.Get(), out.dseeOut);
+    }
+    if (seamFilter) {
+        auto inPin = findUniquePin(seamFilter.Get(), PINDIR_INPUT);
+        auto outPin = findUniquePin(seamFilter.Get(), PINDIR_OUTPUT);
+        readPinAudioFormat(inPin.Get(), out.seamlessIn);
+        readPinAudioFormat(outPin.Get(), out.seamlessOut);
+    }
+    if (eqFilter) {
+        auto inPin = findUniquePin(eqFilter.Get(), PINDIR_INPUT);
+        auto outPin = findUniquePin(eqFilter.Get(), PINDIR_OUTPUT);
+        readPinAudioFormat(inPin.Get(), out.eqIn);
+        readPinAudioFormat(outPin.Get(), out.eqOut);
+    }
+    if (dsFilter) {
+        auto inPin = findUniquePin(dsFilter.Get(), PINDIR_INPUT);
+        readPinAudioFormat(inPin.Get(), out.renderIn);
+        if (inPin && seamFilter) {
+            auto seamOut = findUniquePin(seamFilter.Get(), PINDIR_OUTPUT);
+            ComPtr<IPin> currentPeer;
+            if (SUCCEEDED(inPin->ConnectedTo(&currentPeer)) && seamOut && currentPeer.Get() == seamOut.Get()) {
+                out.isDirectSeamless = true;
+                out.eqBypassed = true;
+            }
+        }
+    }
+    if (!out.eqIn.connected) {
+        out.eqBypassed = true;
+    }
+    return true;
+}
+
+// Bypasses OmgEqxlFilter (EQ) so SeamlessFilter outputs directly to DirectSound.
+// Ensures robust handling across initial playback and seamless track transitions.
 inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     RouteResult result;
     if (!graph) return result;
 
-    ComPtr<IMediaControl> control;
-    OAFilterState state{};
-    if (FAILED(graph->QueryInterface(IID_PPV_ARGS(&control))) ||
-        control->GetState(0, &state) != S_OK || state != State_Stopped) {
-        return result;
-    }
-
     ComPtr<IBaseFilter> dseeFilter, seamFilter, eqFilter, dsFilter;
     ComPtr<IEnumFilters> enumFilters;
-    if (FAILED(graph->EnumFilters(&enumFilters))) return result;
+    if (FAILED(graph->EnumFilters(&enumFilters)) || !enumFilters) return result;
 
     ComPtr<IBaseFilter> f;
     while (enumFilters->Next(1, &f, nullptr) == S_OK) {
@@ -98,24 +209,26 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     auto dsIn = findUniquePin(dsFilter.Get(), PINDIR_INPUT);
     if (!seamOut || !dsIn) return result;
 
-    // Check if Seamless is already connected directly to DirectSound
+    // Check FIRST if Seamless is already connected directly to DirectSound
+    // This check is state-independent and must always populate negotiated render format.
     ComPtr<IPin> currentPeer;
     if (SUCCEEDED(seamOut->ConnectedTo(&currentPeer)) && currentPeer.Get() == dsIn.Get()) {
         result.outcome = RouteOutcome::AlreadyBypassed;
         result.change = S_OK;
 
         AM_MEDIA_TYPE mt{};
-        if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= 16) {
+        if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
             auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
             result.outputRate = w->nSamplesPerSec;
             result.outputBits = w->wBitsPerSample;
             result.outputChannels = w->nChannels;
             if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+            if (mt.pUnk) mt.pUnk->Release();
         }
         return result;
     }
 
-    // If EQ is present, trace the edges to disconnect and reconnect Seamless -> DirectSound
+    // If EQ is not present or disconnected, nothing to bypass
     if (!eqFilter) return result;
 
     auto eqIn = findUniquePin(eqFilter.Get(), PINDIR_INPUT);
@@ -126,6 +239,21 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     ComPtr<IPin> seamPeer, eqPeer;
     if (FAILED(seamOut->ConnectedTo(&seamPeer)) || seamPeer.Get() != eqIn.Get()) return result;
     if (FAILED(eqOut->ConnectedTo(&eqPeer)) || eqPeer.Get() != dsIn.Get()) return result;
+
+    // DirectShow filter state handling:
+    // If graph is paused (e.g. during track transition), transition temporarily to stopped
+    // to rewire connections safely, then restore previous state.
+    ComPtr<IMediaControl> control;
+    OAFilterState state = State_Stopped;
+    if (SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&control)))) {
+        control->GetState(0, &state);
+    }
+    bool wasPaused = (state == State_Paused);
+    if (wasPaused) {
+        control->Stop();
+    } else if (state != State_Stopped) {
+        return result; // Cannot rewire while running
+    }
 
     // Save existing media types for rollback
     auto edgeSeamEq = std::make_unique<RouteEdge>();
@@ -153,15 +281,19 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     HRESULT hr = graph->ConnectDirect(seamOut.Get(), dsIn.Get(), nullptr);
     if (SUCCEEDED(hr)) {
         AM_MEDIA_TYPE mt{};
-        if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= 16) {
+        if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
             auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
             result.outputRate = w->nSamplesPerSec;
             result.outputBits = w->wBitsPerSample;
             result.outputChannels = w->nChannels;
             if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+            if (mt.pUnk) mt.pUnk->Release();
         }
         if (seeking) {
             seeking->SetPositions(&position, AM_SEEKING_AbsolutePositioning, nullptr, AM_SEEKING_NoPositioning);
+        }
+        if (wasPaused) {
+            control->Pause();
         }
         result.outcome = RouteOutcome::Bypassed;
         result.change = hr;
@@ -177,6 +309,9 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     HRESULT rollback = SUCCEEDED(r1) ? r2 : r1;
     if (seeking) {
         seeking->SetPositions(&position, AM_SEEKING_AbsolutePositioning, nullptr, AM_SEEKING_NoPositioning);
+    }
+    if (wasPaused) {
+        control->Pause();
     }
     result.change = hr;
     result.restore = rollback;
