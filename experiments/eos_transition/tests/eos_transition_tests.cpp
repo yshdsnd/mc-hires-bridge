@@ -31,6 +31,8 @@ void check(bool cond, const char* expr, int line) {
 
 #define CHECK(expr) check((expr), #expr, __LINE__)
 
+#include "conflict_entry_point_tests.h"
+
 // Test 1: Arbitrary durations and seek offsets (no fixed 23s threshold)
 void testArbitraryDurationsAndOffsets() {
     std::printf("[TEST 1] Arbitrary segment durations, seek offsets, and byte-only fallback...\n");
@@ -2083,6 +2085,7 @@ void testEngineObservationOnManualPause() {
 } // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::printf("=== Issue #20 / #21 / #23 / #24 / #25 / #27 / #28 Experimental EOS Transition Tests ===\n");
 
@@ -2117,9 +2120,12 @@ int main() {
     testReentrancyProtectionAndPrePostInitCalls();
     testEngineObservationOnManualPause();
 
+    // Issue #30 Control Entry Point Conflict Verification Tests
+    conflictTests::runAllConflictEntryPointTests();
+
     if (SUCCEEDED(co)) CoUninitialize();
     if (g_failures == 0) {
-        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 / #28 EOS TRANSITION TESTS PASSED ===\n");
+        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 / #28 / #30 EOS TRANSITION TESTS PASSED ===\n");
         return 0;
     }
     std::printf("=== %d TEST ASSERTION(S) FAILED ===\n", g_failures);

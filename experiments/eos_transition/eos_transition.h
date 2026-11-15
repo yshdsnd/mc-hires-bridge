@@ -78,6 +78,13 @@ struct GraphState {
     ResetReason lastResetReason = ResetReason::NewSegment;
 
     bool isPauseDeferralActive() const { return pauseDeferralStatus == PauseDeferralStatus::Active; }
+    bool isCancelled() const {
+        return pauseDeferralStatus == PauseDeferralStatus::CancelledStop ||
+               pauseDeferralStatus == PauseDeferralStatus::CancelledSeek ||
+               pauseDeferralStatus == PauseDeferralStatus::CancelledTrackChange ||
+               pauseDeferralStatus == PauseDeferralStatus::CancelledManualPause ||
+               pauseDeferralStatus == PauseDeferralStatus::CancelledQuit;
+    }
 };
 
 class Tracker {
@@ -167,6 +174,9 @@ public:
         (void)sStart;
         if (!graphKey || bytes == 0) return;
         auto& s = ensureGraph(graphKey);
+        if (s.isCancelled()) {
+            s.pauseDeferralStatus = PauseDeferralStatus::None;
+        }
         if (s.upstreamEosCount > 0) {
             // New upstream PCM arrived after EndOfStream without Flush/Seek/Stop:
             // same-format pre-read track is now feeding SeamlessFilter.
@@ -240,7 +250,7 @@ public:
     bool onDownstreamEndOfStream(void* graphKey) {
         if (!graphKey) return true;
         auto& s = ensureGraph(graphKey);
-        if (s.eosDelivered) {
+        if (s.eosDelivered || s.isCancelled()) {
             return false;
         }
         s.eosPending = false;
@@ -450,7 +460,7 @@ private:
     }
 
     static bool shouldDeliverDownstreamEos(const GraphState& s) {
-        if (!s.active24 || !s.eosPending || s.eosDelivered) {
+        if (!s.active24 || !s.eosPending || s.eosDelivered || s.isCancelled()) {
             return false;
         }
         if (s.preReadDecision == PreReadDecision::SameFormat24) {
