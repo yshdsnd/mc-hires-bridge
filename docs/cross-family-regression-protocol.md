@@ -183,7 +183,31 @@ Before evaluating track tails, inspect the capture recording for loopback buffer
   - Repeat the test run with a fresh capture.
 
 #### Step 4: Deterministic Waveform & Log Analysis
-Run `track_regression_tool.exe` against the captured stream:
+
+Run `track_regression_tool.exe` against the captured stream. Two evaluation modes are supported:
+
+##### Mode A: Reference-Based Waveform Comparison (Issue #50: 参照波形による判定)
+This is the primary automated mode for evaluating 192kHz/stereo float32 raw loopback captures against source reference WAV files:
+```powershell
+.\build-Win32\Release\track_regression_tool.exe `
+  --loopback "<path_to_capture.raw>" `
+  --ref1 "<path_to_01_ref.wav>" `
+  --ref2 "<path_to_02_ref.wav>" `
+  --scenario "Cross-Family Transition" `
+  --transition "44.1k/16b -> 48k/24b"
+```
+**Features & Non-Bit-Exact Principles**:
+- **Format Support**: Directly ingests raw 192kHz stereo float32 capture files or standard RIFF WAV files.
+- **Leading Silence Tolerance**: Automatically scans and correlates Track 1, tolerating arbitrary recording lead-in silence before playback begins.
+- **DSEE / Rate Conversion Invariance**: Resamples streams to a standard 24kHz baseband domain. Because DSEE HX operates primarily above 16kHz and Windows shared mixer performs linear/bandlimited resampling, normalized cross-correlation ($\rho \ge 0.65$) reliably matches baseband acoustic features without requiring bit-for-bit identity.
+- **Track 1 Tail Verification**: Identifies the exact matched end position of Track 1 and detects any truncation ($\Delta t > 50\text{ ms}$).
+- **Duplicate Cueing Detection (次曲二重頭出し判定)**: Scans the transition window for Track 2's opening signature (100ms template):
+  - Exactly 1 peak: Single start (**PASS**).
+  - 2 or more peaks: Duplicate cueing / restart detected (**FAIL**). Reports cue count and millisecond timestamps.
+  - 0 peaks or ambiguous correlation (< 0.50): Insufficient evidence (**PENDING / 判定保留**).
+
+##### Mode B: Legacy Frame-Count PCM Evaluation
+For evaluating raw PCM files where exact total frame counts are predefined:
 ```powershell
 .\build-Win32\Release\track_regression_tool.exe <captured.pcm> <capture_rate> <capture_bits> <expected_track1_frames> `
   --scenario "Cross-Family Transition" `
