@@ -181,6 +181,8 @@ using DsPlayFn = HRESULT(WINAPI*)(IDirectSoundBuffer*, DWORD, DWORD, DWORD);
 using DsStopFn = HRESULT(WINAPI*)(IDirectSoundBuffer*);
 using DsSetCurrentPositionFn = HRESULT(WINAPI*)(IDirectSoundBuffer*, DWORD);
 using DsSetVolumeFn = HRESULT(WINAPI*)(IDirectSoundBuffer*, LONG);
+using DsAddRefFn = ULONG(STDMETHODCALLTYPE*)(IDirectSoundBuffer*);
+using DsReleaseFn = ULONG(STDMETHODCALLTYPE*)(IDirectSoundBuffer*);
 
 static MemReceiveFn originalSeamlessReceive = nullptr;
 static PinOneFn originalSeamlessEos = nullptr;
@@ -205,6 +207,8 @@ static DsPlayFn originalDsPlay = nullptr;
 static DsStopFn originalDsStop = nullptr;
 static DsSetCurrentPositionFn originalDsSetCurrentPosition = nullptr;
 static DsSetVolumeFn originalDsSetVolume = nullptr;
+static DsAddRefFn originalDsAddRef = nullptr;
+static DsReleaseFn originalDsRelease = nullptr;
 
 using EnterCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
 using LeaveCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
@@ -417,16 +421,7 @@ static bool isCallerFromOpcDSPlay(void* returnAddress) {
 }
 
 static bool safeQueryDirectSoundBuffer(IDirectSoundBuffer* buf, DWORD* playCursor, DWORD* writeCursor, DWORD* status, HRESULT* hrPos, HRESULT* hrStat) {
-    if (!buf) return false;
-    __try {
-        if (hrPos) *hrPos = buf->GetCurrentPosition(playCursor, writeCursor);
-        if (hrStat) *hrStat = buf->GetStatus(status);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (hrPos) *hrPos = E_FAIL;
-        if (hrStat) *hrStat = E_FAIL;
-        return false;
-    }
+    return eosTransition::safeQueryDirectSoundBuffer(buf, playCursor, writeCursor, status, hrPos, hrStat);
 }
 
 static bool isOpcDsPlayPauseCaller(void* returnAddress) {
@@ -456,6 +451,23 @@ static bool isOpcDsPlayPauseCaller(void* returnAddress) {
 }
 
 static void* g_lastActiveSoundBuffer = nullptr;
+
+static ULONG STDMETHODCALLTYPE dsAddRefHook(IDirectSoundBuffer* self) {
+    ULONG ref = originalDsAddRef ? originalDsAddRef(self) : 0;
+    if (g_diagEnabled) {
+        recordDiag("DSOUND_BUFFER_ADDREF", self, _ReturnAddress(), ref, 0, S_OK);
+    }
+    return ref;
+}
+
+static ULONG STDMETHODCALLTYPE dsReleaseHook(IDirectSoundBuffer* self) {
+    void* caller = _ReturnAddress();
+    ULONG ref = originalDsRelease ? originalDsRelease(self) : 0;
+    if (g_diagEnabled) {
+        recordDiag("DSOUND_BUFFER_RELEASE", self, caller, ref, 0, S_OK);
+    }
+    return ref;
+}
 
 static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
     if (!inEosHook) {
@@ -638,9 +650,12 @@ static IDirectSoundBuffer* findDirectSoundBufferFromGraph(IFilterGraph* graph) {
         IBaseFilter* f = nullptr;
         while (filters->Next(1, &f, nullptr) == S_OK) {
             IAMDirectSound* amDs = nullptr;
-            if (SUCCEEDED(f->QueryInterface(kIID_IAMDirectSound, reinterpret_cast<void**>(&amDs))) && amDs) {
+            HRESULT hrQi = f->QueryInterface(kIID_IAMDirectSound, reinterpret_cast<void**>(&amDs));
+            if (SUCCEEDED(hrQi) && amDs) {
                 LPDIRECTSOUNDBUFFER dsb = nullptr;
-                if (SUCCEEDED(amDs->GetSecondaryBufferInterface(&dsb)) && dsb) {
+                HRESULT hrDsb = amDs->GetSecondaryBufferInterface(&dsb);
+                recordDiag("DSOUND_RENDERER_GET_BUFFER", graph, f, reinterpret_cast<uint64_t>(dsb), 0, hrDsb);
+                if (SUCCEEDED(hrDsb) && dsb) {
                     foundBuffer = dsb;
                 }
                 amDs->Release();
@@ -729,21 +744,33 @@ static HRESULT STDMETHODCALLTYPE seamlessReceiveHook(IMemInputPin* self, IMediaS
 }
 
 static HRESULT STDMETHODCALLTYPE seamlessEosHook(IPin* self) {
+    void* key = graphKeyFromPin(self);
+    void* caller = _ReturnAddress();
+    uint32_t gen = 0;
+    AcquireSRWLockShared(&eosLock);
+    gen = eosTracker.getTransitionGeneration(key);
+    ReleaseSRWLockShared(&eosLock);
+
+    recordDiag("EOS_ENTER_SEAMLESS", key, caller, gen, 0, S_OK);
     auto hr = originalSeamlessEos(self);
+    recordDiag("EOS_LEAVE_SEAMLESS", key, caller, gen, 0, hr);
+
     if (!inEosHook && SUCCEEDED(hr)) {
-        void* key = graphKeyFromPin(self);
         syncGraphActivationFromPin(self, key);
         bool deliverNow = false;
         AcquireSRWLockExclusive(&eosLock);
         deliverNow = eosTracker.onUpstreamEndOfStream(key);
         ReleaseSRWLockExclusive(&eosLock);
         record("EOS_UPSTREAM", 0, deliverNow ? 1 : 0, hr);
+        recordDiag("EOS_UPSTREAM_PROCESSED", key, caller, gen, deliverNow ? 1 : 0, hr);
         if (deliverNow && originalEqEos) {
             IPin* eqPin = findEqInputPinInGraph(self);
             if (eqPin) {
                 EosHookScope scope;
+                recordDiag("EOS_ENTER_DOWNSTREAM_FROM_SEAMLESS", key, caller, gen, 0, S_OK);
                 auto eqHr = originalEqEos(eqPin);
                 record("EOS_DELIVERED_IMMEDIATE", 0, 1, eqHr);
+                recordDiag("EOS_LEAVE_DOWNSTREAM_FROM_SEAMLESS", key, caller, gen, 0, eqHr);
                 eqPin->Release();
             }
         }
@@ -808,8 +835,14 @@ static HRESULT STDMETHODCALLTYPE eqReceiveHook(IMemInputPin* self, IMediaSample*
             IPin* pin = nullptr;
             if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&pin))) && pin) {
                 EosHookScope scope;
+                uint32_t gen = 0;
+                AcquireSRWLockShared(&eosLock);
+                gen = eosTracker.getTransitionGeneration(key);
+                ReleaseSRWLockShared(&eosLock);
+                recordDiag("EOS_ENTER_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(sEnd / 10000), S_OK);
                 auto eosHr = originalEqEndOfStream(pin);
                 record("EOS_DELIVERED_DOWNSTREAM", static_cast<DWORD>(sEnd / 10000), static_cast<DWORD>(len), eosHr);
+                recordDiag("EOS_LEAVE_DOWNSTREAM_ON_PCM_TARGET", key, _ReturnAddress(), gen, static_cast<DWORD>(len), eosHr);
                 pin->Release();
             }
         }
@@ -818,20 +851,33 @@ static HRESULT STDMETHODCALLTYPE eqReceiveHook(IMemInputPin* self, IMediaSample*
 }
 
 static HRESULT STDMETHODCALLTYPE eqEosHook(IPin* self) {
-    if (inEosHook) {
-        return originalEqEos(self);
-    }
     void* key = graphKeyFromPin(self);
+    void* caller = _ReturnAddress();
+    uint32_t gen = 0;
+    AcquireSRWLockShared(&eosLock);
+    gen = eosTracker.getTransitionGeneration(key);
+    ReleaseSRWLockShared(&eosLock);
+
+    if (inEosHook) {
+        recordDiag("EOS_ENTER_EQ_INTERNAL", key, caller, gen, 1, S_OK);
+        auto hr = originalEqEos(self);
+        recordDiag("EOS_LEAVE_EQ_INTERNAL", key, caller, gen, 1, hr);
+        return hr;
+    }
+
+    recordDiag("EOS_ENTER_EQ_PROPAGATED", key, caller, gen, 0, S_OK);
     bool allow = true;
     AcquireSRWLockExclusive(&eosLock);
     allow = eosTracker.onDownstreamEndOfStream(key);
     ReleaseSRWLockExclusive(&eosLock);
     if (!allow) {
         record("EOS_DUPLICATE_SUPPRESSED", 0, 0, S_OK);
+        recordDiag("EOS_DUPLICATE_SUPPRESSED", key, caller, gen, 0, S_OK);
         return S_OK;
     }
     auto hr = originalEqEos(self);
     record("EOS_PASSTHROUGH_DOWNSTREAM", 0, 1, hr);
+    recordDiag("EOS_LEAVE_EQ_PROPAGATED", key, caller, gen, 0, hr);
     return hr;
 }
 
@@ -875,7 +921,9 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
     // If downstream hasn't received all PCM yet, eqReceiveHook on the streaming thread will
     // deliver EOS when the final PCM actually arrives, preventing premature blocking and lock contention.
     IFilterGraph* graph = nullptr;
+    IDirectSoundBuffer* dsBuf = nullptr;
     if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&graph))) && graph) {
+        dsBuf = findDirectSoundBufferFromGraph(graph);
         IPin* eqPin = findEqInputPinFromGraph(graph);
         if (eqPin) {
             bool deliverNow = false;
@@ -887,16 +935,33 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
             }
             ReleaseSRWLockExclusive(&eosLock);
             if (deliverNow && originalEqEos) {
-                recordDiag("EQ_EOS_CALL_ENTER", key, caller, 1, 0, S_OK);
+                uint32_t gen = 0;
+                AcquireSRWLockShared(&eosLock);
+                gen = eosTracker.getTransitionGeneration(key);
+                ReleaseSRWLockShared(&eosLock);
+                recordDiag("EQ_EOS_CALL_ENTER", key, caller, gen, 0, S_OK);
                 DWORD eosStart = GetTickCount();
                 EosHookScope scope;
-                originalEqEndOfStream(eqPin);
+                auto eqHr = originalEqEndOfStream(eqPin);
                 DWORD eosDuration = GetTickCount() - eosStart;
-                recordDiag("EQ_EOS_CALL_LEAVE", key, caller, eosDuration, 1, S_OK);
+                recordDiag("EQ_EOS_CALL_LEAVE", key, caller, eosDuration, gen, eqHr);
             }
             eqPin->Release();
         }
         graph->Release();
+    }
+
+    if (!dsBuf && g_lastActiveSoundBuffer) {
+        dsBuf = reinterpret_cast<IDirectSoundBuffer*>(g_lastActiveSoundBuffer);
+        dsBuf->AddRef();
+    }
+    if (dsBuf) {
+        AcquireSRWLockExclusive(&eosLock);
+        eosTracker.registerActiveSoundBuffer(key, dsBuf);
+        ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("DRAIN_DSOUND_ATTACHED", key, caller, reinterpret_cast<uint64_t>(dsBuf), 0, S_OK);
+    } else {
+        recordDiag("DRAIN_DSOUND_ATTACH_FAILED", key, caller, 0, 0, E_FAIL);
     }
 
     // Check if cancelled during EQ EOS call (e.g. from concurrent UI thread)
@@ -971,9 +1036,44 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
             break;
         }
 
-        if (g_diagEnabled && (GetTickCount() - lastTickLog >= 250)) {
+        if (g_diagEnabled && (GetTickCount() - lastTickLog >= 500)) {
             lastTickLog = GetTickCount();
-            recordDiag("DRAIN_WAIT_TICK", key, caller, static_cast<DWORD>(c / 10000), static_cast<DWORD>(s / 10000), S_OK);
+
+            uint64_t targetB = 0, downB = 0, upB = 0;
+            uint32_t gen = 0;
+            bool pcmDelivered = false;
+            AcquireSRWLockShared(&eosLock);
+            const auto* curG = eosTracker.findGraph(key);
+            if (curG) {
+                targetB = curG->targetBytes;
+                downB = curG->downstreamBytes;
+                upB = curG->upstreamBytes;
+                gen = curG->transitionGeneration;
+                pcmDelivered = curG->transition.pcmDeliveryComplete;
+            }
+            ReleaseSRWLockShared(&eosLock);
+
+            recordDiag("DRAIN_HEARTBEAT_POS", key, caller,
+                       static_cast<DWORD>(c / 10000), static_cast<DWORD>(s / 10000),
+                       S_OK);
+            recordDiag("DRAIN_HEARTBEAT_PCM", key, caller,
+                       downB, targetB,
+                       static_cast<HRESULT>(gen));
+            recordDiag("DRAIN_HEARTBEAT_BYTES", key, caller,
+                       upB, downB,
+                       (pcmDelivered ? 0x01 : 0) | ((c >= s && s > 0) ? 0x02 : 0));
+
+            DWORD dsPlayCursor = 0, dsWriteCursor = 0, dsStatus = 0;
+            HRESULT hrDsPos = E_POINTER, hrDsStat = E_POINTER;
+            safeQueryDirectSoundBuffer(dsBuf, &dsPlayCursor, &dsWriteCursor, &dsStatus, &hrDsPos, &hrDsStat);
+            recordDiag("DRAIN_HEARTBEAT_DSOUND", dsBuf, caller,
+                       (static_cast<uint64_t>(dsPlayCursor) << 32) | static_cast<uint64_t>(dsWriteCursor),
+                       static_cast<uint64_t>(dsStatus),
+                       hrDsPos);
+            if (!dsBuf || FAILED(hrDsPos) || FAILED(hrDsStat)) {
+                recordDiag("DRAIN_DSOUND_DIAG_FAIL", dsBuf, caller,
+                           static_cast<uint64_t>(hrDsStat), 0, hrDsPos);
+            }
         }
 
         MSG msg;
@@ -994,6 +1094,7 @@ static eosTransition::PauseDeferralStatus deferFormatChangePause(IUnknown* self,
         Sleep(15);
     }
     if (seeking) seeking->Release();
+    if (dsBuf) dsBuf->Release();
 
     AcquireSRWLockExclusive(&eosLock);
     if (exitStatus == eosTransition::PauseDeferralStatus::CompletedDrain ||
@@ -1090,23 +1191,6 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
 
         if (!primaryBuf) primaryBuf = initialDsBuf;
 
-        // If upstream completed reading (upB == targetB && targetB > 0) but downstream hasn't reached target yet,
-        // intermediate DSP filters (like DSEE) may be holding the remaining tail samples in their latency delay-line.
-        // Deliver EOS to EQ input pin to flush these samples!
-        if (upB == targetB && targetB > 0 && downB < targetB && !curEosDelivered) {
-            IFilterGraph* fg = nullptr;
-            if (seeking && SUCCEEDED(seeking->QueryInterface(IID_PPV_ARGS(&fg))) && fg) {
-                IPin* eqPin = findEqInputPinFromGraph(fg);
-                if (eqPin && originalEqEos) {
-                    EosHookScope scope;
-                    originalEqEndOfStream(eqPin);
-                    recordDiag("EOS_DELIVERED_ASYNC_DRAIN", key, caller, downB, targetB, S_OK);
-                    eqPin->Release();
-                }
-                fg->Release();
-            }
-        }
-
         // Stage 2: Audio renderer final output drain
         LONGLONG c = 0, s = 0;
         HRESULT hrCur = seeking ? seeking->GetCurrentPosition(&c) : E_POINTER;
@@ -1159,11 +1243,13 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
                        (pcmDelivered ? 0x01 : 0) | (rendererFinished ? 0x02 : 0));
 
             // 4. DirectSound buffer playback cursor & status
-            if (activeDsBuf && hasDs) {
-                recordDiag("DRAIN_HEARTBEAT_DSOUND", activeDsBuf, caller,
-                           (static_cast<uint64_t>(dsPlayCursor) << 32) | static_cast<uint64_t>(dsWriteCursor),
-                           static_cast<uint64_t>(dsStatus),
-                           hrDsPos);
+            recordDiag("DRAIN_HEARTBEAT_DSOUND", activeDsBuf, caller,
+                       (static_cast<uint64_t>(dsPlayCursor) << 32) | static_cast<uint64_t>(dsWriteCursor),
+                       static_cast<uint64_t>(dsStatus),
+                       hrDsPos);
+            if (!activeDsBuf || FAILED(hrDsPos) || FAILED(hrDsStat)) {
+                recordDiag("DRAIN_DSOUND_DIAG_FAIL", activeDsBuf, caller,
+                           static_cast<uint64_t>(hrDsStat), 0, hrDsPos);
             }
         }
 
@@ -1188,11 +1274,13 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
                 recordDiag("PAUSE_DRAIN_TIMEOUT_SEEK_DIFF", key, caller,
                            static_cast<DWORD>(c / 10000), static_cast<DWORD>(s / 10000),
                            hrCur);
-                if (activeDsBuf && hasDs) {
-                    recordDiag("PAUSE_DRAIN_TIMEOUT_DSOUND", activeDsBuf, caller,
-                               (static_cast<uint64_t>(dsPlayCursor) << 32) | static_cast<uint64_t>(dsWriteCursor),
-                               static_cast<uint64_t>(dsStatus),
-                               hrDsPos);
+                recordDiag("PAUSE_DRAIN_TIMEOUT_DSOUND", activeDsBuf, caller,
+                           (static_cast<uint64_t>(dsPlayCursor) << 32) | static_cast<uint64_t>(dsWriteCursor),
+                           static_cast<uint64_t>(dsStatus),
+                           hrDsPos);
+                if (!activeDsBuf || FAILED(hrDsPos) || FAILED(hrDsStat)) {
+                    recordDiag("PAUSE_DRAIN_TIMEOUT_DSOUND_FAIL", activeDsBuf, caller,
+                               static_cast<uint64_t>(hrDsStat), 0, hrDsPos);
                 }
             }
 
@@ -1301,6 +1389,7 @@ static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
         recordDiag("DRAIN_DSOUND_ATTACHED", key, caller, reinterpret_cast<uint64_t>(dsBuf), 0, S_OK);
     } else {
         p->primaryDsBuffer = nullptr;
+        recordDiag("DRAIN_DSOUND_ATTACH_FAILED", key, caller, 0, 0, E_FAIL);
     }
 
     IMediaFilter* mf = nullptr;
@@ -1939,6 +2028,8 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
         IDirectSoundBuffer* buf = nullptr;
         if (SUCCEEDED(ds8->CreateSoundBuffer(&desc, &buf, nullptr)) && buf) {
             auto bufV = *reinterpret_cast<void***>(buf);
+            MH_CreateHook(bufV[1], reinterpret_cast<void*>(dsAddRefHook), reinterpret_cast<void**>(&originalDsAddRef));
+            MH_CreateHook(bufV[2], reinterpret_cast<void*>(dsReleaseHook), reinterpret_cast<void**>(&originalDsRelease));
             MH_CreateHook(bufV[12], reinterpret_cast<void*>(dsPlayHook), reinterpret_cast<void**>(&originalDsPlay));
             MH_CreateHook(bufV[13], reinterpret_cast<void*>(dsSetCurrentPositionHook), reinterpret_cast<void**>(&originalDsSetCurrentPosition));
             MH_CreateHook(bufV[15], reinterpret_cast<void*>(dsSetVolumeHook), reinterpret_cast<void**>(&originalDsSetVolume));

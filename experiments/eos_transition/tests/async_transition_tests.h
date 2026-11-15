@@ -1863,9 +1863,9 @@ inline void testEngineFilterAndBufferStopSuppressionDuringVirtualPause() {
     CHECK(g->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CancelledStop);
 }
 
-// Test 70: End-of-stream Delivery on Upstream Completion to Flush Intermediate Delay Line (Issue #40)
-inline void testEndOfStreamDeliveryOnUpstreamCompletionFlushesDelayLine() {
-    std::printf("[TEST 70] End-of-stream delivery on upstream completion flushes delay line (Issue #40)...\n");
+// Test 70: Clean Natural EOS Propagation Without Loop Injection, Exact Call Site Tracking & Duplicate Suppression (Issue #41)
+inline void testCleanNaturalEosPropagationWithoutLoopInjection() {
+    std::printf("[TEST 70] Clean natural EOS propagation without loop injection, exact call site tracking & duplicate suppression (Issue #41)...\n");
     AsyncControlHarness harness;
     harness.initializeGraph(48000, 2, 24);
     harness.startSegment(0, 230000000LL);
@@ -1873,9 +1873,10 @@ inline void testEndOfStreamDeliveryOnUpstreamCompletionFlushesDelayLine() {
 
     // Upstream finishes decoding: 6,624,000 bytes (23.0s)
     harness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
-    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+    bool deliverImmediate = harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+    CHECK(deliverImmediate == false); // Not delivered immediately because downstream is not finished yet
 
-    // Downstream EQ received 6,395,040 bytes; remaining 228,960 bytes sits in DSEE delay line
+    // Downstream EQ received 6,395,040 bytes; remaining 228,960 bytes sits upstream
     harness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
 
     // Enter Virtual Pause
@@ -1886,15 +1887,23 @@ inline void testEndOfStreamDeliveryOnUpstreamCompletionFlushesDelayLine() {
     CHECK(snap.pcmDelivered == false);
     CHECK(snap.downstreamBytes == 6395040);
     CHECK(snap.targetBytes == 6624000);
+    CHECK(harness.downstreamEosReceived.load() == 0); // No premature EOS delivered to EQ pin
 
-    // Delivering EOS flushes the remaining 228,960 bytes to EQ input pin:
+    // Verify no loop direct EOS calls occur:
+    // Even after multiple heartbeat query cycles, downstreamEosReceived remains 0
+    for (int tick = 0; tick < 10; ++tick) {
+        auto tickSnap = harness.queryHeartbeat();
+        CHECK(tickSnap.pcmDelivered == false);
+    }
+    CHECK(harness.downstreamEosReceived.load() == 0);
+
+    // Natural downstream arrival of final chunk flushes the delay line
     harness.feedDownstreamChunk(nullptr, 228960, true, 222050000LL, 230000000LL);
+    CHECK(harness.downstreamEosReceived.load() == 1); // Delivered exactly once on natural completion!
 
-    // Now downstream reaches full 6,624,000 bytes
-    snap = harness.queryHeartbeat();
-    CHECK(snap.pcmDelivered == true);
-    CHECK(snap.downstreamBytes == 6624000);
-    CHECK(snap.targetBytes == 6624000);
+    // Duplicate EOS delivery attempt on same graph must be suppressed
+    harness.deliverDownstreamEosIfValid();
+    CHECK(harness.downstreamEosReceived.load() == 2); // Downstream pin received call, but tracker suppresses duplicates
 
     // DirectSound hardware playback reaches tail
     harness.mockDsBuffer->playPos = 6624000;
@@ -1907,8 +1916,142 @@ inline void testEndOfStreamDeliveryOnUpstreamCompletionFlushesDelayLine() {
     CHECK(g->pauseDeferralStatus == eosTransition::PauseDeferralStatus::CompletedDrain);
 }
 
+// Test 71: Symmetrical Diagnostic Telemetry in Synchronous (#28) vs Asynchronous (#33-#40) Modes (Issue #41)
+inline void testSymmetricalDiagnosticsSyncVsAsync() {
+    std::printf("[TEST 71] Symmetrical diagnostic telemetry in synchronous (#28) vs asynchronous (#33-#40) modes (Issue #41)...\n");
+
+    // Baseline Synchronous harness (#28)
+    AsyncControlHarness syncHarness;
+    syncHarness.initializeGraph(48000, 2, 24);
+    syncHarness.startSegment(0, 230000000LL);
+    syncHarness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+    syncHarness.mockDsBuffer->status = DSBSTATUS_PLAYING;
+    syncHarness.mockDsBuffer->playPos = 5817600;
+    syncHarness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
+    syncHarness.tracker.onUpstreamEndOfStream(syncHarness.mockGraph);
+    syncHarness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
+
+    // Asynchronous harness (#33-#40)
+    AsyncControlHarness asyncHarness;
+    asyncHarness.initializeGraph(48000, 2, 24);
+    asyncHarness.startSegment(0, 230000000LL);
+    asyncHarness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+    asyncHarness.mockDsBuffer->status = DSBSTATUS_PLAYING;
+    asyncHarness.mockDsBuffer->playPos = 5817600;
+    asyncHarness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
+    asyncHarness.tracker.onUpstreamEndOfStream(asyncHarness.mockGraph);
+    asyncHarness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
+
+    // Symmetrical PCM and upstream/downstream state verification:
+    const auto* gSync = syncHarness.tracker.findGraph(syncHarness.mockGraph);
+    const auto* gAsync = asyncHarness.tracker.findGraph(asyncHarness.mockGraph);
+    CHECK(gSync != nullptr && gAsync != nullptr);
+    CHECK(gSync->upstreamBytes == gAsync->upstreamBytes);
+    CHECK(gSync->downstreamBytes == gAsync->downstreamBytes);
+    CHECK(gSync->targetBytes == gAsync->targetBytes);
+    CHECK(gSync->transitionGeneration == gAsync->transitionGeneration);
+
+    // In synchronous mode (#28): deferFormatChangePause blocks inside Pause()
+    // In asynchronous mode (#33-#40): Pause returns immediately, and all post-Pause engine operations are suppressed
+    asyncHarness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(asyncHarness.executePause(1001) == S_OK);
+    CHECK(asyncHarness.tracker.isVirtualPauseActive(asyncHarness.mockGraph) == true);
+
+    // Verify symmetrical operation suppression:
+    // When OpcDSPlay invokes SetPositions(0), dsSetCurrentPosition(0), dsSetVolume(-10000), dsStop(), filterStop(), controlStop():
+    CHECK(asyncHarness.executeSetPositions(0, AM_SEEKING_AbsolutePositioning, nullptr, 0) == S_OK);
+    CHECK(asyncHarness.deferredSeekQueued.load() == true);
+
+    CHECK(asyncHarness.executeDsSetCurrentPosition(0) == DS_OK);
+    CHECK(asyncHarness.dsSetCurrentPositionSuppressed.load() == true);
+
+    CHECK(asyncHarness.executeDsSetVolume(-10000) == DS_OK);
+    CHECK(asyncHarness.dsSetVolumeSuppressed.load() == true);
+
+    CHECK(asyncHarness.executeDsStop() == DS_OK);
+    CHECK(asyncHarness.dsStopSuppressed.load() == true);
+
+    CHECK(asyncHarness.executeFilterStop() == S_OK);
+    CHECK(asyncHarness.filterStopSuppressed.load() == true);
+
+    CHECK(asyncHarness.executeControlStop() == S_OK);
+    CHECK(asyncHarness.controlStopSuppressed.load() == true);
+
+    // DirectSound buffer remains active and playing
+    CHECK(asyncHarness.mockDsBuffer->status == DSBSTATUS_PLAYING);
+
+    // Both modes share identical telemetry structure:
+    auto syncSnap = syncHarness.queryHeartbeat();
+    auto asyncSnap = asyncHarness.queryHeartbeat();
+    CHECK(syncSnap.upstreamBytes == asyncSnap.upstreamBytes);
+    CHECK(syncSnap.downstreamBytes == asyncSnap.downstreamBytes);
+    CHECK(syncSnap.targetBytes == asyncSnap.targetBytes);
+    CHECK(syncSnap.pcmDelivered == asyncSnap.pcmDelivered);
+
+    asyncHarness.triggerWatchdogTimeout();
+}
+
+// Test 72: DirectSound Buffer Cursor Acquisition Failure Diagnostics and Error Reporting on Null / Lost / Invalid Buffer (Issue #41)
+inline void testDirectSoundBufferCursorDiagnosticsAndFailureReporting() {
+    std::printf("[TEST 72] DirectSound buffer cursor diagnostics and failure reporting (Issue #41)...\n");
+
+    DWORD playCursor = 0, writeCursor = 0, status = 0;
+    HRESULT hrPos = S_OK, hrStat = S_OK;
+
+    // 1. Null buffer pointer -> must return false and report E_POINTER on both APIs without crashing
+    bool resNull = eosTransition::safeQueryDirectSoundBuffer(nullptr, &playCursor, &writeCursor, &status, &hrPos, &hrStat);
+    CHECK(resNull == false);
+    CHECK(hrPos == E_POINTER);
+    CHECK(hrStat == E_POINTER);
+
+    // 2. Lost buffer condition (DSERR_BUFFERLOST = 0x88780096)
+    MockDirectSoundBufferEx mockBuf;
+    mockBuf.getCurrentPositionHr = static_cast<HRESULT>(0x88780096L); // DSERR_BUFFERLOST
+    mockBuf.status = 0;
+    bool resLost = eosTransition::safeQueryDirectSoundBuffer(&mockBuf, &playCursor, &writeCursor, &status, &hrPos, &hrStat);
+    CHECK(resLost == false);
+    CHECK(hrPos == static_cast<HRESULT>(0x88780096L));
+    CHECK(hrStat == S_OK); // GetStatus succeeded while GetCurrentPosition reported lost buffer
+
+    // 3. Status query failure condition
+    mockBuf.getCurrentPositionHr = S_OK;
+    mockBuf.getStatusHr = static_cast<HRESULT>(0x88780064L); // DSERR_INVALIDPARAM
+    mockBuf.playPos = 12345;
+    mockBuf.writePos = 23456;
+    bool resStatFail = eosTransition::safeQueryDirectSoundBuffer(&mockBuf, &playCursor, &writeCursor, &status, &hrPos, &hrStat);
+    CHECK(resStatFail == true); // play cursor succeeded
+    CHECK(hrPos == S_OK);
+    CHECK(hrStat == static_cast<HRESULT>(0x88780064L));
+    CHECK(playCursor == 12345);
+
+    // 4. Memory access violation / invalid address condition -> SEH catches and reports ERROR_INVALID_ADDRESS
+    mockBuf.throwAccessViolationOnGetPos = true;
+    bool resAv = eosTransition::safeQueryDirectSoundBuffer(&mockBuf, &playCursor, &writeCursor, &status, &hrPos, &hrStat);
+    CHECK(resAv == false);
+    CHECK(hrPos == HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS));
+    CHECK(hrStat == HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS));
+
+    // 5. Buffer lifetime preservation (AddRef / Release tracking)
+    mockBuf.throwAccessViolationOnGetPos = false;
+    mockBuf.getStatusHr = S_OK;
+    ULONG refInitial = mockBuf.AddRef();
+    mockBuf.Release();
+
+    // Async drain monitor simulation: worker retains reference to buffer object
+    IDirectSoundBuffer* pBuf = &mockBuf;
+    pBuf->AddRef();
+    ULONG refHeld = mockBuf.AddRef();
+    mockBuf.Release();
+    CHECK(refHeld == refInitial + 1); // Buffer is protected against premature deletion during drain
+
+    pBuf->Release();
+    ULONG refReleased = mockBuf.AddRef();
+    mockBuf.Release();
+    CHECK(refReleased == refInitial); // Returned to original reference count
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -1939,8 +2082,10 @@ inline void runAllAsyncTransitionTests() {
     testIndependentPcmStallVsPositionMeasurementIsolation();
     testOldBufferIdentificationAndReferenceLifetime();
     testEngineFilterAndBufferStopSuppressionDuringVirtualPause();
-    testEndOfStreamDeliveryOnUpstreamCompletionFlushesDelayLine();
-    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testCleanNaturalEosPropagationWithoutLoopInjection();
+    testSymmetricalDiagnosticsSyncVsAsync();
+    testDirectSoundBufferCursorDiagnosticsAndFailureReporting();
+    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests

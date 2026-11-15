@@ -435,6 +435,9 @@ public:
     DWORD playPos = 0;
     DWORD writePos = 0;
     DWORD status = 0;
+    HRESULT getCurrentPositionHr = S_OK;
+    HRESULT getStatusHr = S_OK;
+    bool throwAccessViolationOnGetPos = false;
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
@@ -454,6 +457,10 @@ public:
     }
     HRESULT STDMETHODCALLTYPE GetCaps(LPDSBCAPS) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetCurrentPosition(LPDWORD pdwCurrentPlayCursor, LPDWORD pdwCurrentWriteCursor) override {
+        if (throwAccessViolationOnGetPos) {
+            RaiseException(STATUS_ACCESS_VIOLATION, 0, 0, nullptr);
+        }
+        if (FAILED(getCurrentPositionHr)) return getCurrentPositionHr;
         if (pdwCurrentPlayCursor) *pdwCurrentPlayCursor = playPos;
         if (pdwCurrentWriteCursor) *pdwCurrentWriteCursor = writePos;
         return S_OK;
@@ -463,6 +470,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetPan(LPLONG) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetFrequency(LPDWORD) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetStatus(LPDWORD pdwStatus) override {
+        if (FAILED(getStatusHr)) return getStatusHr;
         if (pdwStatus) *pdwStatus = status;
         return S_OK;
     }

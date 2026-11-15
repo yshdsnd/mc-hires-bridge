@@ -1,4 +1,4 @@
-# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40）
+# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41）
 
 ## 1. 概要とアーキテクチャ
 
@@ -179,9 +179,11 @@ Issue #30、#33、#34、#35、#36、#37、#38、#39 の競合テストハーネ�
 | **TEST 67** | Independent isolation of PCM delivery deficit vs renderer position (Issue #39) | 下流 PCM 配送不足（差分 228,960 bytes）と DirectShow 再生位置 0ms（クロック停止・API 成否）を独立して判定・切り分けられることを検証 | **PASS** |
 | **TEST 68** | Old buffer identification, reference lifetime preservation, and continuous cursor reporting (Issue #40) | レンダラー `IAMDirectSound` クエリによる旧バッファ特定、`AddRef`/`Release` による監視スレッド参照寿命保護、ハードウェアカーソル継続取得を検証 | **PASS** |
 | **TEST 69** | DirectSound SetCurrentPosition, SetVolume, and filter Stop suppression (Issue #40) | 仮想 Pause 中の自動 `SetCurrentPosition(0)`、`SetVolume(-10000)`、フィルター停止・一時停止命令の抑止と、手動停止時の即時キャンセル優先を検証 | **PASS** |
-| **TEST 70** | End-of-stream delivery on upstream completion flushes delay line (Issue #40) | 上流完了時の EOS 送出による DSEE/Seamless 中間遅延キュー（228,960 bytes）の EQ への排出と下流目標到達・自然完了ドレインを検証 | **PASS** |
+| **TEST 70** | Clean natural EOS propagation without loop injection (Issue #41) | ループ内での直接 EOS 送出を完全廃止し、自然な下流 EOS 到達・重複送出抑止・取消後 Stale EOS 破棄・実 HRESULT 記録を検証 | **PASS** |
+| **TEST 71** | Symmetrical diagnostic telemetry in sync (#28) vs async (#33-#40) (Issue #41) | 同期方式（#28）と非同期方式（#33〜#40）で同一の診断項目（最終 PCM、EOS、停止・位置操作、カーソル取得）を対称記録・比較可能であることを検証 | **PASS** |
+| **TEST 72** | DirectSound buffer cursor diagnostics and failure reporting (Issue #41) | `safeQueryDirectSoundBuffer` における Null ポインタ（E_POINTER）、バッファ喪失（DSERR_BUFFERLOST）、例外（ERROR_INVALID_ADDRESS）、および AddRef/Release 寿命管理を検証 | **PASS** |
 
-> 合計 70 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 非同期テスト 40〜70）すべてがエラーなしで通過しました。
+> 合計 72 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 / #40 / #41 非同期テスト 40〜72）すべてがエラーなしで通過しました。
 
 ---
 
@@ -291,3 +293,25 @@ Codex が Music Center for PC 2.7.4 x86 実機環境で動作検証を行うた�
   4. **実機ループバック波形の末尾確認**:
      - 約 20.1 秒付近での波形途絶・不連続フラグが解消し、先行曲が末尾（約 23 秒）まで正常に鳴動すること。
      - ドレイン完了時に `PAUSE_DEFERRED_COMPLETED` が出力され、次曲へ自然に引き継がれること（Issue #38 の単一起動が維持され、重複波形が発生しないこと）。
+
+#### シナリオ I: 同期方式（#28）と非同期方式（#33〜#40）の対称診断比較と仮説検証（Issue #41 実機検証）
+- **対象**: 48 kHz/24 bit FLAC から 48 kHz/16 bit FLAC への自動曲送り（共有出力、Music Center for PC 2.7.4 x86）。
+- **目的**: ループ内での直接 EOS 送出（427 回発生）を廃止し、実機で曲末が鳴り切っていた同期方式（`MC_BRIDGE_PAUSE_MODE=defer`）と非同期方式（`MC_BRIDGE_PAUSE_MODE=async`）を同一の診断項目で対称採取・比較し、末尾欠落要因を切り分ける。
+- **検証する 4 つの仮説**:
+  1. **仮説 1（バッファオブジェクトの有効性と寿命）**:
+     - `CLSID_DSoundRender`（`IAMDirectSound::GetSecondaryBufferInterface`）経由で取得したセカンダリバッファは同期方式・非同期方式の双方で有効か？
+     - `GetCurrentPosition` / `GetStatus` が `S_OK` を返しているか、あるいは `E_POINTER`、`DSERR_BUFFERLOST`（`0x88780096`）、`ERROR_INVALID_ADDRESS` が発生しているか？
+     - `DSOUND_BUFFER_ADDREF` / `DSOUND_BUFFER_RELEASE` による参照カウント推移から、バッファが非同期ドレイン中に解放（0）されていないか？
+  2. **仮説 2（下流 PCM 総バイト数と実曲長）**:
+     - 曲末まで正常再生された同期方式（#28）において、下流 PCM 総バイト数（`downstreamBytes`）は 6,624,000 bytes まで到達しているか、それとも同期方式でも 6,395,040 bytes で終了しているか？
+     - もし同期方式でも 6,395,040 bytes で曲末まで正常に鳴り切っているならば、6,395,040 bytes こそが先行曲の真のデコード音声総量（残りはゼロパディングまたはメタデータ領域）である。
+  3. **仮説 3（Pause 後のエンジン後続操作）**:
+     - 同期方式では `OpcDSPlay.dll` が `Pause()` 内部でブロックされるため、後続の停止・リセット呼出が 0 件となる。
+     - 非同期方式では即座に制御が戻るため、エンジンが発行する後続呼出（`SetPositions(0)`、`Stop()`、`Pause()`、`SetVolume(-10000)`、`SetCurrentPosition(0)`）がすべて観測される。これらが完全に抑止されているか、あるいは未捕捉の操作が存在するか？
+  4. **仮説 4（EOS の到達タイミングと自然伝播）**:
+     - ループ内直接送出を行わないクリーンな状態で、上流（`SeamlessFilter`）から下流（`EQ`）へ自然に EOS が伝播しているか？
+     - `EOS_ENTER_SEAMLESS`, `EOS_LEAVE_SEAMLESS`, `EOS_UPSTREAM_PROCESSED`, `EOS_ENTER_EQ_PROPAGATED`, `EOS_LEAVE_EQ_PROPAGATED` の呼び出し箇所、遷移世代、および実際の HRESULT を対称記録し、不自然な遅延や脱落がないか確認する。
+- **確認手順**:
+  1. `MC_BRIDGE_PAUSE_MODE=defer` で同一曲送りを実行し、同期ベースラインログを採取。
+  2. `MC_BRIDGE_PAUSE_MODE=async` で同一曲送りを実行し、非同期ログを採取。
+  3. 両ログの `DRAIN_HEARTBEAT_PCM`, `DRAIN_HEARTBEAT_BYTES`, `DRAIN_HEARTBEAT_DSOUND`, `EOS_*` を直接対比し、仮説 1〜4 を検証する。

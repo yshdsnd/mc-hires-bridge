@@ -3,13 +3,32 @@
 // track transitions. No fixed track duration (e.g. 23s) assumptions.
 #include <windows.h>
 #include <dshow.h>
+#include <dsound.h>
 #include <cstdint>
 #include <map>
 
 struct IStream;
-struct IDirectSoundBuffer;
 
 namespace eosTransition {
+
+inline bool safeQueryDirectSoundBuffer(IDirectSoundBuffer* buf, DWORD* playCursor, DWORD* writeCursor, DWORD* status, HRESULT* hrPos, HRESULT* hrStat) {
+    if (!buf) {
+        if (hrPos) *hrPos = E_POINTER;
+        if (hrStat) *hrStat = E_POINTER;
+        return false;
+    }
+    __try {
+        HRESULT pRes = buf->GetCurrentPosition(playCursor, writeCursor);
+        if (hrPos) *hrPos = pRes;
+        HRESULT sRes = buf->GetStatus(status);
+        if (hrStat) *hrStat = sRes;
+        return SUCCEEDED(pRes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (hrPos) *hrPos = HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+        if (hrStat) *hrStat = HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+        return false;
+    }
+}
 
 enum class PreReadDecision {
     Unknown,        // Next track format not yet determined (or 0x31E7A not called)
