@@ -43,8 +43,15 @@ static void record(const char* event,DWORD requested,DWORD applied,HRESULT hr){
 }
 // OpcFlac uses distinct calls for initial playback and seamless next-track preparation.
 static bool knownCaller(void* returnAddress){HMODULE m=nullptr;if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(returnAddress),&m))return false;wchar_t path[MAX_PATH];GetModuleFileNameW(m,path,MAX_PATH);auto name=wcsrchr(path,L'\\');auto base=reinterpret_cast<ULONG_PTR>(m);auto dos=reinterpret_cast<IMAGE_DOS_HEADER*>(m);auto nt=reinterpret_cast<IMAGE_NT_HEADERS*>(base+dos->e_lfanew);return _wcsicmp(name?name+1:path,L"OpcFlac.dll")==0&&nt->FileHeader.TimeDateStamp==0x63EB12E0&&(reinterpret_cast<ULONG_PTR>(returnAddress)-base==0x32A85||reinterpret_cast<ULONG_PTR>(returnAddress)-base==0x31E7A);}
-static bool isNativeSupported24(IUnknown* self){
-    IBaseFilter* f=nullptr;if(FAILED(self->QueryInterface(IID_PPV_ARGS(&f))))return false;IEnumPins* pins=nullptr;bool found=false;if(SUCCEEDED(f->EnumPins(&pins))){IPin* p=nullptr;while(pins->Next(1,&p,nullptr)==S_OK){PIN_DIRECTION direction;p->QueryDirection(&direction);IEnumMediaTypes* types=nullptr;if(direction==PINDIR_OUTPUT&&SUCCEEDED(p->EnumMediaTypes(&types))){AM_MEDIA_TYPE* mt=nullptr;if(types->Next(1,&mt,nullptr)==S_OK){if(mt->majortype==MEDIATYPE_Audio&&mt->subtype==MEDIASUBTYPE_PCM&&mt->formattype==FORMAT_WaveFormatEx&&mt->cbFormat>=16&&mt->pbFormat){WAVEFORMATEX wave{};memcpy(&wave,mt->pbFormat,min(size_t(mt->cbFormat),sizeof(wave)));found=supportedFlacRate(wave.nSamplesPerSec)&&wave.wBitsPerSample==24&&wave.nChannels==2;}if(mt->cbFormat)CoTaskMemFree(mt->pbFormat);if(mt->pUnk)mt->pUnk->Release();CoTaskMemFree(mt);}types->Release();}p->Release();if(found)break;}pins->Release();}f->Release();return found;
+static bool isNativeSupported24(IUnknown* self, DWORD* outRate = nullptr){
+    IBaseFilter* f=nullptr;if(FAILED(self->QueryInterface(IID_PPV_ARGS(&f))))return false;IEnumPins* pins=nullptr;bool found=false;if(SUCCEEDED(f->EnumPins(&pins))){IPin* p=nullptr;while(pins->Next(1,&p,nullptr)==S_OK){PIN_DIRECTION direction;p->QueryDirection(&direction);IEnumMediaTypes* types=nullptr;if(direction==PINDIR_OUTPUT&&SUCCEEDED(p->EnumMediaTypes(&types))){AM_MEDIA_TYPE* mt=nullptr;while(types->Next(1,&mt,nullptr)==S_OK){if(mt->majortype==MEDIATYPE_Audio&&mt->subtype==MEDIASUBTYPE_PCM&&mt->formattype==FORMAT_WaveFormatEx&&mt->cbFormat>=16&&mt->pbFormat){WAVEFORMATEX wave{};memcpy(&wave,mt->pbFormat,min(size_t(mt->cbFormat),sizeof(wave)));if(wave.wBitsPerSample==24&&wave.nChannels==2){if(outRate)*outRate=wave.nSamplesPerSec;found=true;}}if(mt->cbFormat)CoTaskMemFree(mt->pbFormat);if(mt->pUnk)mt->pUnk->Release();CoTaskMemFree(mt);if(found)break;}types->Release();}p->Release();if(found)break;}pins->Release();}f->Release();return found;
+}
+static bool isFlacRateEligible(DWORD rate, bool dseeActive) {
+#ifdef EXPERIMENT_DSEE_UNIFIED
+    return dseeUnified::isFlacRateEligible24(rate, dseeActive);
+#else
+    return rate == 48000 || rate == 96000 || rate == 192000;
+#endif
 }
 #ifdef EXPERIMENT_DSEE_UNIFIED
 static bool supportedOutputRate(DWORD rate){
@@ -69,22 +76,29 @@ static void updateStatus(IUnknown* object,HRESULT result);
 static HRESULT STDMETHODCALLTYPE setterHook(IUnknown* self,DWORD value){
     auto caller=_ReturnAddress();
     bool known=knownCaller(caller);
-    bool isNative24 = isNativeSupported24(self);
-    bool eligible=value==16&&known&&bridgeStatus::directSoundSelected()&&isNative24;
+    DWORD nativeRate = 0;
+    bool isNative24 = isNativeSupported24(self, &nativeRate);
+    bool dseeActive = bridgeStatus::dseeSharedRequested();
+    bool rateEligible = isNative24 && isFlacRateEligible(nativeRate, dseeActive);
+    bool eligible=value==16&&known&&bridgeStatus::directSoundSelected()&&rateEligible;
 #ifdef EXPERIMENT_DSEE_UNIFIED
-    dseeUnified::setActiveDecoderBits(isNative24 ? 24 : 16);
+    dseeUnified::setActiveDecoderBits(eligible ? 24 : 16);
 #endif
-    if(!eligible){auto hr=original(self,value);rememberSource(self,false);record("PASS_THROUGH",value,value,hr);
+    if(!eligible){auto hr=original(self,value);rememberSource(self,false);record("PASS_THROUGH",nativeRate ? nativeRate : value,value,hr);
 #ifdef EXPERIMENT_EOS_TRANSITION
         if(known)onEosSetterDecision(self,caller,false,hr);
 #endif
         return hr;}
-    auto hr=original(self,24);record("SET_24",value,24,hr);
+    auto hr=original(self,24);record("SET_24",nativeRate ? nativeRate : value,24,hr);
     rememberSource(self,SUCCEEDED(hr));
 #ifdef EXPERIMENT_EOS_TRANSITION
     onEosSetterDecision(self,caller,true,hr);
 #endif
-    if(FAILED(hr)){auto fallback=original(self,value);record("SET_16_FALLBACK",value,value,fallback);return fallback;}return hr;
+    if(FAILED(hr)){auto fallback=original(self,value);record("SET_16_FALLBACK",nativeRate ? nativeRate : value,value,fallback);
+#ifdef EXPERIMENT_DSEE_UNIFIED
+        dseeUnified::setActiveDecoderBits(16);
+#endif
+        return fallback;}return hr;
 }
 static void updateStatus(IUnknown* object,HRESULT result) {
     bool source=false,output24=false;DWORD outputRate=0;WORD outputChannels=0,outputBits=0;IFilterGraph* graph=nullptr;

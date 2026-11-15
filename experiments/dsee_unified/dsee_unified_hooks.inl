@@ -47,6 +47,11 @@ inline void recordGraphInspection(const GraphInspection& insp, uint32_t gen) {
     DWORD peerCode = insp.isDirectSeamless ? 1 : (insp.isDirectDsee ? 2 : (insp.eqBypassed ? 3 : 0));
     record("GRAPH_RENDER_PEER", peerCode, 0, S_OK);
 
+    // Issue #54: Unified multi-stage format chain for this track generation
+    // Parameters: requested = (decodeBits << 16) | dseeInBits, applied = (dseeOutBits << 16) | renderInBits
+    record("GRAPH_FORMAT_CHAIN", (DWORD(insp.decodePcm.bitDepth) << 16) | DWORD(insp.dseeIn.bitDepth),
+           (DWORD(insp.dseeOut.bitDepth) << 16) | DWORD(insp.renderIn.bitDepth), S_OK);
+
     // Issue #46 Diagnostics: Peer Code 3 & Full Filter Chain Traversal
     if (!InlineIsEqualGUID(insp.renderPeerClsid, GUID_NULL)) {
         record("GRAPH_PEER_CLSID_1", insp.renderPeerClsid.Data1, (DWORD(insp.renderPeerClsid.Data2) << 16) | insp.renderPeerClsid.Data3, S_OK);
@@ -131,21 +136,31 @@ static HRESULT prepareDseeGraph(IUnknown* object) {
     onEosEqBypassed(graph.Get(), bypassed);
 #endif
 
-    // Track graph lifecycle: recreated vs reused
-    if (routeRes.outputRate > 0) {
-        auto trans = g_graphTracker.onGraphEvent(graph.Get(), routeRes.outputRate, routeRes.outputBits, CodecType::Unknown);
-        if (trans == GraphTransitionType::Recreated) {
-            record("GRAPH_RECREATED", routeRes.outputRate, routeRes.outputBits, S_OK);
-        } else if (trans == GraphTransitionType::ReusedSameFormat) {
-            record("GRAPH_REUSED", routeRes.outputRate, routeRes.outputBits, S_OK);
-        } else if (trans == GraphTransitionType::ReusedFormatSwitched) {
-            record("GRAPH_REUSED", routeRes.outputRate, routeRes.outputBits, S_FALSE);
-        }
-    }
+    DWORD trackedRate = routeRes.outputRate;
+    WORD trackedBits = routeRes.outputBits;
 
     // Inspect and record negotiated audio formats on all 5 graph stages for this generation
     GraphInspection insp{};
-    if (inspectGraphFormats(graph.Get(), insp)) {
+    bool inspected = inspectGraphFormats(graph.Get(), insp);
+
+    if (trackedRate == 0 && inspected) {
+        trackedRate = insp.renderIn.sampleRate;
+        trackedBits = insp.renderIn.bitDepth;
+    }
+
+    // Track graph lifecycle: recreated vs reused
+    if (trackedRate > 0) {
+        auto trans = g_graphTracker.onGraphEvent(graph.Get(), trackedRate, trackedBits, CodecType::Unknown);
+        if (trans == GraphTransitionType::Recreated) {
+            record("GRAPH_RECREATED", trackedRate, trackedBits, S_OK);
+        } else if (trans == GraphTransitionType::ReusedSameFormat) {
+            record("GRAPH_REUSED", trackedRate, trackedBits, S_OK);
+        } else if (trans == GraphTransitionType::ReusedFormatSwitched) {
+            record("GRAPH_REUSED", trackedRate, trackedBits, S_FALSE);
+        }
+    }
+
+    if (inspected) {
         recordGraphInspection(insp, g_graphTracker.generation);
     }
 

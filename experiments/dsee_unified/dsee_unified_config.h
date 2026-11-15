@@ -82,6 +82,17 @@ inline bool isHiResRate(DWORD rate) {
     return rate >= 88200;
 }
 
+// Issue #54: Rate eligibility for 24-bit FLAC decoder output.
+// 48k/96k/192kHz FLAC are always eligible for 24-bit output (DSEE ON or OFF).
+// 44.1kHz FLAC is eligible for 24-bit output IF AND ONLY IF DSEE HX is ON,
+// because DSEE HX bypasses OmgEqxlFilter (which rejects 24-bit) and integer
+// upsamples to 88.2kHz/24-bit. When DSEE HX is OFF, 44.1kHz remains 16-bit to protect EQ.
+inline bool isFlacRateEligible24(DWORD rate, bool dseeActive) {
+    if (rate == 48000 || rate == 96000 || rate == 192000) return true;
+    if (rate == 44100 && dseeActive) return true;
+    return false;
+}
+
 // Harmonization mode for Issue #42 and #43
 enum class HarmonizeMode {
     Target96k,  // Target 96k/24b (48k -> 96k/24b; 44.1k DSEE internal multiple 176.4k/24b)

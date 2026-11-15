@@ -25,11 +25,25 @@ inline std::string_view member(std::string_view s,std::string_view key) {
     for(;;){p=space(s,p);if(p>=s.size())return {};if(s[p]=='}')return found;auto end=endString(s,p);if(end==std::string_view::npos)return {};bool match=s.substr(p+1,end-p-2)==key;p=space(s,end);if(p>=s.size()||s[p++]!=':')return {};p=space(s,p);end=endValue(s,p);if(end==std::string_view::npos)return {};if(match){if(!found.empty())return {};found=s.substr(p,end-p);}p=space(s,end);if(p>=s.size())return {};if(s[p]=='}')return found;if(s[p++]!=',')return {};}
 }
 inline bool defaultMode(std::string_view json) {auto value=member(member(member(member(json,"private"),"audio-output-device"),"output-devices"),"mode");return value=="\"default\"";}
-inline bool directSoundSelected() {
-    wchar_t directory[MAX_PATH];if(FAILED(SHGetFolderPathW(nullptr,CSIDL_APPDATA,nullptr,SHGFP_TYPE_CURRENT,directory)))return false;
+inline std::string savedConfiguration() {
+    wchar_t directory[MAX_PATH];if(FAILED(SHGetFolderPathW(nullptr,CSIDL_APPDATA,nullptr,SHGFP_TYPE_CURRENT,directory)))return {};
     std::wstring path=directory;path+=L"\\Sony\\Music Center\\config\\registry.json";
-    HANDLE f=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);if(f==INVALID_HANDLE_VALUE)return false;
-    LARGE_INTEGER size{};bool ok=GetFileSizeEx(f,&size)&&size.QuadPart>0&&size.QuadPart<=1024*1024;std::string data;if(ok){data.resize(size_t(size.QuadPart));DWORD read=0;ok=ReadFile(f,data.data(),DWORD(data.size()),&read,nullptr)&&read==data.size();}CloseHandle(f);return ok&&defaultMode(data);
+    HANDLE f=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);if(f==INVALID_HANDLE_VALUE)return {};
+    LARGE_INTEGER size{};bool ok=GetFileSizeEx(f,&size)&&size.QuadPart>0&&size.QuadPart<=1024*1024;std::string data;if(ok){data.resize(size_t(size.QuadPart));DWORD read=0;ok=ReadFile(f,data.data(),DWORD(data.size()),&read,nullptr)&&read==data.size();}CloseHandle(f);return ok?data:std::string{};
+}
+inline bool directSoundSelected() { return defaultMode(savedConfiguration()); }
+inline bool dseeSharedEnabled(std::string_view data) {
+    const auto player=member(member(data,"private"),"player");
+    return defaultMode(data) && member(player,"dsee-state")=="true";
+}
+inline bool dseeSharedRequested() {
+    wchar_t envBuf[16]{};
+    DWORD n = GetEnvironmentVariableW(L"MC_BRIDGE_DSEE_ENABLED", envBuf, 16);
+    if (n > 0) {
+        if (_wcsicmp(envBuf, L"0") == 0 || _wcsicmp(envBuf, L"false") == 0 || _wcsicmp(envBuf, L"off") == 0) return false;
+        if (_wcsicmp(envBuf, L"1") == 0 || _wcsicmp(envBuf, L"true") == 0 || _wcsicmp(envBuf, L"on") == 0) return true;
+    }
+    return dseeSharedEnabled(savedConfiguration());
 }
 inline HWND owner=nullptr,badge=nullptr;inline HFONT font=nullptr;inline UINT currentDpi=0;
 inline BOOL CALLBACK findOwner(HWND w,LPARAM result) {DWORD pid=0;GetWindowThreadProcessId(w,&pid);wchar_t name[128];GetClassNameW(w,name,128);if(pid==GetCurrentProcessId()&&IsWindowVisible(w)&&!GetWindow(w,GW_OWNER)&&wcscmp(name,L"Chrome_WidgetWin_1")==0){*reinterpret_cast<HWND*>(result)=w;return FALSE;}return TRUE;}

@@ -1877,6 +1877,157 @@ void testIssue49CodecEligibilityAndRouteMatrix() {
     }
 }
 
+// Test 16: Issue #54 Verification Suite - 44.1kHz/24bit FLAC Entrance, DSEE Input, and Track Transitions
+void testIssue54Flac44k24bInputAndTrackTransitions() {
+    std::printf("[TEST 16] Issue #54: 44.1kHz/24bit FLAC DSEE 24-bit Input & Transition Isolation...\n");
+
+    // 16A: Rate Eligibility Logic (isFlacRateEligible24)
+    CHECK(dseeUnified::isFlacRateEligible24(44100, true));   // 44.1k + DSEE ON -> eligible (24-bit passed)
+    CHECK(!dseeUnified::isFlacRateEligible24(44100, false));  // 44.1k + DSEE OFF -> NOT eligible (kept at 16-bit to protect EQ)
+    CHECK(dseeUnified::isFlacRateEligible24(48000, true));   // 48k + DSEE ON -> eligible
+    CHECK(dseeUnified::isFlacRateEligible24(48000, false));  // 48k + DSEE OFF -> eligible
+    CHECK(dseeUnified::isFlacRateEligible24(96000, true));   // 96k + DSEE ON -> eligible
+    CHECK(dseeUnified::isFlacRateEligible24(96000, false));  // 96k + DSEE OFF -> eligible
+    CHECK(dseeUnified::isFlacRateEligible24(192000, true));  // 192k + DSEE ON -> eligible
+    CHECK(dseeUnified::isFlacRateEligible24(192000, false)); // 192k + DSEE OFF -> eligible
+    CHECK(!dseeUnified::isFlacRateEligible24(32000, true));  // Unsupported rate -> false
+
+    // 16B: DSEE HX Configuration for 44.1kHz / 24-bit FLAC (DSEE ON)
+    {
+        dseeUnified::DseeConfig req{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+        dseeUnified::DseeConfig adj{};
+        // When FLAC decoder indicates 24-bit:
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req, adj, dseeUnified::HarmonizeMode::Family2x, 24));
+        CHECK(adj.inputRate == 44100);
+        CHECK(adj.inputBits == 24);   // Preserved 24-bit input to DSEE HX
+        CHECK(adj.outputRate == 88200); // Integer 2x within 44.1k family
+        CHECK(adj.outputBits == 24);  // 24-bit output
+    }
+
+    // 16C: Multi-Track Transition & Stale Bit Depth Prevention
+    // Track 1: 44.1kHz / 24-bit FLAC (DSEE ON)
+    dseeUnified::setActiveDecoderBits(24);
+    CHECK(dseeUnified::getActiveDecoderBits().load() == 24);
+    {
+        dseeUnified::DseeConfig req1{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+        WORD decBits1 = dseeUnified::getActiveDecoderBits().load();
+        dseeUnified::DseeConfig adj1{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req1, adj1, dseeUnified::HarmonizeMode::Family2x, decBits1));
+        CHECK(adj1.inputBits == 24);
+        CHECK(adj1.outputRate == 88200);
+        CHECK(adj1.outputBits == 24);
+    }
+
+    // Track 2: 48kHz / 16-bit FLAC (DSEE ON)
+    // Decoder recognizes 16-bit -> sets activeDecoderBits to 16
+    dseeUnified::setActiveDecoderBits(16);
+    CHECK(dseeUnified::getActiveDecoderBits().load() == 16);
+    {
+        dseeUnified::DseeConfig req2{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+        WORD decBits2 = dseeUnified::getActiveDecoderBits().load();
+        dseeUnified::DseeConfig adj2{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req2, adj2, dseeUnified::HarmonizeMode::Family2x, decBits2));
+        CHECK(adj2.inputBits == 16);  // Must NOT leak 24-bit from Track 1!
+        CHECK(adj2.outputRate == 96000);
+        CHECK(adj2.outputBits == 24);
+    }
+
+    // Track 3: 44.1kHz / 16-bit FLAC (DSEE ON)
+    dseeUnified::setActiveDecoderBits(16);
+    CHECK(dseeUnified::getActiveDecoderBits().load() == 16);
+    {
+        dseeUnified::DseeConfig req3{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+        WORD decBits3 = dseeUnified::getActiveDecoderBits().load();
+        dseeUnified::DseeConfig adj3{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req3, adj3, dseeUnified::HarmonizeMode::Family2x, decBits3));
+        CHECK(adj3.inputBits == 16);  // Must remain 16-bit
+        CHECK(adj3.outputRate == 88200);
+        CHECK(adj3.outputBits == 24);
+    }
+
+    // Track 4: 48kHz / 16-bit AAC (OpcMp4.dll)
+    // Non-FLAC caller causes reset of activeDecoderBits
+    {
+        dseeUnified::resetActiveDecoderBits();
+        CHECK(dseeUnified::getActiveDecoderBits().load() == 0);
+        dseeUnified::DseeConfig req4{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+        dseeUnified::DseeConfig adj4{};
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req4, adj4, dseeUnified::HarmonizeMode::Family2x, 0));
+        CHECK(adj4.inputBits == 16);
+        CHECK(adj4.outputRate == 96000);
+        CHECK(adj4.outputBits == 24);
+    }
+
+    // Track 5: 44.1kHz / 24-bit FLAC with DSEE OFF
+    // DSEE is OFF -> must NOT be eligible for 24-bit (falls back to 16-bit to preserve EQ path)
+    {
+        CHECK(!dseeUnified::isFlacRateEligible24(44100, false));
+        dseeUnified::setActiveDecoderBits(16);
+        dseeUnified::DseeConfig req5{0, 2, 16, 44100, 44100, 16, 16, 0, 0};
+        dseeUnified::DseeConfig adj5{};
+        CHECK(!dseeUnified::computeUnifiedDseeConfig(req5, adj5, dseeUnified::HarmonizeMode::Family2x, 16));
+    }
+
+    // 16D: DirectShow Mock Graph 4-Stage Format Inspection for 44.1kHz / 24-bit FLAC (DSEE ON)
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dec = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* decOut = new MockPin(PINDIR_OUTPUT, dec, 44100, 24, L"Out");
+        dec->addPin(decOut);
+        graph->addFilter(dec);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 24, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 44100, 16, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 44100, 16, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 44100, 16, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 44100, 16, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(decOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        // Apply EQ bypass: because seamOut is 44.1k/16b and dseeOut is 88.2k/24b,
+        // Peer Code 2 connects dseeOut directly to dsIn
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.outputRate == 88200);
+        CHECK(routeRes.outputBits == 24);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+
+        // Verify the entire 4-stage format chain in the same generation:
+        CHECK(insp.decodePcm.sampleRate == 44100 && insp.decodePcm.bitDepth == 24); // Decoder output: 44.1k/24b
+        CHECK(insp.dseeIn.sampleRate == 44100 && insp.dseeIn.bitDepth == 24);       // DSEE input: 44.1k/24b (NO truncation!)
+        CHECK(insp.dseeOut.sampleRate == 88200 && insp.dseeOut.bitDepth == 24);     // DSEE output: 88.2k/24b
+        CHECK(insp.renderIn.sampleRate == 88200 && insp.renderIn.bitDepth == 24);   // Renderer input: 88.2k/24b
+        CHECK(insp.isDirectDsee);                                                    // Peer Code 2 (Direct DSEE)
+        CHECK(insp.eqBypassed);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1913,6 +2064,8 @@ int main() {
     testIssue46Dsee88kRendererAndChainTraversal();
     std::fflush(stdout);
     testIssue49CodecEligibilityAndRouteMatrix();
+    std::fflush(stdout);
+    testIssue54Flac44k24bInputAndTrackTransitions();
     std::fflush(stdout);
 
     CoUninitialize();
