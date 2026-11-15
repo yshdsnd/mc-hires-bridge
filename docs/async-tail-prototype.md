@@ -1,4 +1,4 @@
-# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35）
+# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36）
 
 ## 1. 概要とアーキテクチャ
 
@@ -7,7 +7,7 @@
 再生エンジン（`OpcDSPlay.dll`）は内部排他制御（CriticalSection）を保持したまま DirectShow の `IMediaControl::Pause()` / `IMediaFilter::Pause()` を呼び出します。従前の同期型待機実装では、このフック内部で前曲の PCM 出力完了を `Sleep` ループで同期待機していたため、エンジン排他制御が 2.7 秒間拘束され、UI スレッドからの手動操作（Pause, Seek, Stop, TrackChange）がブロックされていました。
 
 ### 1.2 非ブロッキング仮想 Pause（Virtual Pause）のアーキテクチャ
-Issue #33、#34、および #35 では、この排他制御拘束を解消するため「非ブロッキング仮想 Pause（Virtual Pause）」方式を採用・改善実装しました（`experiments/eos_transition/` および `flac24_async_experiment`）。
+Issue #33、#34、#35、および #36 では、この排他制御拘束を解消するため「非ブロッキング仮想 Pause（Virtual Pause）」方式を採用・改善実装しました（`experiments/eos_transition/` および `flac24_async_experiment`）。
 
 ```
 [UI スレッド / ユーザー手動操作]
@@ -16,7 +16,7 @@ Issue #33、#34、および #35 では、この排他制御拘束を解消する
        v
 [再生エンジン (OpcDSPlay.dll)]
        |
-       | 1. 自動曲送り時 Pause 呼出 (RVA 0xDAC9)
+       | 1. 自動曲送り時 Pause 呼出 (RVA 0xDAC9) -> 旧グラフ
        v
 [IMediaControl::Pause / IMediaFilter::Pause フック]
        |-- 遷移コンテキスト（transitionId, generation, enterTick）を生成
@@ -26,10 +26,13 @@ Issue #33、#34、および #35 では、この排他制御拘束を解消する
 [再生エンジン (OpcDSPlay.dll)]
        |-- 即座に内部排他制御 (CriticalSection) を解放！
        |
-       | 2. 後続の自動制御呼出 (遷移世代 transitionGeneration に基づく照合)
+       | 2. 後続の自動制御呼出 (遷移世代・対象グラフ・UI入力履歴に基づく峻別)
        |---> IDirectSoundBuffer::Stop() --------> [仮想Pause中の自動停止を抑止 (DS_OK 返却、再生継続)]
-       |---> IMediaSeeking::SetPositions() -----> [内部シーク (seekPos=0, 世代内初回) を退避・保留]
-       |                                          (ユーザー手動シークは世代判定・入力検知で即時優先実行)
+       |---> 旧グラフへの SetPositions(~20s) ---> [旧グラフ内部シークを退避・吸収 (OLD_GRAPH_PARKED)]
+       |                                          (ドレイン中断・旧グラフのフラッシュを防止)
+       |---> 新グラフへの SetPositions(0) ------> [次曲頭出しシークを退避・保留 (DEFERRED_QUEUED)]
+       |                                          (新グラフへドレイン完了時に 1 度だけ適用)
+       | (※ ユーザーの手動非ゼロシーク・手動停止は UI 入力検知により即時最優先実行)
        |
        +=======================================================+
        | バックグラウンド監視スレッド (asyncDrainWorkerThread) |
@@ -49,22 +52,22 @@ Issue #33、#34、および #35 では、この排他制御拘束を解消する
   Stage 2 (レンダラー出力完了)  Virtual Pause 即時取消 (< 1 ms)
         |                             |
   有効な遷移を 1 度だけ完了     保留 SetPositions を破棄 (PURGE)
-  保留 SetPositions を自動実行  ユーザー操作を最優先実行
+  新グラフに保留シークを適用    ユーザー操作を最優先実行
   (PAUSE_DEFERRED_COMPLETED)    遅延 EOS は破棄 (stale_eos == 0)
                                 (PAUSE_DEFERRED_CANCELLED)
 ```
 
-### 1.3 状態遷移と構成要素（Issue #35 改善点を含む）
-- **自動曲送り状態と世代管理（`transitionGeneration`）による内部シーク判定**:
-  - Issue #34 実測において、仮想 Pause 突入の約 6ms 後に別スレッドから発行された内部シーク（`SetPositions(0)`）が手動シークと誤判定されて保留がキャンセルされ、曲末が約 2.8 秒早く打ち切られる回帰が発生しました。
-  - Issue #35 では、固定的なスレッド ID や呼出元アドレスによる判定を廃止し、**グラフの世代（`transitionGeneration`）**、**自動曲送り状態（`autoTrackChangeInProgress`）**、および **ユーザー入力イベント（`g_lastUserInputTick`）** を統合した判定ロジック（`classifySeekOperation`）を導入しました。
-  - 当該世代でユーザー入力がなく、最初に発行された内部初期化シーク（`seekPos == 0`）を自動操作として安全に保留（`AutomatedDeferred`）します。一方、ユーザー入力（マウス・キー・シークバー操作）を伴うシークや位置ジャンプ（`seekPos > 0`）は即座に手動操作（`ManualCancelled`）として識別され、同一呼び出し元からの手動シークも誤分類しません。
-- **DirectSound レンダラー停止の確実な抑止（残存音声排出の維持）**:
-  - 仮想 Pause 中の自動 `IDirectSoundBuffer::Stop()` 呼出をフック層で確実に抑止（`DS_OK` 返却）し、ハードウェア/DirectSound リングバッファ内の残存 PCM（約 2.8 秒）の再生を継続させます。
-  - ユーザーが明示的に停止を操作した場合（`IMediaControl::Stop()` または入力イベント直後の停止）のみ手動停止として Virtual Pause をキャンセルし、直ちに DirectSound を停止させます。
+### 1.3 状態遷移と構成要素（Issue #36 改善点を含む）
+- **旧グラフへの非ゼロシークと新グラフへのゼロシークの完全分離**:
+  - Issue #35 では内部シーク判定に `seekPos > 0` での手動シーク判定を用いていましたが、実機観測により、仮想 Pause 突入の約 6ms 後に旧グラフに対して絶対位置約 20.066 秒の内部シーク（旧グラフの境界位置決め/パーキング呼出）が発行されていることが判明しました（Issue #36）。
+  - この旧グラフへのシークは仮説として扱い、位置の数値や特定モジュールだけに依存せず、**「仮想 Pause 中の旧グラフ宛ての自動呼出（ユーザー入力なし）」** として分類（`OldGraphAutomatedPark`）し、ドレインをキャンセルせず、また旧グラフをフラッシュして残存音声を破壊しないよう安全に吸収（`S_OK` 返却）します。
+  - 約 40ms 後に開く次曲の**新グラフ（`newGraph`）** に対して発行される頭出しシーク（`SetPositions(0)`）は、保留シーク（`AutomatedDeferred`）として新グラフのインターフェース情報とともに退避され、旧グラフのドレイン完了時に新グラフに対して**一度だけ適用**されます。
+- **手動非ゼロシークおよび手動停止の即時優先保証**:
+  - 遷移中であっても、ユーザーの UI 操作（マウス、キーボード、シークバークリック）が観測された場合は `ManualCancelled` として即座に仮想 Pause を取り消し、保留操作をパージした上でユーザー操作を直ちに反映します。
+- **DirectSound レンダラー停止の抑止**:
+  - 仮想 Pause 中の自動 `IDirectSoundBuffer::Stop()` 呼出をフック層で確実に抑止（`DS_OK` 返却）し、ハードウェアバッファ内の残存 PCM（約 2.9 秒）の再生を維持します。
 - **2段階ドレイン完了判定（PCM 到達 vs レンダラー最終出力完了）**:
-  - **Stage 1（下流への PCM 到達 + 下流 EOS 送出）** と **Stage 2（DirectSound レンダラーの最終出力完了）** の双方が満たされて初めて `PAUSE_DEFERRED_COMPLETED` とし、保留されていた `SetPositions` を 1 度だけ安全に適用します。
-  - 完了直前の手動操作取消競合に対しても排他的保護を維持します。
+  - **Stage 1（下流への PCM 到達 + 下流 EOS 送出）** と **Stage 2（DirectSound レンダラーの最終出力完了）** の双方が満たされて初めて `PAUSE_DEFERRED_COMPLETED` とし、新グラフに対して保留シークを安全に 1 度だけ適用します。
 
 ---
 
@@ -80,19 +83,20 @@ Issue #33、#34、および #35 では、この排他制御拘束を解消する
 
 ### 2.2 自然完了時ログシーケンス
 手動操作の割り込みがなく、前曲の曲末がすべて出力され次曲へ自動遷移した場合：
-1. `PAUSE_ASYNC_VIRTUAL_ENTER` (rate, bits, hr=S_OK): 仮想 Pause に突入し、エンジンへ即座に `S_OK` を返却したことを記録。
+1. `PAUSE_ASYNC_VIRTUAL_ENTER` (rate, bits, hr=S_OK): 旧グラフで仮想 Pause に突入し、エンジンへ即座に `S_OK` を返却したことを記録。
 2. `PAUSE_DEFERRED_PENDING` (remainingMs, 0, hr=S_OK): 非同期ドレイン監視が開始されたことを記録。
-3. `DS_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE` (0, 0, hr=DS_OK): エンジンからの自動 DirectSound 停止呼出が抑止されたことを記録。
-4. `DEFERRED_SETPOSITIONS_QUEUED` (newPos, flags, hr=S_OK): 当該世代の内部自動 `SetPositions` が安全に退避・保留されたことを記録。
-5. `EOS_DOWNSTREAM_DELIVER` (rate, bits, hr=S_OK): 前曲ドレイン完了（Stage 1）に伴い下流 EOS を正常送出したことを記録。
-6. `PAUSE_DEFERRED_COMPLETED` (status=CompletedDrain, hr=S_OK): Stage 1（PCM到達）および Stage 2（レンダラー最終出力）が完了。
-7. `DEFERRED_SETPOSITIONS_EXECUTED` (flags, 0, hr=S_OK): 保留されていた `SetPositions` が正常に適用されたことを記録。
+3. `DS_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE` (0, 0, hr=DS_OK): 旧グラフ DirectSound バッファの自動停止呼出が抑止されたことを記録。
+4. `OLD_GRAPH_SETPOSITIONS_PARKED` (pos, flags, hr=S_OK): 旧グラフに対するエンジン内部シーク（約 20.066 秒等）が安全に吸収・パーキングされ、ドレインが維持されたことを記録。
+5. `DEFERRED_SETPOSITIONS_QUEUED` (newPos, flags, hr=S_OK): 次曲の新グラフに対する頭出しシーク（位置 0）が安全に退避・保留されたことを記録。
+6. `EOS_DOWNSTREAM_DELIVER` (rate, bits, hr=S_OK): 前曲ドレイン完了（Stage 1）に伴い下流 EOS を正常送出したことを記録。
+7. `PAUSE_DEFERRED_COMPLETED` (status=CompletedDrain, hr=S_OK): Stage 1（PCM到達）および Stage 2（レンダラー最終出力）が完了。
+8. `DEFERRED_SETPOSITIONS_EXECUTED` (flags, 0, hr=S_OK): 新グラフに対して保留されていた頭出しシークが 1 度だけ適用されたことを記録。
 
 ### 2.3 手動割り込み時ログシーケンス
 仮想 Pause 期間中にユーザーが操作（Pause, Seek, Stop, TrackChange, Exit）を行った場合：
 1. `PAUSE_ASYNC_VIRTUAL_ENTER`: 仮想 Pause 突入。
 2. `PAUSE_DEFERRED_PENDING`: 非同期監視中。
-3. `PAUSE_DEFERRED_CANCELLED` (reason, elapsedMs, hr=S_OK): 手動操作を検知し仮想 Pause を即時取消（キャンセル理由は以下のいずれか）：
+3. `PAUSE_DEFERRED_CANCELLED` (reason, elapsedMs, hr=S_OK): 手動操作（手動非ゼロシーク、手動停止等）を UI 入力検知により即時認識し仮想 Pause を即時取消（キャンセル理由は以下のいずれか）：
    - `CancelledManualPause`: ユーザー手動一時停止
    - `CancelledSeek`: ユーザー手動シーク
    - `CancelledStop`: ユーザー手動停止
@@ -104,9 +108,9 @@ Issue #33、#34、および #35 では、この排他制御拘束を解消する
 
 ---
 
-## 3. ヘッドレス競合テストスイート（Tests 40〜57）検証結果
+## 3. ヘッドレス競合テストスイート（Tests 40〜58）検証結果
 
-Issue #30、#33、#34 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35）、世代・状態判定、および手動操作誤分類防止を検証する Tests 40〜57 を実装・全件合格を確認しました。
+Issue #30、#33、#34、#35、#36 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35 / #36）、旧グラフ非ゼロシークのパーキング、新グラフゼロシークの 1 度きり適用、および手動操作即時優先を検証する Tests 40〜58 を実装・全件合格を確認しました。
 
 | テスト番号 | テスト名称 | 検証項目 | 結果 |
 |:---:|:---|:---|:---:|
@@ -125,11 +129,12 @@ Issue #30、#33、#34 の競合テストハーネス（`AsyncControlHarness`）�
 | **TEST 52** | Two-stage drain verification (PCM delivery vs renderer output) | 下流への PCM 到達（Stage 1）だけでは完了とせず、レンダラー出力完了（Stage 2）を経て初めて `COMPLETED` となることを確認 | **PASS** |
 | **TEST 53** | Pre-completion cancellation race prevention | PCM 到達・EOS 送出完了後、レンダラー最終出力直前に手動操作が到着した場合、取消が確実に優先され、保留操作がパージされ遅延完了処理が古い操作を実行しないことを確認 | **PASS** |
 | **TEST 54** | Monitor thread creation failure non-blocking safety | スレッド作成失敗時にも呼出元スレッドが曲末までブロックされず、即座に（< 2 ms）安全復帰することを確認 | **PASS** |
-| **TEST 55** | 48kHz auto track change event sequence regression (Issue #35) | 仮想 Pause 直後の DirectSound `Stop()` 抑止、約 6ms 後の内部 `SetPositions(0)` 保留、および残存 PCM（約 2.8 秒）完全排出を経て次曲へ遷移することを確認 | **PASS** |
+| **TEST 55** | 48kHz auto track change event sequence regression (Issue #35 / #36) | 仮想 Pause 開始 → DirectSound `Stop()` 抑止 → 旧グラフ非ゼロシーク（約 20.066 秒）パーキング → 新グラフ頭出しシーク（位置 0）保留 → 残存 PCM（約 2.9 秒）完全排出 → 新グラフへ 1 度だけシーク適用を完全検証 | **PASS** |
 | **TEST 56** | Manual seek not misclassified from same caller | 仮想 Pause 保留中に同一呼び出し元から手動シーク（位置 > 0 またはユーザー入力後）が発生した場合、手動シークと判定して即時反映することを確認 | **PASS** |
 | **TEST 57** | Manual stop regression during Virtual Pause | 仮想 Pause 保留中に手動停止が発行された場合、直ちに仮想 Pause を取消してグラフおよび DirectSound を完全停止することを確認 | **PASS** |
+| **TEST 58** | Next track zero seek applied to new graph exactly once (Issue #36) | 重複したエンジン頭出し呼出が発生した場合でも、新グラフへの頭出しシークがドレイン完了時に厳密に 1 回だけ適用されることを確認 | **PASS** |
 
-> 合計 57 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 非同期テスト 40〜57）すべてがエラーなしで通過しました。
+> 合計 58 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 非同期テスト 40〜58）すべてがエラーなしで通過しました。
 
 ---
 
@@ -152,12 +157,13 @@ Codex が Music Center for PC 2.7.4 x86 実機環境で動作検証を行うた�
 
 ### 4.3 実機検証シナリオと確認ポイント
 
-#### シナリオ A: 48kHz 自動曲送りの末尾欠落回帰解消確認（参照 PCM と共有ループバック照合）
+#### シナリオ A: 48kHz 自動曲送りの末尾欠落解消確認（参照 PCM と共有ループバック照合）
 - **対象**: 48 kHz/24 bit FLAC から 48 kHz/16 bit FLAC への自動曲送り（ユーザー操作なし）。
 - **確認事項**:
-  - 先行曲（約 23 秒）の PCM が約 20.2 秒で打ち切られず、末尾まで欠落なく再生されること。
-  - レンダラー出力完了と同時に次曲が 1 度だけ開始されること。
-  - ログに `DS_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE` および `DEFERRED_SETPOSITIONS_QUEUED` が記録され、`PAUSE_DEFERRED_COMPLETED` で自然終了すること。
+  - 先行曲（約 23 秒）の PCM が約 20.2 秒で打ち切られず、末尾約 2.9 秒まで欠落なく再生されること（末尾欠落 0ms）。
+  - 旧グラフへのシーク（約 20.066 秒）でドレインがキャンセルされず `OLD_GRAPH_SETPOSITIONS_PARKED` として処理されること。
+  - レンダラー出力完了と同時に次曲が新グラフで**一度だけ**頭出し・開始されること。
+  - ログに `DS_STOP_SUPPRESSED_FOR_VIRTUAL_PAUSE`, `OLD_GRAPH_SETPOSITIONS_PARKED`, `DEFERRED_SETPOSITIONS_QUEUED` が記録され、`PAUSE_DEFERRED_COMPLETED` で自然終了すること。
 
 #### シナリオ B: 保留区間中の手動一時停止（Manual Pause）の即時反映
 - **対象**: 先行曲末尾約 2 秒前の仮想 Pause 保留区間で、一時停止ボタンをクリック。
@@ -165,14 +171,15 @@ Codex が Music Center for PC 2.7.4 x86 実機環境で動作検証を行うた�
   - クリック直後（< 50 ms）に音声が一時停止し、UI 応答遅延（2.7 秒間の排他ロック拘束）が発生しないこと。
   - ログに `PAUSE_DEFERRED_CANCELLED (CancelledManualPause)` および `DEFERRED_SETPOSITIONS_PURGED` が記録されること。
 
-#### シナリオ C: 保留区間中の手動シーク（Manual Seek）の即時反映
-- **対象**: 保留区間でシークバーをクリックまたはドラッグ。
+#### シナリオ C: 保留区間中の手動非ゼロシーク（Manual Seek）の即時反映
+- **対象**: 保留区間でシークバーをクリックまたはドラッグ（例: 50 秒へシーク）。
 - **確認事項**:
-  - 内部シークと誤分類されることなく、ユーザー指定位置へ即座にジャンプすること。
+  - 旧グラフの内部シークと同一スレッド・呼出元であっても、UI 入力検知により手動シークと判定され、ユーザー指定位置へ即座にジャンプすること。
   - ログに `PAUSE_DEFERRED_CANCELLED (CancelledSeek)` が記録されること。
 
 #### シナリオ D: 保留区間中の手動停止（Manual Stop）の即時反映
 - **対象**: 保留区間で停止ボタンをクリック。
 - **確認事項**:
   - 直ちに音声出力が停止し、停止状態へ遷移すること。
+  - ログに `PAUSE_DEFERRED_CANCELLED (CancelledStop)` が記録されること。
   - ログに `PAUSE_DEFERRED_CANCELLED (CancelledStop)` が記録されること。

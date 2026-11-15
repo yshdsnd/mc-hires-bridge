@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <map>
 
+struct IStream;
+
 namespace eosTransition {
 
 enum class PreReadDecision {
@@ -79,6 +81,9 @@ struct GraphState {
 
     struct DeferredSeekParams {
         bool valid = false;
+        void* targetGraph = nullptr;
+        void* targetSeeking = nullptr;
+        IStream* targetSeekingMarshalStream = nullptr;
         LONGLONG current = 0;
         DWORD currentFlags = 0;
         LONGLONG stop = 0;
@@ -106,6 +111,14 @@ struct GraphState {
     DeferredSeekParams deferredSeek;
     bool deferredDsStop = false;
     bool deferredGraphStop = false;
+
+    void releaseDeferredSeekStream() {
+        if (deferredSeek.targetSeekingMarshalStream) {
+            auto* pStream = deferredSeek.targetSeekingMarshalStream;
+            deferredSeek.targetSeekingMarshalStream = nullptr;
+            pStream->Release();
+        }
+    }
 
     bool isVirtualPauseActive() const { return virtualPauseActive; }
     bool isPauseDeferralActive() const { return virtualPauseActive || pauseDeferralStatus == PauseDeferralStatus::Active; }
@@ -371,6 +384,7 @@ public:
         s.transition.cancelled = true;
         s.formatChangePauseDeferred = false;
         s.pauseDeferralStatus = status;
+        s.releaseDeferredSeekStream();
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;
@@ -437,39 +451,68 @@ public:
     enum class SeekClassification {
         NotVirtualPause,
         AutomatedDeferred,
+        OldGraphAutomatedPark,
         ManualCancelled
     };
 
-    SeekClassification classifySeekOperation(void* graphKey, bool isExplicitManualOp, bool isExplicitEngineCall,
-                                            LONGLONG seekPos, DWORD lastInputTick = 0) const {
-        const auto* s = findGraph(graphKey);
-        if (!s || !s->virtualPauseActive) {
+    bool findActiveVirtualPauseGraph(void** outGraphKey) const {
+        for (const auto& kv : graphs_) {
+            if (kv.second.virtualPauseActive) {
+                if (outGraphKey) *outGraphKey = kv.first;
+                return true;
+            }
+        }
+        if (outGraphKey) *outGraphKey = nullptr;
+        return false;
+    }
+
+    SeekClassification classifySeekOperation(void* targetGraphKey, bool isExplicitManualOp, bool isExplicitEngineCall,
+                                            LONGLONG seekPos, DWORD lastInputTick = 0, void** outActiveVirtualGraph = nullptr) const {
+        void* activeVirtualKey = nullptr;
+        if (!findActiveVirtualPauseGraph(&activeVirtualKey)) {
+            if (outActiveVirtualGraph) *outActiveVirtualGraph = nullptr;
+            return SeekClassification::NotVirtualPause;
+        }
+        if (outActiveVirtualGraph) {
+            *outActiveVirtualGraph = activeVirtualKey;
+        }
+        const auto* activeState = findGraph(activeVirtualKey);
+        if (!activeState || !activeState->virtualPauseActive) {
             return SeekClassification::NotVirtualPause;
         }
 
+        // Priority 1: User manual operations (mouse click, keyboard, seekbar scroll, explicit UI op)
         if (isExplicitManualOp) {
             return SeekClassification::ManualCancelled;
         }
-        if (isExplicitEngineCall) {
-            return s->deferredSeek.valid ? SeekClassification::ManualCancelled : SeekClassification::AutomatedDeferred;
-        }
-
-        // Check if user interacted with UI (mouse click, keyboard, seekbar scroll) recently
-        if (lastInputTick != 0 && (lastInputTick >= s->virtualPauseEnterTick || (GetTickCount() - lastInputTick < 400))) {
+        if (lastInputTick != 0 && (lastInputTick >= activeState->virtualPauseEnterTick || (GetTickCount() - lastInputTick < 400))) {
             return SeekClassification::ManualCancelled;
         }
 
-        // The automated next-track seek only occurs once per transition generation
-        if (s->deferredSeek.valid) {
-            return SeekClassification::ManualCancelled;
-        }
+        // Priority 2: Automated engine operations (no user input observed)
+        bool isOldGraph = (targetGraphKey == nullptr || targetGraphKey == activeVirtualKey);
 
-        // Automated next-track initial seek starts at 0. A non-zero seek position (> 0) indicates a user seekbar jump.
-        if (seekPos > 0) {
-            return SeekClassification::ManualCancelled;
+        if (isOldGraph) {
+            // Internal call on the OLD graph while it is in Virtual Pause:
+            // ~6ms after Pause, the engine calls SetPositions(~20.066s) on the old graph.
+            // This is an internal old-graph positioning/parking call; it must NOT cancel the drain
+            // and must NOT flush the old graph's draining PCM buffer!
+            if (seekPos > 0) {
+                return SeekClassification::OldGraphAutomatedPark;
+            }
+            // If seekPos == 0 on the old graph (e.g. single-graph test environment):
+            // If a deferred seek is already queued for this transition generation, park/absorb subsequent seeks.
+            if (activeState->deferredSeek.valid) {
+                return SeekClassification::OldGraphAutomatedPark;
+            }
+            return SeekClassification::AutomatedDeferred;
+        } else {
+            // Seek on a NEW/different graph while old graph is in Virtual Pause:
+            // This is the next track's preparation seek (e.g. SetPositions(0) on newGraph).
+            // It must be deferred until the old graph's drain completes naturally,
+            // then applied to the new graph once!
+            return SeekClassification::AutomatedDeferred;
         }
-
-        return SeekClassification::AutomatedDeferred;
     }
 
     uint32_t getTransitionGeneration(void* graphKey) const {
@@ -512,14 +555,24 @@ public:
         return s && s->transition.pcmDeliveryComplete && s->transition.rendererOutputComplete;
     }
 
-    void deferAutomaticSeek(void* graphKey, LONGLONG current, DWORD currentFlags, LONGLONG stop, DWORD stopFlags) {
-        if (!graphKey) return;
-        auto& s = ensureGraph(graphKey);
+    void deferAutomaticSeek(void* activeGraphKey, void* targetGraphKey, void* targetSeeking,
+                            LONGLONG current, DWORD currentFlags, LONGLONG stop, DWORD stopFlags,
+                            IStream* marshalStream = nullptr) {
+        if (!activeGraphKey) return;
+        auto& s = ensureGraph(activeGraphKey);
+        s.releaseDeferredSeekStream();
         s.deferredSeek.valid = true;
+        s.deferredSeek.targetGraph = targetGraphKey ? targetGraphKey : activeGraphKey;
+        s.deferredSeek.targetSeeking = targetSeeking;
+        s.deferredSeek.targetSeekingMarshalStream = marshalStream;
         s.deferredSeek.current = current;
         s.deferredSeek.currentFlags = currentFlags;
         s.deferredSeek.stop = stop;
         s.deferredSeek.stopFlags = stopFlags;
+    }
+
+    void deferAutomaticSeek(void* graphKey, LONGLONG current, DWORD currentFlags, LONGLONG stop, DWORD stopFlags) {
+        deferAutomaticSeek(graphKey, graphKey, nullptr, current, currentFlags, stop, stopFlags, nullptr);
     }
 
     bool hasDeferredSeek(void* graphKey) const {
@@ -564,6 +617,7 @@ public:
     void clearDeferredActions(void* graphKey) {
         if (!graphKey) return;
         auto& s = ensureGraph(graphKey);
+        s.releaseDeferredSeekStream();
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;
@@ -680,6 +734,7 @@ private:
         s.virtualPauseActive = false;
         s.autoTrackChangeInProgress = false;
         s.transition = GraphState::TransitionContext{};
+        s.releaseDeferredSeekStream();
         s.deferredSeek = GraphState::DeferredSeekParams{};
         s.deferredDsStop = false;
         s.deferredGraphStop = false;

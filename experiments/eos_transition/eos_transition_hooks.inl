@@ -915,11 +915,22 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
                 recordDiag(completed ? "PAUSE_DEFERRED_COMPLETED" : "PAUSE_DEFERRED_TIMED_OUT",
                            key, caller, GetTickCount() - startTick, 0, S_OK);
 
-                if (hasSeek && seeking && originalSetPositions) {
-                    originalSetPositions(seeking, &seekParams.current, seekParams.currentFlags,
-                                         &seekParams.stop, seekParams.stopFlags);
-                    recordDiag("DEFERRED_SETPOSITIONS_EXECUTED", key, caller,
-                               static_cast<DWORD>(seekParams.current / 10000), seekParams.currentFlags, S_OK);
+                if (hasSeek && originalSetPositions) {
+                    IMediaSeeking* targetSeek = nullptr;
+                    if (seekParams.targetSeekingMarshalStream) {
+                        CoGetInterfaceAndReleaseStream(seekParams.targetSeekingMarshalStream, IID_IMediaSeeking, reinterpret_cast<void**>(&targetSeek));
+                        seekParams.targetSeekingMarshalStream = nullptr;
+                    } else if (seeking) {
+                        targetSeek = seeking;
+                        targetSeek->AddRef();
+                    }
+                    if (targetSeek) {
+                        originalSetPositions(targetSeek, &seekParams.current, seekParams.currentFlags,
+                                             &seekParams.stop, seekParams.stopFlags);
+                        recordDiag("DEFERRED_SETPOSITIONS_EXECUTED", seekParams.targetGraph ? seekParams.targetGraph : key, caller,
+                                   static_cast<DWORD>(seekParams.current / 10000), seekParams.currentFlags, S_OK);
+                        targetSeek->Release();
+                    }
                 }
             }
             break;
@@ -1288,7 +1299,7 @@ static HRESULT STDMETHODCALLTYPE setPositionsHook(IMediaSeeking* self, LONGLONG*
             LONGLONG newStop = modifiesStop ? *pStop : -1;
             recordDiag("BOUNDARY_SEEK_SETPOSITIONS_ENTER", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
             AcquireSRWLockExclusive(&eosLock);
-            auto* g = eosTracker.findGraph(key);
+            void* activePauseGraphKey = nullptr;
             bool isExplicitManual = false;
             bool isExplicitEngine = false;
 #ifdef TESTING_HEADLESS
@@ -1296,19 +1307,31 @@ static HRESULT STDMETHODCALLTYPE setPositionsHook(IMediaSeeking* self, LONGLONG*
             if (g_forceOpcDsPlayPauseCaller) isExplicitEngine = true;
 #endif
             auto classification = eosTracker.classifySeekOperation(key, isExplicitManual, isExplicitEngine,
-                                                                   newPos, g_lastUserInputTick.load());
-            if (classification == eosTransition::Tracker::SeekClassification::AutomatedDeferred) {
-                eosTracker.deferAutomaticSeek(key, newPos, dwCurrentFlags, newStop, dwStopFlags);
+                                                                   newPos, g_lastUserInputTick.load(), &activePauseGraphKey);
+            if (classification == eosTransition::Tracker::SeekClassification::OldGraphAutomatedPark) {
+                ReleaseSRWLockExclusive(&eosLock);
+                recordDiag("OLD_GRAPH_SETPOSITIONS_PARKED", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
+                return S_OK; // Absorbed: do not flush old graph or cancel Virtual Pause
+            } else if (classification == eosTransition::Tracker::SeekClassification::AutomatedDeferred) {
+                IStream* marshalStream = nullptr;
+                if (self) {
+                    CoMarshalInterThreadInterfaceInStream(IID_IMediaSeeking, self, &marshalStream);
+                }
+                eosTracker.deferAutomaticSeek(activePauseGraphKey ? activePauseGraphKey : key, key, self,
+                                              newPos, dwCurrentFlags, newStop, dwStopFlags, marshalStream);
                 ReleaseSRWLockExclusive(&eosLock);
                 recordDiag("DEFERRED_SETPOSITIONS_QUEUED", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, dwCurrentFlags, S_OK);
                 return S_OK;
             } else if (classification == eosTransition::Tracker::SeekClassification::ManualCancelled) {
-                eosTracker.cancelVirtualPause(key, eosTransition::PauseDeferralStatus::CancelledSeek);
+                eosTracker.cancelVirtualPause(activePauseGraphKey ? activePauseGraphKey : key, eosTransition::PauseDeferralStatus::CancelledSeek);
                 recordDiag("PAUSE_DEFERRED_CANCELLED", key, caller, static_cast<DWORD>(eosTransition::PauseDeferralStatus::CancelledSeek), 0, S_OK);
                 recordDiag("DEFERRED_SETPOSITIONS_PURGED", key, caller, 0, 0, S_OK);
-            } else if (g && g->isPauseDeferralActive()) {
-                eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledSeek);
-                recordDiag("PAUSE_DEFERRED_ABORT_BY_SEEK", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, 0, S_OK);
+            } else {
+                auto* g = eosTracker.findGraph(key);
+                if (g && g->isPauseDeferralActive()) {
+                    eosTracker.cancelFormatChangePause(key, eosTransition::PauseDeferralStatus::CancelledSeek);
+                    recordDiag("PAUSE_DEFERRED_ABORT_BY_SEEK", key, caller, modifiesCurr ? static_cast<DWORD>(newPos / 10000) : 0, 0, S_OK);
+                }
             }
             eosTracker.onSeekPositions(key, modifiesCurr, newPos, modifiesStop, newStop);
             ReleaseSRWLockExclusive(&eosLock);
