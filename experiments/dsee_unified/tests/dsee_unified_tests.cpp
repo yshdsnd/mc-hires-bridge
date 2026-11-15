@@ -665,6 +665,56 @@ void testDirectShowEqBypassMock() {
         peer.Reset();
         CHECK(SUCCEEDED(eqOut->ConnectedTo(&peer)) && peer.Get() == dsIn);
     }
+
+    // Case 6C: Topology B - DSEE connected directly to EQ (SeamlessFilter omitted / format switch)
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId);
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+        dsee->Release();
+
+        auto* eq = new MockFilter(dseeUnified::eqId);
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 88200, 24);
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 88200, 24);
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+        eq->Release();
+
+        auto* ds = new MockFilter(CLSID_DSoundRender);
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 88200, 24);
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+        ds->Release();
+
+        // Connect DSEE -> EQ and EQ -> DirectSound
+        dseeOut->ReceiveConnection(eqIn, nullptr);
+        eqIn->ReceiveConnection(dseeOut, nullptr);
+        eqOut->ReceiveConnection(dsIn, nullptr);
+        dsIn->ReceiveConnection(eqOut, nullptr);
+
+        // Apply bypass
+        auto res = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(res.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(res.change == S_OK);
+        CHECK(res.outputRate == 88200);
+        CHECK(res.outputBits == 24);
+
+        // Verify DSEE is now connected directly to DirectSound
+        Microsoft::WRL::ComPtr<IPin> peer;
+        CHECK(SUCCEEDED(dseeOut->ConnectedTo(&peer)) && peer.Get() == dsIn);
+        peer.Reset();
+        CHECK(SUCCEEDED(dsIn->ConnectedTo(&peer)) && peer.Get() == dseeOut);
+
+        // Calling applyEqBypass again should report AlreadyBypassed
+        auto res2 = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(res2.outcome == dseeUnified::RouteOutcome::AlreadyBypassed);
+        CHECK(res2.outputRate == 88200);
+        CHECK(res2.outputBits == 24);
+    }
 }
 
 // Test 7: Live Sony Filter Negotiation Verification (if OmgDseeHxFilter.ax is present)
@@ -894,6 +944,113 @@ void testCrossFamilyLimitation() {
     CHECK(adj48_96k.outputRate == 96000);
 }
 
+// Test 11: Issue #44 Negotiation Matrix & Family Mode Verification
+void testIssue44NegotiationMatrix() {
+    std::printf("[TEST 11] Issue #44 Negotiation Matrix & Family Modes...\n");
+
+    // Formats matrix:
+    // 44.1kHz / 16bit
+    // 44.1kHz / 24bit
+    // 48kHz / 16bit
+    // 48kHz / 24bit
+    // 96kHz / 24bit (Hi-Res native)
+    // 192kHz / 24bit (Hi-Res native)
+
+    dseeUnified::DseeConfig req44_16{1, 2, 16, 44100, 44100, 16, 16, 0, 0};
+    dseeUnified::DseeConfig req44_24{1, 2, 24, 44100, 44100, 24, 16, 0, 0};
+    dseeUnified::DseeConfig req48_16{1, 2, 16, 48000, 48000, 16, 16, 0, 0};
+    dseeUnified::DseeConfig req48_24{1, 2, 24, 48000, 48000, 24, 16, 0, 0};
+    dseeUnified::DseeConfig req96_24{1, 2, 24, 96000, 96000, 24, 16, 0, 0};
+    dseeUnified::DseeConfig req192_24{1, 2, 24, 192000, 192000, 24, 16, 0, 0};
+
+    // 1. Family2x Mode (Default standard output policy for Issue #44):
+    // 44.1kHz family -> 88.2kHz / 24-bit
+    // 48kHz family -> 96kHz / 24-bit
+    {
+        dseeUnified::DseeConfig out44_16{}, out44_24{}, out48_16{}, out48_24{};
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req44_16, out44_16, dseeUnified::HarmonizeMode::Family2x));
+        CHECK(out44_16.outputRate == 88200);
+        CHECK(out44_16.outputBits == 24);
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req44_24, out44_24, dseeUnified::HarmonizeMode::Family2x));
+        CHECK(out44_24.outputRate == 88200);
+        CHECK(out44_24.outputBits == 24);
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req48_16, out48_16, dseeUnified::HarmonizeMode::Family2x));
+        CHECK(out48_16.outputRate == 96000);
+        CHECK(out48_16.outputBits == 24);
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req48_24, out48_24, dseeUnified::HarmonizeMode::Family2x));
+        CHECK(out48_24.outputRate == 96000);
+        CHECK(out48_24.outputBits == 24);
+    }
+
+    // 2. Family4x Mode (Candidate output policy):
+    // 44.1kHz family -> 176.4kHz / 24-bit
+    // 48kHz family -> 192kHz / 24-bit
+    {
+        dseeUnified::DseeConfig out44_16{}, out44_24{}, out48_16{}, out48_24{};
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req44_16, out44_16, dseeUnified::HarmonizeMode::Family4x));
+        CHECK(out44_16.outputRate == 176400);
+        CHECK(out44_16.outputBits == 24);
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req44_24, out44_24, dseeUnified::HarmonizeMode::Family4x));
+        CHECK(out44_24.outputRate == 176400);
+        CHECK(out44_24.outputBits == 24);
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req48_16, out48_16, dseeUnified::HarmonizeMode::Family4x));
+        CHECK(out48_16.outputRate == 192000);
+        CHECK(out48_16.outputBits == 24);
+
+        CHECK(dseeUnified::computeUnifiedDseeConfig(req48_24, out48_24, dseeUnified::HarmonizeMode::Family4x));
+        CHECK(out48_24.outputRate == 192000);
+        CHECK(out48_24.outputBits == 24);
+    }
+
+    // 3. Hi-Res Native (96kHz & 192kHz) pass-through:
+    // DSEE HX should not process native hi-res formats (computeUnifiedDseeConfig returns false)
+    {
+        dseeUnified::DseeConfig out96{}, out192{};
+        CHECK(!dseeUnified::computeUnifiedDseeConfig(req96_24, out96, dseeUnified::HarmonizeMode::Family2x));
+        CHECK(!dseeUnified::computeUnifiedDseeConfig(req192_24, out192, dseeUnified::HarmonizeMode::Family2x));
+        CHECK(!dseeUnified::computeUnifiedDseeConfig(req96_24, out96, dseeUnified::HarmonizeMode::Family4x));
+        CHECK(!dseeUnified::computeUnifiedDseeConfig(req192_24, out192, dseeUnified::HarmonizeMode::Family4x));
+    }
+
+    // 4. Topology B Format Inspection (Direct DSEE -> DirectSound without SeamlessFilter):
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId);
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 16);
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24);
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+        dsee->Release();
+
+        auto* ds = new MockFilter(CLSID_DSoundRender);
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 88200, 24);
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+        ds->Release();
+
+        // Connect DSEE directly to DirectSound (as after applyEqBypass in Topology B)
+        dseeOut->ReceiveConnection(dsIn, nullptr);
+        dsIn->ReceiveConnection(dseeOut, nullptr);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.isDirectDsee);
+        CHECK(insp.eqBypassed);
+        CHECK(!insp.isDirectSeamless);
+        CHECK(insp.dseeOut.sampleRate == 88200 && insp.dseeOut.bitDepth == 24);
+        CHECK(insp.renderIn.sampleRate == 88200 && insp.renderIn.bitDepth == 24);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -920,6 +1077,8 @@ int main() {
     testGraphInspectionCoverage();
     std::fflush(stdout);
     testCrossFamilyLimitation();
+    std::fflush(stdout);
+    testIssue44NegotiationMatrix();
     std::fflush(stdout);
 
     CoUninitialize();

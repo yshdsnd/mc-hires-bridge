@@ -173,11 +173,57 @@ In `flac24_dsee_experiment`:
 
 ### 8.4 Cross-Family (44.1kHz vs 48kHz) Common Sample Rate Analysis
 
-- The user clarified that `Family2x` (88.2kHz vs 96kHz) is **not** a common sample rate.
+- The user clarified that `Family2x` (88.2kHz vs 96kHz) is within-family integer upsampling, not cross-family sample rate unification.
 - Investigation confirmed that Sony's `OmgDseeHxFilter.ax` internal DSP algorithm is an integer-ratio polyphase upsampler:
   - 44.1kHz can only upsample to 44.1k, 88.2k, or 176.4k.
   - 48.0kHz can only upsample to 48.0k, 96.0k, or 192.0k.
 - Setting `outputRate = 96000` for 44.1kHz causes DSEE HX to reject fractional resampling and clamp to 176.4kHz/24-bit.
-- **Architectural Conclusion**: To achieve a single, truly unified sample rate across 44.1kHz and 48kHz (e.g. universal 96kHz or 192kHz output for all tracks):
-  - An external DirectShow Resampler filter (such as Microsoft's standard Audio Resampler DSP / MFT or custom sinc-interpolator) must be inserted between `SeamlessFilter` and `DirectSoundRender`.
-  - Within each rate family (e.g. 48kHz/16bit and 48kHz/24bit), DSEE HX natively unifies both to 24-bit without requiring an external resampler.
+
+---
+
+## 9. Issue #44: 44.1kHz Family Output Policy, Windows Shared Mode Integration, and Dual Graph Topology Bypass
+
+### 9.1 Output Policy and Windows Shared Engine Responsibility
+
+Under Music Center 2.7.4 with DSEE HX enabled and Windows DirectSound shared output:
+1. **Device Shared Format Conversion**:
+   - DirectSound / WASAPI shared mixer in Windows automatically converts any stream format accepted by the DirectSound renderer to the Windows default shared format (e.g., 24-bit 96kHz or 24-bit 192kHz configured in Windows Sound Control Panel).
+   - Therefore, **an in-graph DirectShow resampler filter is unnecessary and undesirable**.
+   - DSEE HX performs clean integer-ratio upsampling within each family without introducing DSP interpolation artifacts, passing pristine 24-bit PCM to DirectSound.
+2. **Harmonization Modes**:
+   - **`Family2x` (Default / Standard baseline)**:
+     - 44.1kHz (16-bit & 24-bit) → **88.2kHz / 24-bit**
+     - 48.0kHz (16-bit & 24-bit) → **96.0kHz / 24-bit**
+   - **`Family4x` (Candidate mode)**:
+     - 44.1kHz (16-bit & 24-bit) → **176.4kHz / 24-bit**
+     - 48.0kHz (16-bit & 24-bit) → **192.0kHz / 24-bit**
+   - **Native Hi-Res Pass-Through**:
+     - 96kHz/24-bit and 192kHz/24-bit native sources pass through DSEE HX untouched (bit-perfect preservation).
+   - **Equalizer**:
+     - Disabled / bypassed (`applyEqBypass`), ensuring 24-bit output reaches DirectSound.
+
+### 9.2 Dual Graph Topologies during Format-Changing Track Transitions
+
+Live graph inspection during continuous playback across tracks of differing formats revealed two distinct DirectShow graph topologies constructed by `OpcDSPlay.dll` / `SeamlessManager.dll`:
+
+- **Topology A (Same-Format / Seamless)**:
+  `[Decoded Source] -> [OmgDseeHxFilter] -> [SeamlessFilter] -> [OmgEqxlFilter (EQ)] -> [DirectSoundRender]`
+  - Used when consecutive tracks have identical sampling rates and bit depths.
+  - `applyEqBypass` disconnects `SeamlessFilter -> EQ` and connects `SeamlessFilter -> DirectSoundRender`.
+- **Topology B (Format-Changing Transition)**:
+  `[Decoded Source] -> [OmgDseeHxFilter] -> [OmgEqxlFilter (EQ)] -> [DirectSoundRender]`
+  - `SeamlessManager.dll` omits `SeamlessFilter` entirely because seamless buffer splicing cannot bridge differing sampling rates or bit depths.
+  - The previous implementation expected `SeamlessFilter` to precede EQ and skipped bypass (`DSEE_EQ_SKIPPED`).
+  - **Generalized `applyEqBypass`**:
+    - Queries the upstream pin connected to `eqIn` via `eqIn->ConnectedTo(&upstreamOut)`.
+    - Whether `upstreamOut` belongs to `SeamlessFilter` or `OmgDseeHxFilter`, it disconnects `upstreamOut -> eqIn`, disconnects `eqOut -> dsIn`, and connects `upstreamOut -> dsIn`.
+    - Telemetry logs `GRAPH_RENDER_PEER: 2` for direct DSEE connection, `1` for direct Seamless connection, or `0` for EQ.
+
+### 9.3 End-of-Stream (EOS) and Sample Accounting in Topology B
+
+When `SeamlessFilter` is absent in Topology B:
+1. Upstream hook `seamlessReceiveHook` is never invoked, leaving `upstreamSamples` at 0.
+2. In `dsRenderReceiveHook`: when `upstreamSamples == 0` and EQ is bypassed, `onUpstreamSample` is recorded to ensure `upstreamBytes == downstreamBytes`.
+3. In `dsRenderEosHook`: when `upstreamEosCount == 0`, `onUpstreamEndOfStream` is synthesized before `onDownstreamEndOfStream`.
+4. This ensures `isFormatChangePending` is properly set, enabling synchronous track-tail pause deferral (`deferFormatChangePause`) to protect track tails across format transitions (e.g. 44.1kHz ↔ 48kHz or 24-bit ↔ 16-bit).
+

@@ -69,6 +69,7 @@ struct GraphInspection {
     FormatStage renderIn;
     bool eqBypassed = false;
     bool isDirectSeamless = false;
+    bool isDirectDsee = false;
 };
 
 inline ComPtr<IPin> findUniquePin(IBaseFilter* filter, PIN_DIRECTION wanted) {
@@ -165,12 +166,23 @@ inline bool inspectGraphFormats(IGraphBuilder* graph, GraphInspection& out) {
     if (dsFilter) {
         auto inPin = findUniquePin(dsFilter.Get(), PINDIR_INPUT);
         readPinAudioFormat(inPin.Get(), out.renderIn);
-        if (inPin && seamFilter) {
-            auto seamOut = findUniquePin(seamFilter.Get(), PINDIR_OUTPUT);
+        if (inPin) {
             ComPtr<IPin> currentPeer;
-            if (SUCCEEDED(inPin->ConnectedTo(&currentPeer)) && seamOut && currentPeer.Get() == seamOut.Get()) {
-                out.isDirectSeamless = true;
-                out.eqBypassed = true;
+            if (SUCCEEDED(inPin->ConnectedTo(&currentPeer)) && currentPeer) {
+                auto seamOut = seamFilter ? findUniquePin(seamFilter.Get(), PINDIR_OUTPUT) : nullptr;
+                auto dseeOut = dseeFilter ? findUniquePin(dseeFilter.Get(), PINDIR_OUTPUT) : nullptr;
+                auto eqOut = eqFilter ? findUniquePin(eqFilter.Get(), PINDIR_OUTPUT) : nullptr;
+                if (seamOut && currentPeer.Get() == seamOut.Get()) {
+                    out.isDirectSeamless = true;
+                    out.eqBypassed = true;
+                } else if (dseeOut && currentPeer.Get() == dseeOut.Get()) {
+                    out.isDirectDsee = true;
+                    out.eqBypassed = true;
+                } else if (eqOut && currentPeer.Get() == eqOut.Get()) {
+                    out.eqBypassed = false;
+                } else {
+                    out.eqBypassed = true;
+                }
             }
         }
     }
@@ -180,8 +192,10 @@ inline bool inspectGraphFormats(IGraphBuilder* graph, GraphInspection& out) {
     return true;
 }
 
-// Bypasses OmgEqxlFilter (EQ) so SeamlessFilter outputs directly to DirectSound.
-// Ensures robust handling across initial playback and seamless track transitions.
+// Bypasses OmgEqxlFilter (EQ) so upstream filter (SeamlessFilter, DSEE, or Source)
+// connects directly to DirectSound.
+// Supports both seamless transitions (Topology A: Seamless -> EQ -> DS) and
+// format-change transitions (Topology B: DSEE -> EQ -> DS).
 inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     RouteResult result;
     if (!graph) return result;
@@ -202,47 +216,42 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
         f.Reset();
     }
 
-    // Must have Seamless and DirectSound
-    if (!seamFilter || !dsFilter) return result;
-
-    auto seamOut = findUniquePin(seamFilter.Get(), PINDIR_OUTPUT);
+    if (!dsFilter) return result;
     auto dsIn = findUniquePin(dsFilter.Get(), PINDIR_INPUT);
-    if (!seamOut || !dsIn) return result;
+    if (!dsIn) return result;
 
-    // Check FIRST if Seamless is already connected directly to DirectSound
-    // This check is state-independent and must always populate negotiated render format.
-    ComPtr<IPin> currentPeer;
-    if (SUCCEEDED(seamOut->ConnectedTo(&currentPeer)) && currentPeer.Get() == dsIn.Get()) {
-        result.outcome = RouteOutcome::AlreadyBypassed;
-        result.change = S_OK;
+    auto eqIn = eqFilter ? findUniquePin(eqFilter.Get(), PINDIR_INPUT) : nullptr;
+    auto eqOut = eqFilter ? findUniquePin(eqFilter.Get(), PINDIR_OUTPUT) : nullptr;
 
-        AM_MEDIA_TYPE mt{};
-        if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
-            auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
-            result.outputRate = w->nSamplesPerSec;
-            result.outputBits = w->wBitsPerSample;
-            result.outputChannels = w->nChannels;
-            if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
-            if (mt.pUnk) mt.pUnk->Release();
+    // Check FIRST if DirectSoundRender input is ALREADY connected directly to an upstream filter (EQ already bypassed)
+    ComPtr<IPin> currentDsPeer;
+    if (SUCCEEDED(dsIn->ConnectedTo(&currentDsPeer)) && currentDsPeer) {
+        if (!eqOut || currentDsPeer.Get() != eqOut.Get()) {
+            result.outcome = RouteOutcome::AlreadyBypassed;
+            result.change = S_OK;
+
+            AM_MEDIA_TYPE mt{};
+            if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
+                auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
+                result.outputRate = w->nSamplesPerSec;
+                result.outputBits = w->wBitsPerSample;
+                result.outputChannels = w->nChannels;
+                if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+                if (mt.pUnk) mt.pUnk->Release();
+            }
+            return result;
         }
-        return result;
     }
 
-    // If EQ is not present or disconnected, nothing to bypass
-    if (!eqFilter) return result;
+    // If EQ is not present or not connected to DirectSound, nothing to bypass
+    if (!eqFilter || !eqIn || !eqOut) return result;
 
-    auto eqIn = findUniquePin(eqFilter.Get(), PINDIR_INPUT);
-    auto eqOut = findUniquePin(eqFilter.Get(), PINDIR_OUTPUT);
-    if (!eqIn || !eqOut) return result;
-
-    // Check that Seamless -> EQ and EQ -> DirectSound are currently connected
-    ComPtr<IPin> seamPeer, eqPeer;
-    if (FAILED(seamOut->ConnectedTo(&seamPeer)) || seamPeer.Get() != eqIn.Get()) return result;
-    if (FAILED(eqOut->ConnectedTo(&eqPeer)) || eqPeer.Get() != dsIn.Get()) return result;
+    // Determine which pin is feeding EQ (SeamlessFilter, DSEE, or Source)
+    ComPtr<IPin> upstreamOut;
+    if (FAILED(eqIn->ConnectedTo(&upstreamOut)) || !upstreamOut) return result;
+    if (FAILED(eqOut->ConnectedTo(&currentDsPeer)) || currentDsPeer.Get() != dsIn.Get()) return result;
 
     // DirectShow filter state handling:
-    // If graph is paused (e.g. during track transition), transition temporarily to stopped
-    // to rewire connections safely, then restore previous state.
     ComPtr<IMediaControl> control;
     OAFilterState state = State_Stopped;
     if (SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&control)))) {
@@ -256,9 +265,9 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     }
 
     // Save existing media types for rollback
-    auto edgeSeamEq = std::make_unique<RouteEdge>();
-    edgeSeamEq->out = seamOut; edgeSeamEq->in = eqIn;
-    seamOut->ConnectionMediaType(&edgeSeamEq->type.value);
+    auto edgeUpstreamEq = std::make_unique<RouteEdge>();
+    edgeUpstreamEq->out = upstreamOut; edgeUpstreamEq->in = eqIn;
+    upstreamOut->ConnectionMediaType(&edgeUpstreamEq->type.value);
 
     auto edgeEqDs = std::make_unique<RouteEdge>();
     edgeEqDs->out = eqOut; edgeEqDs->in = dsIn;
@@ -271,14 +280,14 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
         seeking->GetCurrentPosition(&position);
     }
 
-    // Disconnect Seamless -> EQ and EQ -> DirectSound
-    graph->Disconnect(seamOut.Get());
+    // Disconnect Upstream -> EQ and EQ -> DirectSound
+    graph->Disconnect(upstreamOut.Get());
     graph->Disconnect(eqIn.Get());
     graph->Disconnect(eqOut.Get());
     graph->Disconnect(dsIn.Get());
 
-    // Connect Seamless directly to DirectSound
-    HRESULT hr = graph->ConnectDirect(seamOut.Get(), dsIn.Get(), nullptr);
+    // Connect Upstream directly to DirectSound
+    HRESULT hr = graph->ConnectDirect(upstreamOut.Get(), dsIn.Get(), nullptr);
     if (SUCCEEDED(hr)) {
         AM_MEDIA_TYPE mt{};
         if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
@@ -301,10 +310,10 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     }
 
     // Rollback if direct connection failed
-    graph->Disconnect(seamOut.Get());
+    graph->Disconnect(upstreamOut.Get());
     graph->Disconnect(dsIn.Get());
 
-    HRESULT r1 = graph->ConnectDirect(edgeSeamEq->out.Get(), edgeSeamEq->in.Get(), &edgeSeamEq->type.value);
+    HRESULT r1 = graph->ConnectDirect(edgeUpstreamEq->out.Get(), edgeUpstreamEq->in.Get(), &edgeUpstreamEq->type.value);
     HRESULT r2 = graph->ConnectDirect(edgeEqDs->out.Get(), edgeEqDs->in.Get(), &edgeEqDs->type.value);
     HRESULT rollback = SUCCEEDED(r1) ? r2 : r1;
     if (seeking) {

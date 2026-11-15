@@ -943,6 +943,10 @@ static HRESULT STDMETHODCALLTYPE dsRenderReceiveHook(IMemInputPin* self, IMediaS
         if (bypassed) {
             bool deliverEos = false;
             AcquireSRWLockExclusive(&eosLock);
+            const auto* gCheck = eosTracker.findGraph(key);
+            if (gCheck && gCheck->upstreamSamples == 0) {
+                eosTracker.onUpstreamSample(key, static_cast<uint32_t>(len), hasTime, sStart, sEnd);
+            }
             deliverEos = eosTracker.onDownstreamSample(key, static_cast<uint32_t>(len), hasTime, sStart, sEnd);
             ReleaseSRWLockExclusive(&eosLock);
             if (deliverEos && originalDsRenderEos) {
@@ -990,6 +994,10 @@ static HRESULT STDMETHODCALLTYPE dsRenderEosHook(IPin* self) {
     recordDiag("EOS_ENTER_DSRENDER_PROPAGATED", key, caller, gen, 0, S_OK);
     bool allow = true;
     AcquireSRWLockExclusive(&eosLock);
+    const auto* gCheck = eosTracker.findGraph(key);
+    if (gCheck && gCheck->upstreamEosCount == 0) {
+        eosTracker.onUpstreamEndOfStream(key);
+    }
     allow = eosTracker.onDownstreamEndOfStream(key);
     ReleaseSRWLockExclusive(&eosLock);
     if (!allow) {

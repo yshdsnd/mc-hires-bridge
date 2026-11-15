@@ -44,7 +44,8 @@ inline void recordGraphInspection(const GraphInspection& insp, uint32_t gen) {
         record("GRAPH_EQ_ABSENT", gen, 0, S_OK);
     }
     record("GRAPH_RENDER_IN", insp.renderIn.sampleRate, insp.renderIn.bitDepth, HRESULT(insp.renderIn.channels));
-    record("GRAPH_RENDER_PEER", insp.isDirectSeamless ? 1 : 0, 0, S_OK);
+    DWORD peerCode = insp.isDirectSeamless ? 1 : (insp.isDirectDsee ? 2 : (insp.eqBypassed ? 3 : 0));
+    record("GRAPH_RENDER_PEER", peerCode, 0, S_OK);
 }
 
 static HRESULT STDMETHODCALLTYPE dseeUnifiedSetterHook(IUnknown* self, DseeConfig config) {

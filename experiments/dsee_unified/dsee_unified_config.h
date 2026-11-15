@@ -101,17 +101,20 @@ inline HarmonizeMode initHarmonizeModeFromEnv() {
     wchar_t buf[32]{};
     DWORD n = GetEnvironmentVariableW(L"MC_BRIDGE_DSEE_MODE", buf, 32);
     if (n > 0) {
-        if (_wcsicmp(buf, L"native24") == 0 || _wcsicmp(buf, L"native24b") == 0 || _wcsicmp(buf, L"native") == 0) {
-            return HarmonizeMode::Native24b;
-        } else if (_wcsicmp(buf, L"family2x") == 0 || _wcsicmp(buf, L"2x") == 0) {
-            return HarmonizeMode::Family2x;
-        } else if (_wcsicmp(buf, L"family4x") == 0 || _wcsicmp(buf, L"4x") == 0) {
+        if (_wcsicmp(buf, L"family4x") == 0 || _wcsicmp(buf, L"4x") == 0 ||
+            _wcsicmp(buf, L"176k") == 0 || _wcsicmp(buf, L"192k") == 0) {
             return HarmonizeMode::Family4x;
+        } else if (_wcsicmp(buf, L"native24") == 0 || _wcsicmp(buf, L"native24b") == 0 || _wcsicmp(buf, L"native") == 0) {
+            return HarmonizeMode::Native24b;
         } else if (_wcsicmp(buf, L"96k") == 0 || _wcsicmp(buf, L"target96k") == 0 || _wcsicmp(buf, L"common96k") == 0) {
             return HarmonizeMode::Target96k;
+        } else if (_wcsicmp(buf, L"family2x") == 0 || _wcsicmp(buf, L"2x") == 0) {
+            return HarmonizeMode::Family2x;
         }
     }
-    return HarmonizeMode::Target96k;
+    // Issue #44: Family2x is the standard baseline (44.1k -> 88.2kHz/24b, 48k -> 96kHz/24b).
+    // Windows Shared Mode handles device mix conversion.
+    return HarmonizeMode::Family2x;
 }
 
 // Computes adjusted DseeConfig for 44.1kHz/48kHz PCM when DSEE HX is ON
