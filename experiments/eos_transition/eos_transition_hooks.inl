@@ -174,6 +174,7 @@ using FilterPauseFn = HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*);
 using FilterStopFn = HRESULT(STDMETHODCALLTYPE*)(IMediaFilter*);
 using GetPositionFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*);
 using SetPositionsFn = HRESULT(STDMETHODCALLTYPE*)(IMediaSeeking*, LONGLONG*, DWORD, LONGLONG*, DWORD);
+using DsPlayFn = HRESULT(WINAPI*)(IDirectSoundBuffer*, DWORD, DWORD, DWORD);
 using DsStopFn = HRESULT(WINAPI*)(IDirectSoundBuffer*);
 
 static MemReceiveFn originalSeamlessReceive = nullptr;
@@ -195,6 +196,7 @@ static FilterStopFn originalFilterStop = nullptr;
 static GetPositionFn originalGetStopPosition = nullptr;
 static GetPositionFn originalGetCurrentPosition = nullptr;
 static SetPositionsFn originalSetPositions = nullptr;
+static DsPlayFn originalDsPlay = nullptr;
 static DsStopFn originalDsStop = nullptr;
 
 using EnterCsFn = void(WINAPI*)(LPCRITICAL_SECTION);
@@ -476,6 +478,27 @@ static HRESULT WINAPI dsStopHook(IDirectSoundBuffer* self) {
     return originalDsStop(self);
 }
 
+static HRESULT WINAPI dsPlayHook(IDirectSoundBuffer* self, DWORD dwReserved1, DWORD dwPriority, DWORD dwFlags) {
+    if (!inEosHook) {
+        void* caller = _ReturnAddress();
+        void* activeGraphKey = nullptr;
+        AcquireSRWLockShared(&eosLock);
+        bool virtualActive = eosTracker.hasAnyVirtualPauseActive();
+        bool isAssoc = eosTracker.isTransitionBuffer(self, &activeGraphKey);
+        ReleaseSRWLockShared(&eosLock);
+
+        DWORD playPos = 0, writePos = 0;
+        if (self) self->GetCurrentPosition(&playPos, &writePos);
+        recordDiag("DS_PLAY", activeGraphKey ? activeGraphKey : reinterpret_cast<void*>(self), caller,
+                   playPos, dwFlags, S_OK);
+        if (virtualActive && !isAssoc) {
+            recordDiag("DS_PLAY_NEW_BUFFER_DURING_VIRTUAL_PAUSE", reinterpret_cast<void*>(self), caller,
+                       playPos, dwFlags, S_OK);
+        }
+    }
+    return originalDsPlay ? originalDsPlay(self, dwReserved1, dwPriority, dwFlags) : DSERR_GENERIC;
+}
+
 static HRESULT STDMETHODCALLTYPE originalEqEndOfStream(IPin* pin) {
     return originalEqEos ? originalEqEos(pin) : S_OK;
 }
@@ -581,10 +604,12 @@ static HRESULT STDMETHODCALLTYPE seamlessEosHook(IPin* self) {
 static HRESULT STDMETHODCALLTYPE seamlessBeginFlushHook(IPin* self) {
     if (!inEosHook) {
         void* key = graphKeyFromPin(self);
+        void* caller = _ReturnAddress();
         AcquireSRWLockExclusive(&eosLock);
         eosTracker.onBeginFlush(key);
+        uint32_t gen = eosTracker.getTransitionGeneration(key);
         ReleaseSRWLockExclusive(&eosLock);
-        record("EOS_RESET_BEGIN_FLUSH", 0, 0, S_OK);
+        recordDiag("SEAMLESS_BEGIN_FLUSH", key, caller, gen, 0, S_OK);
     }
     return originalSeamlessBeginFlush(self);
 }
@@ -592,9 +617,12 @@ static HRESULT STDMETHODCALLTYPE seamlessBeginFlushHook(IPin* self) {
 static HRESULT STDMETHODCALLTYPE seamlessEndFlushHook(IPin* self) {
     if (!inEosHook) {
         void* key = graphKeyFromPin(self);
+        void* caller = _ReturnAddress();
         AcquireSRWLockExclusive(&eosLock);
         eosTracker.onEndFlush(key);
+        uint32_t gen = eosTracker.getTransitionGeneration(key);
         ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("SEAMLESS_END_FLUSH", key, caller, gen, 0, S_OK);
     }
     return originalSeamlessEndFlush(self);
 }
@@ -660,9 +688,12 @@ static HRESULT STDMETHODCALLTYPE eqEosHook(IPin* self) {
 static HRESULT STDMETHODCALLTYPE eqBeginFlushHook(IPin* self) {
     if (!inEosHook) {
         void* key = graphKeyFromPin(self);
+        void* caller = _ReturnAddress();
         AcquireSRWLockExclusive(&eosLock);
         eosTracker.onBeginFlush(key);
+        uint32_t gen = eosTracker.getTransitionGeneration(key);
         ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("EQ_BEGIN_FLUSH", key, caller, gen, 0, S_OK);
     }
     return originalEqBeginFlush(self);
 }
@@ -670,9 +701,12 @@ static HRESULT STDMETHODCALLTYPE eqBeginFlushHook(IPin* self) {
 static HRESULT STDMETHODCALLTYPE eqEndFlushHook(IPin* self) {
     if (!inEosHook) {
         void* key = graphKeyFromPin(self);
+        void* caller = _ReturnAddress();
         AcquireSRWLockExclusive(&eosLock);
         eosTracker.onEndFlush(key);
+        uint32_t gen = eosTracker.getTransitionGeneration(key);
         ReleaseSRWLockExclusive(&eosLock);
+        recordDiag("EQ_END_FLUSH", key, caller, gen, 0, S_OK);
     }
     return originalEqEndFlush(self);
 }
@@ -871,12 +905,19 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
         // Two-stage drain verification:
         // Stage 1: Downstream PCM delivery
         bool pcmDelivered = false;
+        uint64_t targetB = 0, downB = 0;
+        uint32_t gen = 0;
         AcquireSRWLockExclusive(&eosLock);
         if (eosTracker.hasDownstreamReachedTarget(key)) {
             eosTracker.onDownstreamPcmDelivered(key);
         }
         const auto* curG = eosTracker.findGraph(key);
         pcmDelivered = curG && curG->transition.pcmDeliveryComplete;
+        if (curG) {
+            targetB = curG->targetBytes;
+            downB = curG->downstreamBytes;
+            gen = curG->transitionGeneration;
+        }
         ReleaseSRWLockExclusive(&eosLock);
 
         // Stage 2: Audio renderer final output drain
@@ -894,6 +935,15 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
         }
         ReleaseSRWLockShared(&eosLock);
 
+        // Periodic progress heartbeat every 500ms
+        static DWORD lastTickTime = 0;
+        if (g_diagEnabled && (GetTickCount() - lastTickTime >= 500)) {
+            lastTickTime = GetTickCount();
+            recordDiag("DRAIN_PROGRESS_TICK", key, caller,
+                       static_cast<DWORD>(c / 10000), static_cast<DWORD>(s / 10000),
+                       (pcmDelivered ? 0x01 : 0) | (rendererFinished ? 0x02 : 0));
+        }
+
         // Must satisfy BOTH Stage 1 (PCM delivered) AND Stage 2 (renderer finished)
         bool completed = pcmDelivered && rendererFinished;
         bool timedOut = (GetTickCount() - startTick >= maxWait);
@@ -901,6 +951,18 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
         if (completed || timedOut) {
             auto status = completed ? eosTransition::PauseDeferralStatus::CompletedDrain
                                     : eosTransition::PauseDeferralStatus::TimedOut;
+
+            if (timedOut) {
+                recordDiag("PAUSE_DRAIN_TIMEOUT_STATE", key, caller,
+                           (pcmDelivered ? 1 : 0), (rendererFinished ? 1 : 0),
+                           E_FAIL);
+                recordDiag("PAUSE_DRAIN_TIMEOUT_PCM_DIFF", key, caller,
+                           targetB, downB,
+                           targetB > downB ? static_cast<HRESULT>(targetB - downB) : S_OK);
+                recordDiag("PAUSE_DRAIN_TIMEOUT_SEEK_DIFF", key, caller,
+                           static_cast<DWORD>(c / 10000), static_cast<DWORD>(s / 10000),
+                           s > c ? static_cast<HRESULT>((s - c) / 10000) : S_OK);
+            }
 
             AcquireSRWLockExclusive(&eosLock);
             bool executedOnce = eosTracker.onVirtualPauseCompleted(key, status);
@@ -997,6 +1059,23 @@ static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
     CloseHandle(hThread);
 }
 
+static void onEosControlRun(IMediaControl* self, void* caller) {
+    if (!inEosHook) {
+        void* key = graphKeyFromObject(self);
+        AcquireSRWLockShared(&eosLock);
+        uint32_t gen = eosTracker.getTransitionGeneration(key);
+        bool anyVirtual = eosTracker.hasAnyVirtualPauseActive();
+        void* activePauseKey = nullptr;
+        eosTracker.findActiveVirtualPauseGraph(&activePauseKey);
+        ReleaseSRWLockShared(&eosLock);
+
+        recordDiag("CONTROL_RUN", key, caller, gen, anyVirtual ? 1 : 0, S_OK);
+        if (anyVirtual && key != activePauseKey) {
+            recordDiag("CONTROL_RUN_NEW_GRAPH_DURING_VIRTUAL_PAUSE", key, caller, gen, 0, S_OK);
+        }
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
     if (!inEosHook) {
         tryAttachOpcDsPlayLockHooks();
@@ -1058,6 +1137,23 @@ static HRESULT STDMETHODCALLTYPE controlPauseHook(IMediaControl* self) {
         recordDiag("BOUNDARY_CONTROL_PAUSE_LEAVE", key, caller, 0, 0, hr);
     }
     return hr;
+}
+
+static void onEosFilterRun(IMediaFilter* self, void* caller, REFERENCE_TIME tStart) {
+    if (!inEosHook) {
+        void* key = graphKeyFromObject(self);
+        AcquireSRWLockShared(&eosLock);
+        uint32_t gen = eosTracker.getTransitionGeneration(key);
+        bool anyVirtual = eosTracker.hasAnyVirtualPauseActive();
+        void* activePauseKey = nullptr;
+        eosTracker.findActiveVirtualPauseGraph(&activePauseKey);
+        ReleaseSRWLockShared(&eosLock);
+
+        recordDiag("FILTER_RUN", key, caller, static_cast<uint64_t>(tStart / 10000), anyVirtual ? 1 : 0, S_OK);
+        if (anyVirtual && key != activePauseKey) {
+            recordDiag("FILTER_RUN_NEW_GRAPH_DURING_VIRTUAL_PAUSE", key, caller, gen, static_cast<uint64_t>(tStart / 10000), S_OK);
+        }
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE filterPauseHook(IMediaFilter* self) {
@@ -1425,8 +1521,10 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
     }
     if (!ok || !seekingOk) return false;
 
+    eosDiag::getHookStatusReporter().report("DirectShow.ControlRun", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
     eosDiag::getHookStatusReporter().report("DirectShow.ControlPause", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
     eosDiag::getHookStatusReporter().report("DirectShow.ControlStop", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
+    eosDiag::getHookStatusReporter().report("DirectShow.FilterRun", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
     eosDiag::getHookStatusReporter().report("DirectShow.FilterPause", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
     eosDiag::getHookStatusReporter().report("DirectShow.FilterStop", ok ? "OK" : "FAILED", ok ? S_OK : E_FAIL);
     eosDiag::getHookStatusReporter().report("DirectShow.Seeking", seekingOk ? "OK" : "FAILED", seekingOk ? S_OK : E_FAIL);
@@ -1460,6 +1558,7 @@ static bool setupEosTransitionHooks(IGraphBuilder* graph, IMediaControl* control
         IDirectSoundBuffer* buf = nullptr;
         if (SUCCEEDED(ds8->CreateSoundBuffer(&desc, &buf, nullptr)) && buf) {
             auto bufV = *reinterpret_cast<void***>(buf);
+            MH_CreateHook(bufV[12], reinterpret_cast<void*>(dsPlayHook), reinterpret_cast<void**>(&originalDsPlay));
             MH_CreateHook(bufV[18], reinterpret_cast<void*>(dsStopHook), reinterpret_cast<void**>(&originalDsStop));
             buf->Release();
         }

@@ -84,6 +84,7 @@ static HRESULT STDMETHODCALLTYPE runHook(IMediaControl* self){
     WavScope scope;if(scope.outer){auto check=prepareWav(self);if(FAILED(check))return check;}
 #endif
 #ifdef EXPERIMENT_EOS_TRANSITION
+    onEosControlRun(self, _ReturnAddress());
     updateStatus(self,S_OK);
     tryAttachOpcDsPlayLockHooks();
 #endif
@@ -93,6 +94,7 @@ static HRESULT STDMETHODCALLTYPE filterRunHook(IMediaFilter* self,REFERENCE_TIME
     WavScope scope;if(scope.outer){auto check=prepareWav(self);if(FAILED(check))return check;}
 #endif
 #ifdef EXPERIMENT_EOS_TRANSITION
+    onEosFilterRun(self, _ReturnAddress(), time);
     updateStatus(self,S_OK);
     tryAttachOpcDsPlayLockHooks();
 #endif

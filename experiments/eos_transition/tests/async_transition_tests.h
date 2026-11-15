@@ -54,6 +54,9 @@ public:
     std::atomic<int> staleEosDiscarded{0};
     std::atomic<int> oldGraphSeekParkedCount{0};
     std::atomic<int> deferredSeekExecutedCount{0};
+    std::atomic<int> controlRunCount{0};
+    std::atomic<int> dsPlayCount{0};
+    std::atomic<bool> newGraphRunPrecededDeferredSeek{false};
     DWORD lastUserInputTick = 0;
 
     // Stored deferred seek parameters
@@ -224,6 +227,30 @@ public:
         return buf->Stop();
     }
 
+    // --- Control Run Hook ---
+    HRESULT executeControlRun(MockFilterGraphEx* graph = nullptr) {
+        controlRunCount++;
+        if (graph && graph != mockGraph && tracker.isVirtualPauseActive(mockGraph)) {
+            newGraphRunPrecededDeferredSeek = true;
+        }
+        if (graph && graph->control) {
+            return graph->control->Run();
+        }
+        return pControl->Run();
+    }
+
+    // --- DirectSound Play Hook ---
+    HRESULT executeDsPlay(MockDirectSoundBufferEx* buf = nullptr, DWORD dwFlags = 0) {
+        dsPlayCount++;
+        if (buf && buf != mockDsBuffer && tracker.isVirtualPauseActive(mockGraph)) {
+            newGraphRunPrecededDeferredSeek = true;
+        }
+        if (buf) {
+            return buf->Play(0, 0, dwFlags);
+        }
+        return pDsBuffer->Play(0, 0, dwFlags);
+    }
+
     // --- Control Stop Hook ---
     HRESULT executeControlStop() {
         bool isEngine = (currentCallerContext == CallerContext::EngineAutoChange);
@@ -293,8 +320,13 @@ public:
 
         eosTransition::GraphState::DeferredSeekParams sp;
         if (tracker.popDeferredSeek(mockGraph, sp)) {
-            pSeeking->SetPositions(&sp.current, sp.currentFlags, &sp.stop, sp.stopFlags);
+            IMediaSeeking* seekToUse = pSeeking;
+            if (sp.targetSeeking) {
+                seekToUse = static_cast<IMediaSeeking*>(sp.targetSeeking);
+            }
+            seekToUse->SetPositions(&sp.current, sp.currentFlags, &sp.stop, sp.stopFlags);
             deferredSeekExecuted = true;
+            deferredSeekExecutedCount++;
         }
         return true;
     }
@@ -1022,8 +1054,85 @@ inline void testNewGraphZeroSeekAppliedExactlyOnce() {
     nextSeeking->Release();
 }
 
+// Test 59: New Graph Playback Preceding Deferred Seek & Timeout Duplicate Start (Issue #37)
+inline void testNewGraphPlaybackPrecedesDeferredSeekAndCausesTimeoutDuplicate() {
+    std::printf("[TEST 59] New graph playback preceding deferred seek & timeout duplicate start (Issue #37)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL); // 23 seconds
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    // Track 1 finishes decoding at ~20.2 seconds
+    const uint32_t chunkBytes = 4800 * 6; // 100ms
+    for (int i = 0; i < 202; ++i) {
+        harness.feedUpstreamChunk(chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+        if (i < 174) {
+            harness.feedDownstreamChunk(nullptr, chunkBytes, true, i * 1000000LL, (i + 1) * 1000000LL);
+        }
+    }
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    // 1. Old graph enters Virtual Pause
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+    const auto* st = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(st != nullptr && st->isVirtualPauseActive());
+
+    // 2. DirectSound Stop on old buffer is suppressed
+    CHECK(harness.executeDsStop(nullptr, 1001) == DS_OK);
+    CHECK(harness.dsStopSuppressed.load() == true);
+
+    // 3. Old graph receives internal SetPositions(~20.066s) -> parked
+    LONGLONG oldGraphPos = 200660000LL;
+    CHECK(harness.executeSetPositions(&oldGraphPos, AM_SEEKING_AbsolutePositioning, nullptr, AM_SEEKING_NoPositioning, 2002) == S_OK);
+    CHECK(harness.oldGraphSeekParkedCount.load() == 1);
+    CHECK(st->isVirtualPauseActive() == true);
+
+    // 4. New graph opens for next track (~40ms later)
+    MockFilterGraphEx* nextMockGraph = new MockFilterGraphEx();
+    MockMediaControl* nextMockControl = new MockMediaControl();
+    MockMediaSeekingEx* nextMockSeeking = new MockMediaSeekingEx();
+    MockDirectSoundBufferEx* nextMockBuffer = new MockDirectSoundBufferEx();
+    nextMockGraph->control = nextMockControl;
+    nextMockGraph->seeking = nextMockSeeking;
+    harness.tracker.onGraphActivated(nextMockGraph, false, 48000, 2, 16);
+
+    // 5. Engine calls SetPositions(0) on NEW graph -> deferred
+    LONGLONG nextPos = 0, nextStop = 300000000LL;
+    CHECK(harness.executeSetPositions(nextMockGraph, nextMockSeeking, &nextPos, AM_SEEKING_AbsolutePositioning,
+                                      &nextStop, AM_SEEKING_AbsolutePositioning, 2002) == S_OK);
+    CHECK(harness.deferredSeekQueued.load() == true);
+    CHECK(harness.deferredSeekExecutedCount.load() == 0);
+
+    // 6. Real-world observation (Issue #37):
+    // The engine starts playback on NEW graph (Run / Play) BEFORE deferred seek executes!
+    CHECK(harness.executeControlRun(nextMockGraph) == S_OK);
+    CHECK(harness.executeDsPlay(nextMockBuffer, DSBPLAY_LOOPING) == DS_OK);
+    CHECK(harness.newGraphRunPrecededDeferredSeek.load() == true);
+    CHECK(nextMockControl->state == State_Running);
+
+    // 7. Old graph does not complete natural drain (e.g. downstream / renderer stall),
+    // reaches timeout (~4.5 seconds later)
+    CHECK(harness.triggerWatchdogTimeout());
+    CHECK(!st->isVirtualPauseActive());
+    CHECK(st->pauseDeferralStatus == eosTransition::PauseDeferralStatus::TimedOut);
+
+    // 8. Timeout triggers execution of the deferred seek on the new graph!
+    // This resets the new graph's position back to 0 while it is already running,
+    // producing the duplicate start waveform (observed at 24.611s)!
+    CHECK(harness.deferredSeekExecuted.load() == true);
+    CHECK(harness.deferredSeekExecutedCount.load() == 1);
+    CHECK(nextMockSeeking->currentPos == 0);
+    CHECK(nextMockSeeking->stopPos == 300000000LL);
+
+    nextMockGraph->Release();
+    nextMockControl->Release();
+    nextMockSeeking->Release();
+    nextMockBuffer->Release();
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 / #34 / #35 / #36 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -1043,7 +1152,8 @@ inline void runAllAsyncTransitionTests() {
     testManualSeekNotMisclassifiedFromSameCaller();
     testManualStopRegressionDuringVirtualPause();
     testNewGraphZeroSeekAppliedExactlyOnce();
-    std::printf("=== Issue #33 / #34 / #35 / #36 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testNewGraphPlaybackPrecedesDeferredSeekAndCausesTimeoutDuplicate();
+    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests

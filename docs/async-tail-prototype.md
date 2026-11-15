@@ -1,4 +1,4 @@
-# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36）
+# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37）
 
 ## 1. 概要とアーキテクチャ
 
@@ -106,11 +106,20 @@ Issue #33、#34、#35、および #36 では、この排他制御拘束を解消
 5. ユーザー要求の DirectShow / DirectSound 操作（`BOUNDARY_CONTROL_PAUSE_ENTER`, `BOUNDARY_SEEK_SETPOSITIONS_ENTER` 等）が遅延なく実行。
 6. 遅延して到着した前曲の EOS やコールバックは無効化され、次曲への誤送出（Stale EOS）は 0 件として記録。
 
+### 2.4 再生開始・ドレイン進捗・タイムアウト診断イベント（Issue #37）
+次曲の再生開始経路および旧グラフドレイン未達要因を特定するため、以下のイベントを診断ログに追加：
+1. `CONTROL_RUN` / `CONTROL_RUN_NEW_GRAPH_DURING_VIRTUAL_PAUSE`: `IMediaControl::Run` 呼出をグラフ世代とともに記録。仮想 Pause 中に新グラフで Run が呼ばれた場合を検出。
+2. `FILTER_RUN` / `FILTER_RUN_NEW_GRAPH_DURING_VIRTUAL_PAUSE`: `IMediaFilter::Run` 呼出をグラフ世代とともに記録。
+3. `DS_PLAY` / `DS_PLAY_NEW_BUFFER_DURING_VIRTUAL_PAUSE`: `IDirectSoundBuffer::Play` 呼出を記録。
+4. `SEAMLESS_BEGIN_FLUSH` / `SEAMLESS_END_FLUSH` / `EQ_BEGIN_FLUSH` / `EQ_END_FLUSH`: ピンフラッシュの発生を記録。
+5. `DRAIN_PROGRESS_TICK`: ドレイン監視スレッドから約 500ms ごとに進捗ハートビートを出力（`downstreamBytes`, `targetBytes`, `upstreamBytes`, `curPos`, `stopPos`）。
+6. `PAUSE_DRAIN_TIMEOUT_STATE`: タイムアウト（4.5 秒上限）到達時の未達条件を特定（`pcmDelivered`, `rendererFinished`, `targetBytes - downstreamBytes`, `stopPos - curPos`）。
+
 ---
 
-## 3. ヘッドレス競合テストスイート（Tests 40〜58）検証結果
+## 3. ヘッドレス競合テストスイート（Tests 40〜59）検証結果
 
-Issue #30、#33、#34、#35、#36 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35 / #36）、旧グラフ非ゼロシークのパーキング、新グラフゼロシークの 1 度きり適用、および手動操作即時優先を検証する Tests 40〜58 を実装・全件合格を確認しました。
+Issue #30、#33、#34、#35、#36、#37 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35 / #36）、旧グラフ非ゼロシークのパーキング、新グラフゼロシークの 1 度きり適用、手動操作即時優先、および次曲先行再生とタイムアウト重複頭出しの回帰を検証する Tests 40〜59 を実装・全件合格を確認しました。
 
 | テスト番号 | テスト名称 | 検証項目 | 結果 |
 |:---:|:---|:---|:---:|
@@ -133,8 +142,9 @@ Issue #30、#33、#34、#35、#36 の競合テストハーネス（`AsyncControl
 | **TEST 56** | Manual seek not misclassified from same caller | 仮想 Pause 保留中に同一呼び出し元から手動シーク（位置 > 0 またはユーザー入力後）が発生した場合、手動シークと判定して即時反映することを確認 | **PASS** |
 | **TEST 57** | Manual stop regression during Virtual Pause | 仮想 Pause 保留中に手動停止が発行された場合、直ちに仮想 Pause を取消してグラフおよび DirectSound を完全停止することを確認 | **PASS** |
 | **TEST 58** | Next track zero seek applied to new graph exactly once (Issue #36) | 重複したエンジン頭出し呼出が発生した場合でも、新グラフへの頭出しシークがドレイン完了時に厳密に 1 回だけ適用されることを確認 | **PASS** |
+| **TEST 59** | New graph playback precedes deferred seek & causes timeout duplicate (Issue #37) | 新グラフ再生開始（`Run`/`Play`）が保留シーク適用に先行し、旧グラフ未達によるタイムアウト（約 4.5 秒後）で保留シークが実行されて次曲が頭出しリセットされ重複波形が生じる実機現象を完全モデル化して検証 | **PASS** |
 
-> 合計 58 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 非同期テスト 40〜58）すべてがエラーなしで通過しました。
+> 合計 59 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 非同期テスト 40〜59）すべてがエラーなしで通過しました。
 
 ---
 
@@ -182,4 +192,10 @@ Codex が Music Center for PC 2.7.4 x86 実機環境で動作検証を行うた�
 - **確認事項**:
   - 直ちに音声出力が停止し、停止状態へ遷移すること。
   - ログに `PAUSE_DEFERRED_CANCELLED (CancelledStop)` が記録されること。
-  - ログに `PAUSE_DEFERRED_CANCELLED (CancelledStop)` が記録されること。
+
+#### シナリオ E: Issue #37 再生開始経路・タイムアウト要因の特定（診断ログ採取）
+- **対象**: 48 kHz/24 bit FLAC から 48 kHz/16 bit FLAC への自動曲送り。
+- **確認事項**:
+  - 先行曲の約 20.2 秒付近で次曲波形が出現する際、どの経路（`CONTROL_RUN`, `FILTER_RUN`, `DS_PLAY` 等）が新グラフ・バッファで呼ばれているか確認する。
+  - 約 24.6 秒付近でタイムアウト（`PAUSE_DEFERRED_COMPLETED (status=TimedOut)`）が発生する際、直前に出力される `PAUSE_DRAIN_TIMEOUT_STATE` から旧グラフが未達となった原因（`pcmDelivered` が偽か、`rendererFinished` が偽か、未到達 PCM バイト数、またはレンダラー進行度）を特定する。
+  - ピンフラッシュ（`SEAMLESS_BEGIN_FLUSH`, `EQ_BEGIN_FLUSH` 等）がどのタイミングで発生しているか確認する。
