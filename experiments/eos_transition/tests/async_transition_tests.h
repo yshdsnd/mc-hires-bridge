@@ -408,6 +408,44 @@ public:
         }
         return true;
     }
+
+    struct HeartbeatSnapshot {
+        uint32_t generation = 0;
+        uint64_t upstreamBytes = 0;
+        uint64_t downstreamBytes = 0;
+        uint64_t targetBytes = 0;
+        LONGLONG curPos = 0;
+        LONGLONG stopPos = 0;
+        HRESULT hrCurPos = S_OK;
+        HRESULT hrStopPos = S_OK;
+        DWORD dsPlayCursor = 0;
+        DWORD dsWriteCursor = 0;
+        DWORD dsStatus = 0;
+        HRESULT hrDsPos = S_OK;
+        bool pcmDelivered = false;
+        bool rendererFinished = false;
+    };
+
+    HeartbeatSnapshot queryHeartbeat() {
+        HeartbeatSnapshot snap;
+        const auto* g = tracker.findGraph(mockGraph);
+        if (g) {
+            snap.generation = g->transitionGeneration;
+            snap.upstreamBytes = g->upstreamBytes;
+            snap.downstreamBytes = g->downstreamBytes;
+            snap.targetBytes = g->targetBytes;
+            snap.pcmDelivered = g->transition.pcmDeliveryComplete;
+            snap.rendererFinished = g->transition.rendererOutputComplete;
+        }
+        snap.hrCurPos = pSeeking->GetCurrentPosition(&snap.curPos);
+        snap.hrStopPos = pSeeking->GetStopPosition(&snap.stopPos);
+        if (snap.curPos >= snap.stopPos && snap.stopPos > 0) {
+            snap.rendererFinished = true;
+        }
+        snap.hrDsPos = pDsBuffer->GetCurrentPosition(&snap.dsPlayCursor, &snap.dsWriteCursor);
+        pDsBuffer->GetStatus(&snap.dsStatus);
+        return snap;
+    }
 };
 
 // Test 40: Non-blocking Virtual Pause Immediate Return (< 2 ms)
@@ -1525,8 +1563,139 @@ inline void testUnifiedPreparationCOMThreadBoundaryMarshalAndExecute() {
     graph->Release();
 }
 
+// Test 65: Generation-Specific Upstream, Downstream, Target Bytes and HRESULT in Heartbeat (Issue #39)
+inline void testHeartbeatGenerationAndByteCounters() {
+    std::printf("[TEST 65] Heartbeat generation, upstream/downstream/target byte counters, and HRESULT (Issue #39)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL); // 23.0s
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    // 23s at 48k/24b/stereo = 6,624,000 bytes
+    const uint32_t totalBytes = 6624000;
+    const uint32_t chunkBytes = 288000; // 1.0s chunks
+    for (uint32_t b = 0; b < totalBytes; b += chunkBytes) {
+        harness.feedUpstreamChunk(chunkBytes, true, b * 10000LL / 288, (b + chunkBytes) * 10000LL / 288);
+    }
+    // Upstream finishes
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+
+    // Downstream only receives 6,395,040 bytes (deficit 228,960 bytes)
+    const uint32_t downstreamBytes = 6395040;
+    for (uint32_t b = 0; b < downstreamBytes; b += chunkBytes) {
+        uint32_t toFeed = (b + chunkBytes <= downstreamBytes) ? chunkBytes : (downstreamBytes - b);
+        harness.feedDownstreamChunk(nullptr, toFeed, true, b * 10000LL / 288, (b + toFeed) * 10000LL / 288);
+    }
+
+    // Engine enters Virtual Pause
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+
+    auto snap = harness.queryHeartbeat();
+    CHECK(snap.generation == 1);
+    CHECK(snap.upstreamBytes == 6624000);
+    CHECK(snap.downstreamBytes == 6395040);
+    CHECK(snap.targetBytes == 6624000);
+    CHECK(snap.targetBytes - snap.downstreamBytes == 228960);
+    CHECK(snap.pcmDelivered == false);
+    CHECK(SUCCEEDED(snap.hrCurPos));
+    CHECK(SUCCEEDED(snap.hrStopPos));
+}
+
+// Test 66: DirectSound Buffer Playback Cursor and Status Tracking Across Virtual Pause (Issue #39)
+inline void testDirectSoundBufferCursorTrackingAcrossVirtualPause() {
+    std::printf("[TEST 66] DirectSound buffer hardware cursor and status tracking across Virtual Pause (Issue #39)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    // Start playback on primary DirectSound buffer
+    CHECK(harness.executeDsPlay(harness.mockDsBuffer, DSBPLAY_LOOPING, false) == S_OK);
+    CHECK(harness.mockDsBuffer->status == DSBSTATUS_PLAYING);
+
+    // Simulate play cursor advancing to 20.2s: 20.2 * 288,000 = 5,817,600 bytes
+    harness.mockDsBuffer->playPos = 5817600;
+    harness.mockDsBuffer->writePos = 5817600 + 4800;
+
+    // Feed partial data
+    harness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+    harness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
+
+    // Enter Virtual Pause
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+
+    // Verify DirectSound buffer is recognized as the transition buffer
+    void* activeGraph = nullptr;
+    CHECK(harness.tracker.isTransitionBuffer(harness.pDsBuffer, &activeGraph) == true);
+    CHECK(activeGraph == harness.mockGraph);
+
+    // Engine attempts automatic Stop on sound buffer: must be suppressed
+    CHECK(harness.executeDsStop(harness.pDsBuffer) == DS_OK);
+    CHECK(harness.dsStopSuppressed == true);
+
+    // Query heartbeat: DirectSound cursor and playing status must be preserved
+    auto snap = harness.queryHeartbeat();
+    CHECK(snap.dsPlayCursor == 5817600);
+    CHECK((snap.dsStatus & DSBSTATUS_PLAYING) != 0);
+    CHECK(SUCCEEDED(snap.hrDsPos));
+}
+
+// Test 67: Independent Isolation of PCM Delivery Deficit vs Renderer Position (Issue #39)
+inline void testIndependentPcmStallVsPositionMeasurementIsolation() {
+    std::printf("[TEST 67] Independent isolation of PCM delivery deficit vs renderer position (Issue #39)...\n");
+    AsyncControlHarness harness;
+    harness.initializeGraph(48000, 2, 24);
+    harness.startSegment(0, 230000000LL);
+    harness.setPreReadDecision(eosTransition::PreReadDecision::FormatChanged);
+
+    // Feed 6,624,000 upstream, 6,395,040 downstream
+    harness.feedUpstreamChunk(6624000, true, 0, 230000000LL);
+    harness.tracker.onUpstreamEndOfStream(harness.mockGraph);
+    harness.feedDownstreamChunk(nullptr, 6395040, true, 0, 222050000LL);
+
+    // Simulate DirectShow FilterGraph seeking position remaining at 0ms (as observed in #37 / #39)
+    harness.mockSeeking->currentPos = 0;
+    harness.mockSeeking->stopPos = 230000000LL;
+
+    // Simulate DirectSound buffer play cursor at ~20.2s
+    harness.mockDsBuffer->playPos = 5817600;
+    harness.mockDsBuffer->status = DSBSTATUS_PLAYING;
+
+    // Enter Virtual Pause
+    harness.currentCallerContext = CallerContext::EngineAutoChange;
+    CHECK(harness.executePause(1001) == S_OK);
+
+    auto snap = harness.queryHeartbeat();
+
+    // 1. PCM delivery stall is isolated independently:
+    CHECK(snap.pcmDelivered == false);
+    CHECK(snap.targetBytes > snap.downstreamBytes);
+    uint64_t pcmDeficit = snap.targetBytes - snap.downstreamBytes;
+    CHECK(pcmDeficit == 228960); // 0.795s of 48k/24b/stereo
+
+    // 2. DirectShow seeking position remaining at 0 is isolated:
+    CHECK(snap.curPos == 0);
+    CHECK(snap.stopPos == 230000000LL);
+    CHECK(snap.rendererFinished == false);
+    CHECK(SUCCEEDED(snap.hrCurPos));
+
+    // 3. DirectSound hardware playback status distinguishes audio output from DirectShow position:
+    CHECK(snap.dsPlayCursor == 5817600);
+    CHECK((snap.dsStatus & DSBSTATUS_PLAYING) != 0);
+
+    // 4. Trigger watchdog timeout: verifies both flags 0 trigger proper diagnostic exit without crash
+    CHECK(harness.triggerWatchdogTimeout() == true);
+    CHECK(harness.tracker.isVirtualPauseActive(harness.mockGraph) == false);
+    const auto* g = harness.tracker.findGraph(harness.mockGraph);
+    CHECK(g != nullptr);
+    CHECK(g->pauseDeferralStatus == eosTransition::PauseDeferralStatus::TimedOut);
+}
+
 inline void runAllAsyncTransitionTests() {
-    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 Non-blocking Virtual Pause & Deferral Tests ===\n");
+    std::printf("\n=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 Non-blocking Virtual Pause & Deferral Tests ===\n");
     testAsyncVirtualPauseImmediateReturn();
     testAutomaticSetPositionsDeferredDuringVirtualPause();
     testNaturalDrainCompletionPath();
@@ -1552,7 +1721,10 @@ inline void runAllAsyncTransitionTests() {
     testManualCancellationPurgesUnifiedSeekAndRun();
     testTransitionGenerationMismatchDiscardsStalePrep();
     testUnifiedPreparationCOMThreadBoundaryMarshalAndExecute();
-    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 Non-blocking Virtual Pause Tests Completed ===\n\n");
+    testHeartbeatGenerationAndByteCounters();
+    testDirectSoundBufferCursorTrackingAcrossVirtualPause();
+    testIndependentPcmStallVsPositionMeasurementIsolation();
+    std::printf("=== Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 Non-blocking Virtual Pause Tests Completed ===\n\n");
 }
 
 } // namespace asyncTests

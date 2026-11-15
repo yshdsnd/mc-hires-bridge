@@ -2129,7 +2129,7 @@ int main() {
 
     if (SUCCEEDED(co)) CoUninitialize();
     if (g_failures == 0) {
-        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 / #28 / #30 / #33 / #34 / #35 / #36 / #37 / #38 EOS TRANSITION TESTS PASSED ===\n");
+        std::printf("=== ALL ISSUE #20 / #21 / #23 / #24 / #25 / #27 / #28 / #30 / #33 / #34 / #35 / #36 / #37 / #38 / #39 EOS TRANSITION TESTS PASSED ===\n");
         return 0;
     }
     std::printf("=== %d TEST ASSERTION(S) FAILED ===\n", g_failures);

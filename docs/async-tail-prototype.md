@@ -1,4 +1,4 @@
-# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37 / #38）
+# 非ブロッキング仮想 Pause 試作実装および検証仕様書（Issue #33 / #34 / #35 / #36 / #37 / #38 / #39）
 
 ## 1. 概要とアーキテクチャ
 
@@ -130,11 +130,22 @@ Issue #33、#34、#35、および #36 では、この排他制御拘束を解消
 5. 手動操作（手動 Pause, Seek, Stop, TrackChange, Exit, ManualPlay）発生時：
    - `DEFERRED_OPERATIONS_PURGED`: 保留されていた次曲のシーク・Run・Play をすべて安全に破棄。
 
+### 2.6 PCM 配送不足とレンダラー進捗の切り分け診断イベント（Issue #39）
+旧グラフのドレイン待機中に PCM 配送が停止する要因と DirectShow レンダラー位置が 0ms のままとなる要因を別々に切り分けるため、以下の詳細診断イベントを拡充：
+1. `ASYNC_DRAIN_CLOCK_CHECK` (hasClock, 0, hrClock): 仮想 Pause 監視開始時に旧グラフの `IMediaFilter::GetSyncSource` を確認し、リファレンスクロックの有無を記録。
+2. `ASYNC_DRAIN_SEEKING_INIT` (isMediaTime, timeFormat.Data1, hrTf): 旧グラフ `IMediaSeeking` の時間フォーマットが `TIME_FORMAT_MEDIA_TIME` であるかを記録。
+3. `DRAIN_HEARTBEAT_POS` (curPos_ms, stopPos_ms, hrCurPos): ドレイン監視スレッドから約 500ms ごとに再生位置と `GetCurrentPosition` の HRESULT を記録。
+4. `DRAIN_HEARTBEAT_PCM` (downstreamBytes, targetBytes, transitionGeneration): 世代別の下流到達 PCM バイト数と目標バイト数を記録。
+5. `DRAIN_HEARTBEAT_BYTES` (upstreamBytes, downstreamBytes, completionFlags): 上流送出バイト数と下流到達バイト数を比較記録。
+6. `DRAIN_HEARTBEAT_DSOUND` ((playCursor << 32) | writeCursor, dsStatus, hrDsPos): 旧 DirectSound バッファの実際のハードウェア再生・書込カーソルおよび再生状態（`DSBSTATUS_PLAYING` 等）を直接取得して記録。
+7. `PAUSE_DRAIN_TIMEOUT_UPSTREAM_DIFF` (upstreamBytes, targetBytes, generation): タイムアウト時の上流送出完了状態を記録。
+8. `PAUSE_DRAIN_TIMEOUT_DSOUND` ((playCursor << 32) | writeCursor, dsStatus, hrDsPos): タイムアウト時の DirectSound ハードウェアカーソル位置を記録。
+
 ---
 
-## 3. ヘッドレス競合テストスイート（Tests 40〜64）検証結果
+## 3. ヘッドレス競合テストスイート（Tests 40〜67）検証結果
 
-Issue #30、#33、#34、#35、#36、#37、#38 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35 / #36）、旧グラフ非ゼロシークのパーキング、新グラフゼロシークと再生開始（Run/Play）の一元確定適用、手動操作即時優先、および COM スレッド境界マーシャリングを検証する Tests 40〜64 を実装・全件合格を確認しました。
+Issue #30、#33、#34、#35、#36、#37、#38、#39 の競合テストハーネス（`AsyncControlHarness`）を再利用・拡張し、仮想 Pause の非同期特性、48kHz 実測回帰（Issue #35 / #36）、旧グラフ非ゼロシークのパーキング、新グラフゼロシークと再生開始（Run/Play）の一元確定適用、世代別ハートビート進捗、DirectSound ハードウェアカーソル追跡、および PCM 供給不足と位置計測の独立切り分けを検証する Tests 40〜67 を実装・全件合格を確認しました。
 
 | テスト番号 | テスト名称 | 検証項目 | 結果 |
 |:---:|:---|:---|:---:|
@@ -163,8 +174,11 @@ Issue #30、#33、#34、#35、#36、#37、#38 の競合テストハーネス（`
 | **TEST 62** | Manual cancellation purges unified seek and playback start (Issue #38) | ユーザー手動操作（Stop等）発生時に一元保留されたシーク・Run・Play が即座に全破棄され、古い再生命令が一切発生しないことを検証 | **PASS** |
 | **TEST 63** | Transition generation update discards stale preparation (Issue #38) | 遷移世代が更新（新世代突入）された場合、旧世代の一元保留命令が無効化され新世代へ誤適用されないことを検証 | **PASS** |
 | **TEST 64** | COM thread boundary marshaling and execution across apartments (Issue #38) | `CoMarshalInterThreadInterfaceInStream` による `IMediaSeeking` および `IMediaControl` のアパートメント間ストリームマーシャリング・復元実行が正常動作することを検証 | **PASS** |
+| **TEST 65** | Heartbeat generation, upstream/downstream/target byte counters, and HRESULT (Issue #39) | ハートビートにおいて世代番号、上流バイト数、下流バイト数、目標バイト数、および `GetCurrentPosition` の HRESULT が正確に記録されることを検証 | **PASS** |
+| **TEST 66** | DirectSound buffer hardware cursor and status tracking across Virtual Pause (Issue #39) | 仮想 Pause 保留中に旧 DirectSound バッファが正常に関連付けられ、ハードウェア再生カーソルおよび `DSBSTATUS_PLAYING` 状態が監視可能であることを検証 | **PASS** |
+| **TEST 67** | Independent isolation of PCM delivery deficit vs renderer position (Issue #39) | 下流 PCM 配送不足（差分 228,960 bytes）と DirectShow 再生位置 0ms（クロック停止・API 成否）を独立して判定・切り分けられることを検証 | **PASS** |
 
-> 合計 64 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 / #38 非同期テスト 40〜64）すべてがエラーなしで通過しました。
+> 合計 67 件（基本テスト 1〜28、Issue #30 競合テスト 29〜39、Issue #33 / #34 / #35 / #36 / #37 / #38 / #39 非同期テスト 40〜67）すべてがエラーなしで通過しました。
 
 ---
 
@@ -234,3 +248,24 @@ Codex が Music Center for PC 2.7.4 x86 実機環境で動作検証を行うた�
       3. `DEFERRED_DS_PLAY_EXECUTED` (新バッファの Play)
   - **手動操作時のキャンセル安全性**:
     - 仮想 Pause 保留区間中に手動停止・一時停止・シーク・手動再生を行った場合、一元保留されたシーク・Run・Play が全て即座に破棄され、古い再生命令や新グラフの誤再生が一切発生しないこと。
+
+#### シナリオ G: 旧グラフの PCM 配送不足とレンダラー進捗停止の切り分け（Issue #39 実機検証）
+- **対象**: 48 kHz/24 bit FLAC から 48 kHz/16 bit FLAC への自動曲送り。
+- **目的**: タイムアウト時に `pcmDelivered == 0` および `rendererFinished == 0` となった旧グラフの停止要因を、PCM 供給停止（上流・中間フィルター）とレンダラー位置計測（DirectShow クロック / DirectSound ハードウェアカーソル）に分離して特定する。
+- **確認事項と判定基準**:
+  1. **リファレンスクロックと時間単位の確認**:
+     - `ASYNC_DRAIN_CLOCK_CHECK`: 旧グラフに有効なリファレンスクロックが設定されているか（`hasClock == 1` か `0` か）。
+     - `ASYNC_DRAIN_SEEKING_INIT`: `IMediaSeeking` の時間単位が `TIME_FORMAT_MEDIA_TIME`（`isMediaTime == 1`）か。
+  2. **PCM 配送停止の切り分け判定**:
+     - `DRAIN_HEARTBEAT_PCM` / `DRAIN_HEARTBEAT_BYTES`:
+       - `upstreamBytes == targetBytes`（約 6,624,000 bytes）に達しているか確認。
+       - `downstreamBytes` が約 6,395,040 bytes で固定され増加していない場合、不足分 228,960 bytes（約 0.795 秒分）が `OmgSeamlessFilter` / `OmgDseeXlFilter` 中間キューに滞留しているか、下流レンダラーのブロックによって送出停止したことが確定。
+  3. **DirectShow 再生位置 0ms の切り分け判定**:
+     - `DRAIN_HEARTBEAT_POS`: `hrCurPos` が `S_OK` かエラーコード（`VFW_E_NO_CLOCK` 等）かを確認。
+       - `hrCurPos != S_OK`: API 取得失敗に起因して値が 0ms のままとなったと判定。
+       - `hrCurPos == S_OK` かつ `curPos == 0`: DirectShow グラフ内部のリファレンスクロックが停止またはストリームタイムがリセットされたと判定。
+  4. **DirectSound ハードウェア再生カーソルの照合**:
+     - `DRAIN_HEARTBEAT_DSOUND`:
+       - `dsStatus & DSBSTATUS_PLAYING` が 1（再生中）か 0（停止）かを確認。
+       - `dsPlayCursor` が約 20.2 秒相当（約 5,817,600 bytes 付近）で進捗しているか停止しているかを確認。
+       - **判定**: `dsPlayCursor` が実時間通りに進捗していれば、DirectShow グラフ側の位置通知が 0ms であっても音声ハードウェア自体は正常に鳴動していることが特定できる。

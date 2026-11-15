@@ -409,6 +409,19 @@ static bool isCallerFromOpcDSPlay(void* returnAddress) {
     return (_wcsicmp(baseName, L"OpcDSPlay.dll") == 0);
 }
 
+static bool safeQueryDirectSoundBuffer(IDirectSoundBuffer* buf, DWORD* playCursor, DWORD* writeCursor, DWORD* status, HRESULT* hrPos, HRESULT* hrStat) {
+    if (!buf) return false;
+    __try {
+        if (hrPos) *hrPos = buf->GetCurrentPosition(playCursor, writeCursor);
+        if (hrStat) *hrStat = buf->GetStatus(status);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (hrPos) *hrPos = E_FAIL;
+        if (hrStat) *hrStat = E_FAIL;
+        return false;
+    }
+}
+
 static bool isOpcDsPlayPauseCaller(void* returnAddress) {
 #ifdef TESTING_HEADLESS
     if (g_forceOpcDsPlayPauseCaller) return true;
@@ -492,6 +505,14 @@ static HRESULT WINAPI dsPlayHook(IDirectSoundBuffer* self, DWORD dwReserved1, DW
         if (self) self->GetCurrentPosition(&playPos, &writePos);
         recordDiag("DS_PLAY", activeGraphKey ? activeGraphKey : reinterpret_cast<void*>(self), caller,
                    playPos, dwFlags, S_OK);
+
+        if (!virtualActive) {
+            g_lastActiveSoundBuffer = self;
+            AcquireSRWLockExclusive(&eosLock);
+            eosTracker.registerActiveSoundBuffer(activeGraphKey, self);
+            ReleaseSRWLockExclusive(&eosLock);
+        }
+
         if (virtualActive && !isAssoc) {
             bool isManualPlay = false;
             DWORD lastInput = g_lastUserInputTick.load();
@@ -889,6 +910,7 @@ struct AsyncDrainParams {
     IMediaSeeking* rawSeeking = nullptr;
     void* key = nullptr;
     void* caller = nullptr;
+    void* primaryDsBuffer = nullptr;
     DWORD startTick = 0;
     DWORD maxWaitMs = 4500;
 };
@@ -911,6 +933,15 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
     DWORD maxWait = p->maxWaitMs;
     void* key = p->key;
     void* caller = p->caller;
+    void* initialDsBuf = p->primaryDsBuffer;
+
+    GUID timeFormat = GUID_NULL;
+    HRESULT hrTf = seeking ? seeking->GetTimeFormat(&timeFormat) : E_POINTER;
+    recordDiag("ASYNC_DRAIN_SEEKING_INIT", key, caller,
+               (timeFormat == TIME_FORMAT_MEDIA_TIME) ? 1 : 0,
+               static_cast<uint64_t>(timeFormat.Data1), hrTf);
+
+    DWORD lastHeartbeatTick = 0;
 
     while (true) {
         Sleep(10);
@@ -931,43 +962,76 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
         // Two-stage drain verification:
         // Stage 1: Downstream PCM delivery
         bool pcmDelivered = false;
-        uint64_t targetB = 0, downB = 0;
+        uint64_t targetB = 0, downB = 0, upB = 0;
         uint32_t gen = 0;
+        void* primaryBuf = nullptr;
+        bool trackerRendererComplete = false;
+
         AcquireSRWLockExclusive(&eosLock);
         if (eosTracker.hasDownstreamReachedTarget(key)) {
             eosTracker.onDownstreamPcmDelivered(key);
         }
         const auto* curG = eosTracker.findGraph(key);
-        pcmDelivered = curG && curG->transition.pcmDeliveryComplete;
         if (curG) {
+            pcmDelivered = curG->transition.pcmDeliveryComplete;
             targetB = curG->targetBytes;
             downB = curG->downstreamBytes;
+            upB = curG->upstreamBytes;
             gen = curG->transitionGeneration;
+            primaryBuf = curG->transition.primaryDsBuffer;
+            trackerRendererComplete = curG->transition.rendererOutputComplete;
         }
         ReleaseSRWLockExclusive(&eosLock);
 
+        if (!primaryBuf) primaryBuf = initialDsBuf;
+
         // Stage 2: Audio renderer final output drain
         LONGLONG c = 0, s = 0;
+        HRESULT hrCur = seeking ? seeking->GetCurrentPosition(&c) : E_POINTER;
+        HRESULT hrStop = seeking ? seeking->GetStopPosition(&s) : E_POINTER;
+
         bool rendererFinished = false;
-        if (seeking && SUCCEEDED(seeking->GetCurrentPosition(&c)) &&
-            SUCCEEDED(seeking->GetStopPosition(&s))) {
+        if (SUCCEEDED(hrCur) && SUCCEEDED(hrStop)) {
             if (c >= s && s > 0) {
                 rendererFinished = true;
             }
         }
-        AcquireSRWLockShared(&eosLock);
-        if (curG && curG->transition.rendererOutputComplete) {
+        if (trackerRendererComplete) {
             rendererFinished = true;
         }
-        ReleaseSRWLockShared(&eosLock);
+
+        // DirectSound hardware playback cursor & status
+        IDirectSoundBuffer* activeDsBuf = reinterpret_cast<IDirectSoundBuffer*>(primaryBuf);
+        DWORD dsPlayCursor = 0, dsWriteCursor = 0, dsStatus = 0;
+        HRESULT hrDsPos = E_POINTER, hrDsStat = E_POINTER;
+        bool hasDs = safeQueryDirectSoundBuffer(activeDsBuf, &dsPlayCursor, &dsWriteCursor, &dsStatus, &hrDsPos, &hrDsStat);
 
         // Periodic progress heartbeat every 500ms
-        static DWORD lastTickTime = 0;
-        if (g_diagEnabled && (GetTickCount() - lastTickTime >= 500)) {
-            lastTickTime = GetTickCount();
-            recordDiag("DRAIN_PROGRESS_TICK", key, caller,
+        if (g_diagEnabled && (GetTickCount() - lastHeartbeatTick >= 500)) {
+            lastHeartbeatTick = GetTickCount();
+
+            // 1. Position heartbeat: curPos(ms), stopPos(ms), HRESULT of GetCurrentPosition
+            recordDiag("DRAIN_HEARTBEAT_POS", key, caller,
                        static_cast<DWORD>(c / 10000), static_cast<DWORD>(s / 10000),
+                       hrCur);
+
+            // 2. PCM delivery heartbeat: downstream bytes, target bytes, generation in hr
+            recordDiag("DRAIN_HEARTBEAT_PCM", key, caller,
+                       downB, targetB,
+                       static_cast<HRESULT>(gen));
+
+            // 3. Upstream vs Downstream byte counters: upstream bytes, downstream bytes, completion flags
+            recordDiag("DRAIN_HEARTBEAT_BYTES", key, caller,
+                       upB, downB,
                        (pcmDelivered ? 0x01 : 0) | (rendererFinished ? 0x02 : 0));
+
+            // 4. DirectSound buffer playback cursor & status
+            if (activeDsBuf && hasDs) {
+                recordDiag("DRAIN_HEARTBEAT_DSOUND", activeDsBuf, caller,
+                           (static_cast<uint64_t>(dsPlayCursor) << 32) | static_cast<uint64_t>(dsWriteCursor),
+                           static_cast<uint64_t>(dsStatus),
+                           hrDsPos);
+            }
         }
 
         // Must satisfy BOTH Stage 1 (PCM delivered) AND Stage 2 (renderer finished)
@@ -981,13 +1045,22 @@ static DWORD WINAPI asyncDrainWorkerThread(LPVOID param) {
             if (timedOut) {
                 recordDiag("PAUSE_DRAIN_TIMEOUT_STATE", key, caller,
                            (pcmDelivered ? 1 : 0), (rendererFinished ? 1 : 0),
-                           E_FAIL);
+                           hrCur);
                 recordDiag("PAUSE_DRAIN_TIMEOUT_PCM_DIFF", key, caller,
                            targetB, downB,
                            targetB > downB ? static_cast<HRESULT>(targetB - downB) : S_OK);
+                recordDiag("PAUSE_DRAIN_TIMEOUT_UPSTREAM_DIFF", key, caller,
+                           upB, targetB,
+                           static_cast<HRESULT>(gen));
                 recordDiag("PAUSE_DRAIN_TIMEOUT_SEEK_DIFF", key, caller,
                            static_cast<DWORD>(c / 10000), static_cast<DWORD>(s / 10000),
-                           s > c ? static_cast<HRESULT>((s - c) / 10000) : S_OK);
+                           hrCur);
+                if (activeDsBuf && hasDs) {
+                    recordDiag("PAUSE_DRAIN_TIMEOUT_DSOUND", activeDsBuf, caller,
+                               (static_cast<uint64_t>(dsPlayCursor) << 32) | static_cast<uint64_t>(dsWriteCursor),
+                               static_cast<uint64_t>(dsStatus),
+                               hrDsPos);
+                }
             }
 
             AcquireSRWLockExclusive(&eosLock);
@@ -1070,8 +1143,18 @@ static void startAsyncDrainMonitor(T* self, void* key, void* caller) {
     auto* p = new AsyncDrainParams();
     p->key = key;
     p->caller = caller;
+    p->primaryDsBuffer = g_lastActiveSoundBuffer;
     p->startTick = GetTickCount();
     p->maxWaitMs = 4500;
+
+    IMediaFilter* mf = nullptr;
+    if (self && SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&mf))) && mf) {
+        IReferenceClock* clock = nullptr;
+        HRESULT hrClock = mf->GetSyncSource(&clock);
+        recordDiag("ASYNC_DRAIN_CLOCK_CHECK", key, caller, clock ? 1 : 0, 0, hrClock);
+        if (clock) clock->Release();
+        mf->Release();
+    }
 
     IMediaSeeking* seeking = nullptr;
     if (self) {
