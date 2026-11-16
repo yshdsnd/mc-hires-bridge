@@ -28,10 +28,13 @@ jobs:
         run: cmake -S . -B build-Win32 -G "Visual Studio 17 2022" -A Win32
 
       - name: Build launcher and tests
-        run: cmake --build build-Win32 --config Release --target mc_hires_bridge bridge_status_tests package_manifest_tests
+        run: cmake --build build-Win32 --config Release --target mc_hires_bridge bridge_status_tests package_manifest_tests dsee_unified_tests
 
       - name: Check output-mode parser and labels
         run: ./build-Win32/Release/bridge_status_tests.exe
+
+      - name: Check DSEE unified 2x and EQ route restoration
+        run: ./build-Win32/Release/dsee_unified_tests.exe
 
       - name: Check package manifest rules
         run: ./build-Win32/Release/package_manifest_tests.exe

@@ -1,6 +1,6 @@
 add_library(flac24_override SHARED bridge/flac24_override.cpp)
-target_include_directories(flac24_override PRIVATE common)
-target_link_libraries(flac24_override PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32)
+target_include_directories(flac24_override PRIVATE common bridge)
+target_link_libraries(flac24_override PRIVATE minhook ole32 strmiids uuid user32 gdi32 shell32 dsound)
 target_compile_definitions(flac24_override PRIVATE UNICODE _UNICODE)
 add_executable(mc_hires_bridge WIN32 launcher/launcher.cpp launcher/launcher.rc)
 # RC resolves the icon path against this include directory.
