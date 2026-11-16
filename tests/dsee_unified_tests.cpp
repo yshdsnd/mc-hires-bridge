@@ -2262,6 +2262,25 @@ void testIssue56DseeOffResetAndEqRestoration() {
 
 } // namespace
 
+static void testDseeStatusRejectsNative96k() {
+    dseeUnified::GraphInspection graph{};
+    graph.eqBypassed = true;
+    graph.renderIn = {true, true, 96000, 24, 2};
+    CHECK(!dseeUnified::hasDsee2xOutput(graph));
+
+    graph.dseeIn = {true, true, 96000, 24, 2};
+    graph.dseeOut = graph.renderIn;
+    CHECK(!dseeUnified::hasDsee2xOutput(graph));
+
+    graph.dseeIn = {true, true, 48000, 16, 2};
+    CHECK(dseeUnified::hasDsee2xOutput(graph));
+
+    graph.dseeIn = {true, true, 44100, 24, 2};
+    graph.dseeOut.sampleRate = 88200;
+    graph.renderIn.sampleRate = 88200;
+    CHECK(dseeUnified::hasDsee2xOutput(graph));
+}
+
 int main() {
     std::printf("Starting dsee_unified_tests...\n");
     std::fflush(stdout);
@@ -2300,6 +2319,7 @@ int main() {
     testIssue54Flac44k24bInputAndTrackTransitions();
     std::fflush(stdout);
     testIssue56DseeOffResetAndEqRestoration();
+    testDseeStatusRejectsNative96k();
     std::fflush(stdout);
 
     CoUninitialize();

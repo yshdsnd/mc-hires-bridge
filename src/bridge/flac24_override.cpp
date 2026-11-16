@@ -335,10 +335,7 @@ static void updateStatus(IUnknown* object, HRESULT result) {
                 playback.input = {insp.decodePcm.sampleRate, insp.decodePcm.bitDepth, insp.decodePcm.channels};
             }
 
-            if (insp.eqBypassed && (insp.renderIn.sampleRate == 88200 || insp.renderIn.sampleRate == 96000) &&
-                insp.renderIn.bitDepth == 24) {
-                dseeActive = true;
-            }
+            dseeActive = dseeUnified::hasDsee2xOutput(insp);
         }
 
         if (dseeActive) {

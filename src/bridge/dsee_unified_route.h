@@ -92,6 +92,17 @@ struct GraphInspection {
     FilterChainNode chain[MAX_CHAIN_NODES]{};
 };
 
+inline bool hasDsee2xOutput(const GraphInspection& graph) {
+    const auto& input = graph.dseeIn;
+    const auto& output = graph.dseeOut;
+    const auto& renderer = graph.renderIn;
+    return graph.eqBypassed && input.connected && output.connected && renderer.connected &&
+           isTargetInputRate(input.sampleRate) && isTargetInputBits(input.bitDepth) &&
+           input.channels == 2 && output.channels == 2 && renderer.channels == 2 &&
+           output.sampleRate == input.sampleRate * 2 && renderer.sampleRate == output.sampleRate &&
+           output.bitDepth == 24 && renderer.bitDepth == 24;
+}
+
 inline ComPtr<IPin> findUniquePin(IBaseFilter* filter, PIN_DIRECTION wanted) {
     if (!filter) return {};
     ComPtr<IEnumPins> pins;
