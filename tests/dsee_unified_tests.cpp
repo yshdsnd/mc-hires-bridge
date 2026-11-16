@@ -2628,6 +2628,201 @@ void testIssue63MidPlaybackDseeOffMismatch() {
     }
 }
 
+void testIssue64MidPlaybackDseeToggleSafety() {
+    std::printf("[TEST 20] Issue #64: Mid-Playback DSEE Toggle Safety & Safe Deferral...\n");
+
+    // Case 20A: 4x playback in State_Running -> OFF toggle deferred, next track in State_Stopped applied
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* src = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* srcOut = new MockPin(PINDIR_OUTPUT, src, 44100, 16, L"Out");
+        src->addPin(srcOut);
+        graph->addFilter(src);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 16, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 176400, 24, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 44100, 16, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 44100, 16, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 44100, 16, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 44100, 16, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(srcOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        // Apply EQ bypass for 4x
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get(), true);
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.outputRate == 176400);
+
+        // Graph enters Running state during active playback
+        graph->mockState = State_Running;
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.renderIn.sampleRate == 176400 && insp.renderIn.bitDepth == 24);
+
+        // Mid-playback OFF toggle evaluation
+        auto action = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, false, 44100);
+        CHECK(action == dseeUnified::DseeToggleAction::DeferOff);
+
+        // When deferred, the running format is NOT touched (stays 176.4k/24b)
+        CHECK(insp.renderIn.sampleRate == 176400);
+
+        // Next track: graph is stopped and re-initialized in State_Stopped
+        graph->mockState = State_Stopped;
+        auto stoppedAction = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, false, 44100);
+        CHECK(stoppedAction == dseeUnified::DseeToggleAction::ApplyImmediate);
+
+        // Restoring EQ route succeeds in State_Stopped
+        auto restoreRes = dseeUnified::applyEqBypass(graph.Get(), false);
+        CHECK(restoreRes.outcome == dseeUnified::RouteOutcome::Restored);
+        CHECK(restoreRes.outputRate == 44100 && restoreRes.outputBits == 16);
+    }
+
+    // Case 20B: 2x playback in State_Running -> OFF toggle deferred
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24, L"Out");
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 88200, 24, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(dseeOut, dsIn, nullptr);
+        graph->mockState = State_Running;
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        auto action = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, false, 44100);
+        CHECK(action == dseeUnified::DseeToggleAction::DeferOff);
+    }
+
+    // Case 20C: New playback in State_Stopped with DSEE OFF -> Applied immediately
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->mockState = State_Stopped;
+        dseeUnified::GraphInspection insp{};
+        dseeUnified::inspectGraphFormats(graph.Get(), insp);
+
+        auto action = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, false, 44100);
+        CHECK(action == dseeUnified::DseeToggleAction::ApplyImmediate);
+    }
+
+    // Case 20D: OFF -> ON cancellation during same track
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 176400, 24, L"Out");
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 176400, 24, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(dseeOut, dsIn, nullptr);
+        graph->mockState = State_Running;
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+
+        // 1. User toggles OFF -> DeferOff
+        auto actionOff = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, false, 44100);
+        CHECK(actionOff == dseeUnified::DseeToggleAction::DeferOff);
+
+        // 2. User cancels by toggling ON again during the same song
+        auto actionOn = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, true, 176400);
+        CHECK(actionOn == dseeUnified::DseeToggleAction::ApplyImmediate);
+        CHECK(insp.renderIn.sampleRate == 176400);
+    }
+
+    // Case 20E: Pause during 4x playback -> Deferral maintained
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 176400, 24, L"Out");
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 176400, 24, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(dseeOut, dsIn, nullptr);
+        graph->mockState = State_Paused;
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+
+        auto action = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, false, 44100);
+        CHECK(action == dseeUnified::DseeToggleAction::DeferOff);
+    }
+
+    // Case 20F: Standard route (44.1k/16b) playback in State_Running -> ON toggle deferred
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 44100, 16, L"Out");
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+        graph->mockState = State_Running;
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.renderIn.sampleRate == 44100);
+
+        auto action = dseeUnified::evaluateDseeToggleAction(graph->mockState, insp, true, 176400);
+        CHECK(action == dseeUnified::DseeToggleAction::DeferOn);
+    }
+
+    // Case 20G: Native Hi-Res (96k/192k) & Non-DirectSound
+    {
+        CHECK(dseeUnified::isHiResRate(96000));
+        CHECK(dseeUnified::isHiResRate(192000));
+        CHECK(!dseeUnified::isTargetInputRate(96000));
+        CHECK(!dseeUnified::isTargetInputRate(192000));
+    }
+}
+
 int main() {
     std::printf("Starting dsee_unified_tests...\n");
     std::fflush(stdout);
@@ -2669,6 +2864,7 @@ int main() {
     testDseeStatusRejectsNative96k();
     testIssue61ConfigStorageAndDsee4x();
     testIssue63MidPlaybackDseeOffMismatch();
+    testIssue64MidPlaybackDseeToggleSafety();
     std::fflush(stdout);
 
     CoUninitialize();

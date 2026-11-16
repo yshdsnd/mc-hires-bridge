@@ -645,4 +645,32 @@ inline bool inspectDseeOffTransition(IGraphBuilder* graph, DWORD offOutputRate, 
     return true;
 }
 
+// Issue #64: Action decision for mid-playback DSEE toggles
+enum class DseeToggleAction {
+    ApplyImmediate,
+    DeferOff,
+    DeferOn
+};
+
+inline DseeToggleAction evaluateDseeToggleAction(OAFilterState state, const GraphInspection& insp, bool requestedOn, DWORD targetOutputRate) {
+    bool isMidPlayback = (state == State_Running || state == State_Paused);
+    if (!isMidPlayback || !insp.renderIn.connected || insp.renderIn.sampleRate == 0) {
+        return DseeToggleAction::ApplyImmediate;
+    }
+
+    if (!requestedOn) {
+        // Turning OFF mid-playback while renderer is running at Hi-Res (>= 88.2k)
+        if (insp.renderIn.sampleRate >= 88200) {
+            return DseeToggleAction::DeferOff;
+        }
+    } else {
+        // Turning ON mid-playback while renderer is running in standard route (<= 48k)
+        if (insp.renderIn.sampleRate <= 48000) {
+            return DseeToggleAction::DeferOn;
+        }
+    }
+
+    return DseeToggleAction::ApplyImmediate;
+}
+
 } // namespace dseeUnified

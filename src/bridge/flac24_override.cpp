@@ -210,10 +210,26 @@ static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::Dse
         return hr;
     }
 
-    // Issue #56 / #63: If UI DSEE setting is OFF or incoming request is mode == 0,
+    ComPtr<IGraphBuilder> graph = dseeUnified::resolveGraphFromFilter(self);
+    OAFilterState state = dseeUnified::getGraphFilterState(graph.Get());
+    dseeUnified::GraphInspection insp{};
+    if (graph) {
+        dseeUnified::inspectGraphFormats(graph.Get(), insp);
+    }
+
+    // Issue #56 / #63 / #64: If UI DSEE setting is OFF or incoming request is mode == 0,
     // do NOT accept initial mode=1 and do NOT inherit stale upsampled formats (e.g. 96k/24b).
     // Reset outputRate and outputBits to match inputRate and inputBits (bit-perfect bypass).
     if (!dseeRequested || config.mode == 0) {
+        // Issue #64: Defer OFF if graph is actively playing at Hi-Res (>= 88.2k)
+        auto action = dseeUnified::evaluateDseeToggleAction(state, insp, false, config.inputRate);
+        if (action == dseeUnified::DseeToggleAction::DeferOff) {
+            logDseeSetterGraphState("DSEE_OFF_PRE", self, config.mode, codec);
+            record("DSEE_OFF_DEFERRED", config.inputRate, insp.renderIn.sampleRate, S_OK);
+            logDseeSetterGraphState("DSEE_OFF_POST", self, config.mode, codec);
+            return S_OK;
+        }
+
         dseeUnified::GraphInspection preInsp{};
         logDseeSetterGraphState("DSEE_OFF_PRE", self, config.mode, codec, &preInsp);
 
@@ -259,6 +275,15 @@ static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::Dse
         rememberSource(self, false);
         record("DSEE_PASS_THROUGH", config.outputRate, config.outputBits, hr);
         return hr;
+    }
+
+    // Issue #64: Defer ON if graph is actively playing in standard route (<= 48k)
+    auto action = dseeUnified::evaluateDseeToggleAction(state, insp, true, adjusted.outputRate);
+    if (action == dseeUnified::DseeToggleAction::DeferOn) {
+        logDseeSetterGraphState("DSEE_SET_PRE", self, config.mode, codec);
+        record("DSEE_ON_DEFERRED", adjusted.outputRate, insp.renderIn.sampleRate, S_OK);
+        logDseeSetterGraphState("DSEE_SET_POST", self, config.mode, codec);
+        return S_OK;
     }
 
     auto hr = originalDsee(self, adjusted);
