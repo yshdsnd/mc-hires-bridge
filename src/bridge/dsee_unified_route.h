@@ -103,6 +103,38 @@ inline bool hasDsee2xOutput(const GraphInspection& graph) {
            output.bitDepth == 24 && renderer.bitDepth == 24;
 }
 
+inline bool hasDsee4xOutput(const GraphInspection& graph) {
+    const auto& input = graph.dseeIn;
+    const auto& output = graph.dseeOut;
+    const auto& renderer = graph.renderIn;
+    return graph.eqBypassed && input.connected && output.connected && renderer.connected &&
+           isTargetInputRate(input.sampleRate) && isTargetInputBits(input.bitDepth) &&
+           input.channels == 2 && output.channels == 2 && renderer.channels == 2 &&
+           output.sampleRate == input.sampleRate * 4 && renderer.sampleRate == output.sampleRate &&
+           output.bitDepth == 24 && renderer.bitDepth == 24;
+}
+
+inline bool hasDseeOutput(const GraphInspection& graph) {
+    return hasDsee2xOutput(graph) || hasDsee4xOutput(graph);
+}
+
+enum class DseeRouteKind {
+    None,       // Negotiation failed / unbypassed / DSEE OFF
+    Dsee2x,     // 44.1k -> 88.2k or 48k -> 96k (24-bit stereo)
+    Dsee4x,     // 44.1k -> 176.4k or 48k -> 192k (24-bit stereo)
+    NativeHiRes // Native 96k/192k direct passthrough
+};
+
+inline DseeRouteKind classifyDseeRoute(const GraphInspection& graph) {
+    if (hasDsee2xOutput(graph)) return DseeRouteKind::Dsee2x;
+    if (hasDsee4xOutput(graph)) return DseeRouteKind::Dsee4x;
+    if (graph.renderIn.sampleRate >= 88200 &&
+        (!graph.dseeIn.connected || graph.dseeIn.sampleRate >= 88200)) {
+        return DseeRouteKind::NativeHiRes;
+    }
+    return DseeRouteKind::None;
+}
+
 inline ComPtr<IPin> findUniquePin(IBaseFilter* filter, PIN_DIRECTION wanted) {
     if (!filter) return {};
     ComPtr<IEnumPins> pins;
@@ -566,6 +598,79 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph, bool dseeActive = true) {
     result.change = hr;
     result.outcome = RouteOutcome::Restored;
     return result;
+}
+
+// Issue #63: Resolves IGraphBuilder from an arbitrary filter or interface pointer.
+inline ComPtr<IGraphBuilder> resolveGraphFromFilter(IUnknown* self) {
+    if (!self) return nullptr;
+    ComPtr<IGraphBuilder> graph;
+    if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&graph)))) return graph;
+    ComPtr<IBaseFilter> filter;
+    if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&filter)))) {
+        FILTER_INFO fi{};
+        if (SUCCEEDED(filter->QueryFilterInfo(&fi)) && fi.pGraph) {
+            fi.pGraph->QueryInterface(IID_PPV_ARGS(&graph));
+            fi.pGraph->Release();
+            return graph;
+        }
+    }
+    return nullptr;
+}
+
+// Issue #63: Retrieves the current execution state (Stopped / Paused / Running) of a graph.
+inline OAFilterState getGraphFilterState(IGraphBuilder* graph) {
+    if (!graph) return State_Stopped;
+    ComPtr<IMediaControl> mc;
+    OAFilterState fs = State_Stopped;
+    if (SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&mc)))) {
+        mc->GetState(0, &fs);
+    }
+    return fs;
+}
+
+// Issue #63: Diagnostic capture structure for DSEE transitions.
+struct DseeOffDiagnostic {
+    OAFilterState state = State_Stopped;
+    GraphInspection inspPost;
+    bool mismatchDetected = false;
+};
+
+inline bool inspectDseeOffTransition(IGraphBuilder* graph, DWORD offOutputRate, DseeOffDiagnostic& diag) {
+    if (!graph) return false;
+    diag.state = getGraphFilterState(graph);
+    inspectGraphFormats(graph, diag.inspPost);
+    if (diag.state == State_Running && diag.inspPost.renderIn.sampleRate > offOutputRate) {
+        diag.mismatchDetected = true;
+    }
+    return true;
+}
+
+// Issue #64: Action decision for mid-playback DSEE toggles
+enum class DseeToggleAction {
+    ApplyImmediate,
+    DeferOff,
+    DeferOn
+};
+
+inline DseeToggleAction evaluateDseeToggleAction(OAFilterState state, const GraphInspection& insp, bool requestedOn, DWORD targetOutputRate) {
+    bool isMidPlayback = (state == State_Running || state == State_Paused);
+    if (!isMidPlayback || !insp.renderIn.connected || insp.renderIn.sampleRate == 0) {
+        return DseeToggleAction::ApplyImmediate;
+    }
+
+    if (!requestedOn) {
+        // Turning OFF mid-playback while renderer is running at Hi-Res (>= 88.2k)
+        if (insp.renderIn.sampleRate >= 88200) {
+            return DseeToggleAction::DeferOff;
+        }
+    } else {
+        // Turning ON mid-playback while renderer is running in standard route (<= 48k)
+        if (insp.renderIn.sampleRate <= 48000) {
+            return DseeToggleAction::DeferOn;
+        }
+    }
+
+    return DseeToggleAction::ApplyImmediate;
 }
 
 } // namespace dseeUnified

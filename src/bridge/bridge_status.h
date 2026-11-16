@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <shlobj.h>
+#include "bridge_config.h"
 
 namespace bridgeStatus {
 enum class State { Ready, On, Off };
@@ -134,9 +135,64 @@ inline bool seekTooltipMayOverlap(ULONGLONG now, ULONGLONG& hideUntil) {
     if (context) SetThreadDpiAwarenessContext(context);
     return now < hideUntil;
 }
+inline void showBadgeContextMenu(HWND w, POINT screenPt) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    HMENU subMenu = CreatePopupMenu();
+    if (!subMenu) { DestroyMenu(menu); return; }
+
+    uint32_t currentMult = bridgeConfig::getDseeMultiplier();
+    bool is4x = (currentMult == 4);
+
+    AppendMenuW(subMenu, MF_STRING | (is4x ? MF_UNCHECKED : MF_CHECKED), 1001, L"2\u500d (88.2 / 96 kHz)");
+    AppendMenuW(subMenu, MF_STRING | (is4x ? MF_CHECKED : MF_UNCHECKED), 1002, L"4\u500d (176.4 / 192 kHz)");
+
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(subMenu), L"DSEE HX \u51fa\u529b\u500d\u7387");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"\u203b \u6b21\u306b\u958b\u304f\u66f2\u304b\u3089\u9069\u7528\u3055\u308c\u307e\u3059");
+
+    SetForegroundWindow(w);
+    UINT cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN,
+                                screenPt.x, screenPt.y, w, nullptr);
+
+    if (cmd == 1001) {
+        bridgeConfig::saveDseeMultiplier(2);
+    } else if (cmd == 1002) {
+        bridgeConfig::saveDseeMultiplier(4);
+    }
+
+    DestroyMenu(subMenu);
+    DestroyMenu(menu);
+}
+
 inline LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     if(msg==WM_PAINT){PAINTSTRUCT ps;auto dc=BeginPaint(w,&ps);RECT r;GetClientRect(w,&r);FillRect(dc,&r,reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));auto old=SelectObject(dc,font?font:GetStockObject(DEFAULT_GUI_FONT));SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(70,70,70));DrawTextW(dc,label(state.load()),-1,&r,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,old);EndPaint(w,&ps);return 0;}
-    if(msg==WM_NCHITTEST)return HTTRANSPARENT;
+    if(msg==WM_NCHITTEST) {
+        if((GetAsyncKeyState(VK_RBUTTON)&0x8000)!=0) return HTCLIENT;
+        return HTTRANSPARENT;
+    }
+    if(msg==WM_RBUTTONDOWN) {
+        SetCapture(w);
+        return 0;
+    }
+    if(msg==WM_RBUTTONUP) {
+        if(GetCapture()==w) ReleaseCapture();
+        POINT pt{};
+        GetCursorPos(&pt);
+        RECT r{};
+        GetWindowRect(w,&r);
+        if(PtInRect(&r,pt)) showBadgeContextMenu(w,pt);
+        return 0;
+    }
+    if(msg==WM_CONTEXTMENU) {
+        POINT pt{LOWORD(lp),HIWORD(lp)};
+        if(pt.x==-1&&pt.y==-1){
+            RECT r{};GetWindowRect(w,&r);pt.x=r.left;pt.y=r.bottom;
+        }
+        RECT r{};GetWindowRect(w,&r);
+        if(PtInRect(&r,pt)) showBadgeContextMenu(w,pt);
+        return 0;
+    }
     if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
     if(msg==WM_DPICHANGED_AFTERPARENT){layout();return 0;}
     if(msg==WM_DESTROY){PostQuitMessage(0);return 0;}
@@ -241,7 +297,7 @@ inline void runUi(HINSTANCE instance) {
             if(!IsWindow(owner)){owner=nullptr;EnumWindows(findOwner,reinterpret_cast<LPARAM>(&owner));if(!owner)continue;}
             if(!badge){
                 auto context=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(owner));
-                badge=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_NOPARENTNOTIFY,wc.lpszClassName,label(state.load()),WS_CHILD|WS_CLIPSIBLINGS,0,0,1,1,owner,nullptr,instance,nullptr);
+                badge=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_NOPARENTNOTIFY,wc.lpszClassName,label(state.load()),WS_CHILD|WS_CLIPSIBLINGS,0,0,1,1,owner,nullptr,instance,nullptr);
                 if(badge)SetLayeredWindowAttributes(badge,0,255,LWA_ALPHA);
                 if(context)SetThreadDpiAwarenessContext(context);
                 layout();
