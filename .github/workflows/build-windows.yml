@@ -2,7 +2,7 @@ name: Build Windows ZIP
 
 on:
   push:
-    branches: [main, dev/dsee-hx]
+    branches: [main, dev/dsee-hx, 'dev/**']
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -28,24 +28,22 @@ jobs:
         run: cmake -S . -B build-Win32 -G "Visual Studio 17 2022" -A Win32
 
       - name: Build launcher and tests
-        run: cmake --build build-Win32 --config Release --target mc_hires_bridge bridge_status_tests
+        run: cmake --build build-Win32 --config Release --target mc_hires_bridge bridge_status_tests package_manifest_tests dsee_unified_tests
 
       - name: Check output-mode parser and labels
         run: ./build-Win32/Release/bridge_status_tests.exe
 
+      - name: Check DSEE unified 2x and EQ route restoration
+        run: ./build-Win32/Release/dsee_unified_tests.exe
+
+      - name: Check package manifest rules
+        run: ./build-Win32/Release/package_manifest_tests.exe
+
+      - name: Run package verification self-tests
+        run: ./tools/verify-package.ps1 -SelfTest
+
       - name: Create minimal distribution ZIP
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          cmake --install build-Win32 --config Release --prefix 'package/MC HiRes Bridge'
-          $root = (Resolve-Path 'package/MC HiRes Bridge').Path
-          $expected = @('README.md', 'MC HiRes Bridge.exe', 'flac24_override.dll', 'LICENSE', 'licenses/MinHook.txt')
-          $actual = @(Get-ChildItem -LiteralPath $root -File -Recurse | ForEach-Object {
-            [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
-          })
-          if (Compare-Object $expected $actual) { throw 'Unexpected distribution contents' }
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Compress-Archive -LiteralPath $root -DestinationPath 'dist/mc-hires-bridge-windows-x86.zip' -CompressionLevel Optimal -Force
+        run: ./tools/verify-package.ps1 -BuildDir build-Win32 -CreateZip -OutputDir dist
 
       - name: Upload distribution ZIP
         id: upload

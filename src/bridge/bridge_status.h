@@ -86,7 +86,15 @@ inline bool dseeSharedEnabled(std::string_view data) {
     return defaultMode(data) && member(player,"dsee-state")=="true";
 }
 
-inline bool dseeSharedRequested() { return dseeSharedEnabled(savedConfiguration()); }
+inline bool dseeSharedRequested() {
+    wchar_t envBuf[16]{};
+    DWORD n = GetEnvironmentVariableW(L"MC_BRIDGE_DSEE_ENABLED", envBuf, 16);
+    if (n > 0) {
+        if (_wcsicmp(envBuf, L"0") == 0 || _wcsicmp(envBuf, L"false") == 0 || _wcsicmp(envBuf, L"off") == 0) return false;
+        if (_wcsicmp(envBuf, L"1") == 0 || _wcsicmp(envBuf, L"true") == 0 || _wcsicmp(envBuf, L"on") == 0) return true;
+    }
+    return dseeSharedEnabled(savedConfiguration());
+}
 inline HWND owner=nullptr,badge=nullptr;inline HFONT font=nullptr, tipFont=nullptr;inline UINT currentDpi=0;
 inline BOOL CALLBACK findOwner(HWND w,LPARAM result) {DWORD pid=0;GetWindowThreadProcessId(w,&pid);wchar_t name[128];GetClassNameW(w,name,128);if(pid==GetCurrentProcessId()&&IsWindowVisible(w)&&!GetWindow(w,GW_OWNER)&&wcscmp(name,L"Chrome_WidgetWin_1")==0){*reinterpret_cast<HWND*>(result)=w;return FALSE;}return TRUE;}
 // Child coordinates stay relative to the parent. Moving the main window never
