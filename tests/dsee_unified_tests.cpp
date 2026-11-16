@@ -460,14 +460,19 @@ public:
         *ppEnum = new MockEnumPins(pins);
         return S_OK;
     }
+    IFilterGraph* graph = nullptr;
     HRESULT STDMETHODCALLTYPE FindPin(LPCWSTR Id, IPin** ppPin) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE QueryFilterInfo(FILTER_INFO* pInfo) override {
         if (!pInfo) return E_POINTER;
-        pInfo->pGraph = nullptr;
+        pInfo->pGraph = graph;
+        if (graph) graph->AddRef();
         wcsncpy_s(pInfo->achName, filterName.c_str(), _TRUNCATE);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE JoinFilterGraph(IFilterGraph* pGraph, LPCWSTR pName) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE JoinFilterGraph(IFilterGraph* pGraph, LPCWSTR pName) override {
+        graph = pGraph;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE QueryVendorInfo(LPWSTR* pVendorInfo) override { return E_NOTIMPL; }
 };
 
@@ -523,12 +528,15 @@ public:
     IPin* failOutPin = nullptr;
     IPin* failInPin = nullptr;
 
+    OAFilterState mockState = State_Stopped;
+
     ~MockGraph() {
         for (auto* f : filters) f->Release();
     }
 
     void addFilter(MockFilter* f) {
         f->AddRef();
+        f->JoinFilterGraph(this, nullptr);
         filters.push_back(f);
     }
 
@@ -565,7 +573,7 @@ public:
     HRESULT STDMETHODCALLTYPE Stop() override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetState(LONG msTimeout, OAFilterState* pfs) override {
         if (!pfs) return E_POINTER;
-        *pfs = State_Stopped;
+        *pfs = mockState;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE RenderFile(BSTR strFile) override { return E_NOTIMPL; }
@@ -2480,6 +2488,146 @@ void testIssue61ConfigStorageAndDsee4x() {
     }
 }
 
+void testIssue63MidPlaybackDseeOffMismatch() {
+    std::printf("[TEST 19] Issue #63: Mid-Playback DSEE OFF Format Mismatch & Diagnostic Investigation...\n");
+
+    // Case 19A: Graph resolution from filter
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        graph->addFilter(dsee);
+
+        auto resolved = dseeUnified::resolveGraphFromFilter(dsee);
+        CHECK(resolved.Get() == static_cast<IGraphBuilder*>(graph.Get()));
+
+        graph->mockState = State_Running;
+        CHECK(dseeUnified::getGraphFilterState(resolved.Get()) == State_Running);
+        dsee->Release();
+    }
+
+    // Case 19B: Mid-playback DSEE 4x to OFF format mismatch on running graph
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* src = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* srcOut = new MockPin(PINDIR_OUTPUT, src, 44100, 16, L"Out");
+        src->addPin(srcOut);
+        graph->addFilter(src);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 16, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 176400, 24, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 44100, 16, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 44100, 16, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 44100, 16, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 44100, 16, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        // Initial connection before EQ bypass
+        graph->ConnectDirect(srcOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        // 4x DSEE EQ bypass applied
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get(), true);
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.outputRate == 176400 && routeRes.outputBits == 24);
+
+        // Graph enters Running state during active playback
+        graph->mockState = State_Running;
+
+        // User toggles DSEE HX OFF mid-playback: offConfig is 44.1k/16b
+        dseeUnified::DseeConfig reqOff{};
+        reqOff.mode = 0;
+        reqOff.inputRate = 44100;
+        reqOff.inputBits = 16;
+        auto offConfig = dseeUnified::makeOffResetDseeConfig(reqOff);
+        CHECK(offConfig.outputRate == 44100 && offConfig.outputBits == 16);
+
+        // Transition diagnostic inspection:
+        dseeUnified::DseeOffDiagnostic diag{};
+        CHECK(dseeUnified::inspectDseeOffTransition(graph.Get(), offConfig.outputRate, diag));
+        CHECK(diag.state == State_Running);
+        CHECK(diag.inspPost.renderIn.sampleRate == 176400);
+        CHECK(diag.inspPost.renderIn.bitDepth == 24);
+        CHECK(diag.inspPost.isDirectDsee);
+        CHECK(diag.mismatchDetected); // Proves renderer remains at 176.4k/24b while DSEE requested 44.1k/16b!
+
+        // Confirm why applyEqBypass does not rewire during State_Running:
+        auto rewireRes = dseeUnified::applyEqBypass(graph.Get(), false);
+        CHECK(rewireRes.outcome == dseeUnified::RouteOutcome::Skipped); // Refuses to rewire running graph!
+
+        // Confirm that once playback stops (State_Stopped), restoration succeeds cleanly:
+        graph->mockState = State_Stopped;
+        auto stoppedRes = dseeUnified::applyEqBypass(graph.Get(), false);
+        CHECK(stoppedRes.outcome == dseeUnified::RouteOutcome::Restored);
+        CHECK(stoppedRes.outputRate == 44100 && stoppedRes.outputBits == 16);
+    }
+
+    // Case 19C: Mid-playback DSEE 2x to OFF format mismatch on running graph
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 88200, 24, L"Out");
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 88200, 24, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(dseeOut, dsIn, nullptr);
+        graph->mockState = State_Running;
+
+        dseeUnified::DseeOffDiagnostic diag{};
+        CHECK(dseeUnified::inspectDseeOffTransition(graph.Get(), 44100, diag));
+        CHECK(diag.state == State_Running);
+        CHECK(diag.inspPost.renderIn.sampleRate == 88200);
+        CHECK(diag.mismatchDetected); // Proves renderer remains at 88.2k/24b while DSEE reset to 44.1k!
+    }
+
+    // Case 19D: DSEE OFF at track start / stopped state has no mismatch
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 44100, 16, L"Out");
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+        graph->mockState = State_Stopped;
+
+        dseeUnified::DseeOffDiagnostic diag{};
+        CHECK(dseeUnified::inspectDseeOffTransition(graph.Get(), 44100, diag));
+        CHECK(diag.state == State_Stopped);
+        CHECK(diag.inspPost.renderIn.sampleRate == 44100);
+        CHECK(!diag.mismatchDetected);
+    }
+}
+
 int main() {
     std::printf("Starting dsee_unified_tests...\n");
     std::fflush(stdout);
@@ -2520,6 +2668,7 @@ int main() {
     testIssue56DseeOffResetAndEqRestoration();
     testDseeStatusRejectsNative96k();
     testIssue61ConfigStorageAndDsee4x();
+    testIssue63MidPlaybackDseeOffMismatch();
     std::fflush(stdout);
 
     CoUninitialize();

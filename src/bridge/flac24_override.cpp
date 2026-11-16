@@ -168,6 +168,29 @@ static HRESULT STDMETHODCALLTYPE setterHook(IUnknown* self, DWORD value) {
     return hr;
 }
 
+// Issue #63: Detailed graph state logger for DSEE configuration transitions
+static void logDseeSetterGraphState(const char* prefix, IUnknown* self, DWORD mode, dseeUnified::CodecType codec,
+                                    dseeUnified::GraphInspection* pInspOut = nullptr) {
+    ComPtr<IGraphBuilder> graph = dseeUnified::resolveGraphFromFilter(self);
+    if (!graph) return;
+
+    OAFilterState state = dseeUnified::getGraphFilterState(graph.Get());
+    dseeUnified::GraphInspection insp{};
+    if (!dseeUnified::inspectGraphFormats(graph.Get(), insp)) return;
+    if (pInspOut) *pInspOut = insp;
+
+    char eventBuf[64];
+    sprintf_s(eventBuf, "%s_STATE", prefix);
+    record(eventBuf, mode, static_cast<DWORD>(state), HRESULT(codec));
+
+    sprintf_s(eventBuf, "%s_DSEEOUT", prefix);
+    record(eventBuf, insp.dseeOut.sampleRate, insp.dseeOut.bitDepth, insp.dseeOut.connected ? S_OK : S_FALSE);
+
+    sprintf_s(eventBuf, "%s_RENDERIN", prefix);
+    DWORD peerFlag = insp.isDirectDsee ? 1 : (insp.isDirectSeamless ? 2 : (insp.eqBypassed ? 3 : 0));
+    record(eventBuf, insp.renderIn.sampleRate, insp.renderIn.bitDepth, HRESULT(peerFlag));
+}
+
 // DSEE HX Configuration Setter Hook (OmgDseeHxFilter.ax slot 3)
 static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::DseeConfig config) {
     void* caller = _ReturnAddress();
@@ -187,14 +210,25 @@ static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::Dse
         return hr;
     }
 
-    // Issue #56: If UI DSEE setting is OFF or incoming request is mode == 0,
+    // Issue #56 / #63: If UI DSEE setting is OFF or incoming request is mode == 0,
     // do NOT accept initial mode=1 and do NOT inherit stale upsampled formats (e.g. 96k/24b).
     // Reset outputRate and outputBits to match inputRate and inputBits (bit-perfect bypass).
     if (!dseeRequested || config.mode == 0) {
+        dseeUnified::GraphInspection preInsp{};
+        logDseeSetterGraphState("DSEE_OFF_PRE", self, config.mode, codec, &preInsp);
+
         dseeUnified::DseeConfig offConfig = dseeUnified::makeOffResetDseeConfig(config);
         auto hr = originalDsee(self, offConfig);
         rememberSource(self, false);
         record("DSEE_OFF_RESET", offConfig.outputRate, offConfig.outputBits, hr);
+
+        dseeUnified::GraphInspection postInsp{};
+        logDseeSetterGraphState("DSEE_OFF_POST", self, offConfig.mode, codec, &postInsp);
+
+        if (preInsp.renderIn.sampleRate > offConfig.outputRate) {
+            record("DSEE_OFF_MISMATCH", offConfig.outputRate, postInsp.renderIn.sampleRate,
+                   preInsp.isDirectDsee ? HRESULT(1) : HRESULT(0));
+        }
         return hr;
     }
 
@@ -209,6 +243,9 @@ static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::Dse
         record("DSEE_PASS_THROUGH", config.outputRate, config.outputBits, hr);
         return hr;
     }
+
+    dseeUnified::GraphInspection setPreInsp{};
+    logDseeSetterGraphState("DSEE_SET_PRE", self, config.mode, codec, &setPreInsp);
 
     WORD decBits = (codec == dseeUnified::CodecType::Flac) ? dseeUnified::getActiveDecoderBits().load() : static_cast<WORD>(config.inputBits);
     if (codec != dseeUnified::CodecType::Flac) {
@@ -227,6 +264,8 @@ static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::Dse
     auto hr = originalDsee(self, adjusted);
     record(mode == dseeUnified::HarmonizeMode::Family4x ? "DSEE_UNIFIED_SET_4X" : "DSEE_UNIFIED_SET_2X",
            adjusted.outputRate, adjusted.outputBits, hr);
+
+    logDseeSetterGraphState("DSEE_SET_POST", self, adjusted.mode, codec);
 
     if (FAILED(hr)) {
         auto fallback = originalDsee(self, config);

@@ -600,4 +600,49 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph, bool dseeActive = true) {
     return result;
 }
 
+// Issue #63: Resolves IGraphBuilder from an arbitrary filter or interface pointer.
+inline ComPtr<IGraphBuilder> resolveGraphFromFilter(IUnknown* self) {
+    if (!self) return nullptr;
+    ComPtr<IGraphBuilder> graph;
+    if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&graph)))) return graph;
+    ComPtr<IBaseFilter> filter;
+    if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&filter)))) {
+        FILTER_INFO fi{};
+        if (SUCCEEDED(filter->QueryFilterInfo(&fi)) && fi.pGraph) {
+            fi.pGraph->QueryInterface(IID_PPV_ARGS(&graph));
+            fi.pGraph->Release();
+            return graph;
+        }
+    }
+    return nullptr;
+}
+
+// Issue #63: Retrieves the current execution state (Stopped / Paused / Running) of a graph.
+inline OAFilterState getGraphFilterState(IGraphBuilder* graph) {
+    if (!graph) return State_Stopped;
+    ComPtr<IMediaControl> mc;
+    OAFilterState fs = State_Stopped;
+    if (SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&mc)))) {
+        mc->GetState(0, &fs);
+    }
+    return fs;
+}
+
+// Issue #63: Diagnostic capture structure for DSEE transitions.
+struct DseeOffDiagnostic {
+    OAFilterState state = State_Stopped;
+    GraphInspection inspPost;
+    bool mismatchDetected = false;
+};
+
+inline bool inspectDseeOffTransition(IGraphBuilder* graph, DWORD offOutputRate, DseeOffDiagnostic& diag) {
+    if (!graph) return false;
+    diag.state = getGraphFilterState(graph);
+    inspectGraphFormats(graph, diag.inspPost);
+    if (diag.state == State_Running && diag.inspPost.renderIn.sampleRate > offOutputRate) {
+        diag.mismatchDetected = true;
+    }
+    return true;
+}
+
 } // namespace dseeUnified
