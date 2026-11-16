@@ -2,3 +2,15 @@ add_executable(bridge_status_tests EXCLUDE_FROM_ALL bridge_status_tests.cpp)
 target_include_directories(bridge_status_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/bridge")
 target_link_libraries(bridge_status_tests PRIVATE user32 gdi32 shell32)
 target_compile_definitions(bridge_status_tests PRIVATE UNICODE _UNICODE)
+
+add_executable(package_manifest_tests EXCLUDE_FROM_ALL package_manifest_tests.cpp)
+target_compile_definitions(package_manifest_tests PRIVATE UNICODE _UNICODE)
+
+add_executable(dsee_unified_tests EXCLUDE_FROM_ALL dsee_unified_tests.cpp)
+target_include_directories(dsee_unified_tests PRIVATE "${PROJECT_SOURCE_DIR}/src/bridge")
+target_link_libraries(dsee_unified_tests PRIVATE ole32 strmiids uuid user32)
+target_compile_definitions(dsee_unified_tests PRIVATE UNICODE _UNICODE)
+
+add_executable(track_tail_tests EXCLUDE_FROM_ALL "${PROJECT_SOURCE_DIR}/diagnostics/tests/track_tail_tests.cpp")
+target_link_libraries(track_tail_tests PRIVATE ole32 strmiids uuid)
+target_compile_definitions(track_tail_tests PRIVATE UNICODE _UNICODE)

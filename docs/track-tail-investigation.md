@@ -41,3 +41,32 @@ cmake --build build-Win32 --config Release --target end_probe
 `%TEMP%\EndProbe-PID.tsv`のREADYを確認する。`flac24_override`との併用は今回の観測で確認済み。同じAPIをフックする他の観測・迂回DLLを追加しない。統計はpinポインター単位のため、再構築・ポインター再利用をまたぐ解析ではNewSegmentと形式も照合する。Receiveの記録は元Receiveを呼ぶ直前の受け渡し観測で、DACから実際に出たことを直接保証しない。
 
 初期の観測版はストリーム内からグラフ位置を問い合わせてアプリを停止させたため、その版の試行は除外した。公開する観測版はその問い合わせを行わない。実アプリは再起動し、修正した観測版で比較し直した。
+
+## GUIなしの曲末欠落・EOS回帰試験
+
+個人の楽曲やMusic CenterのGUIを使わず、実行時に合成した48kHz・ステレオ・16/24bit整数PCMで曲末欠落・EOS後の無音パディング・次曲開始を判定するCLI試験（`track_tail_tests`、[Issue #19](https://github.com/yshdsnd/mc-hires-bridge/issues/19)）を追加した。PCMファイルや生成バイナリはリポジトリへ保存しない。
+
+- 合成音源：1曲目は同相ステレオ（`L == +R`、末尾300msを強調）、次曲は逆相ステレオ（`L == -R`）をメモリー上で生成する。異なる曲長（`48,000`、`64,800`、端数`51,733`フレーム）とブロック境界（`480`、`1,024`、端数`1,111`、`24,000`フレーム）を含む。
+- 判定内容：末尾全量到達、約300ms欠落（欠落のまま終了・無音置換・次曲への早期移行のいずれも非ゼロ終了）、EOS後の無音パディング長、次曲開始位置とフレーム数を区別する。
+- 独立DirectShowグラフ比較（Win32でSonyフィルターが利用可能な環境）：`OmgEqxlFilter.ax`（EQ）と`OmgDseeHxFilter.ax`（DSEE HX `mode=0/1`）へ合成PCMを入力し、`IPin::EndOfStream`（EOS）前後の出力フレーム数・末尾到達・無音パディング・`EC_COMPLETE`完了イベントを比較する。Sonyフィルターがない環境（x64ビルドや未導入環境）では解析器の単体テスト（216ケース）を実行できる。
+
+| 対象フィルター（48kHz / 16・24bit / 2ch） | EOS前の出力フレーム数 | EOS後の総出力フレーム数 | 有効末尾フレーム | EOS後の無音パディング | `EC_COMPLETE` |
+| --- | --- | --- | --- | --- | --- |
+| `OmgEqxlFilter.ax`（入力`48,000`、塊`24,000` / `480`） | `32,768`（未出力`15,232` = `317.3ms`） | `49,152` | `48,000`（全量） | `1,152`（`24.0ms`） | EOS前は未発生、EOS後に発生 |
+| `OmgEqxlFilter.ax`（入力`51,733`、塊`1,111`） | `40,960`（未出力`10,773` = `224.4ms`） | `57,344` | `51,733`（全量） | `5,611`（`116.9ms`） | EOS前は未発生、EOS後に発生 |
+| `OmgDseeHxFilter.ax` `mode=0/1`（入力`48,000`、塊`24,000`） | `47,616`（未出力`384` = `8.0ms`） | `48,000` | `48,000`（全量） | `0` | EOS前は未発生、EOS後に発生 |
+| `OmgDseeHxFilter.ax` `mode=0/1`（入力`48,000`、塊`480`） | `24,064`（未出力`23,936` = `498.7ms`） | `48,000` | `48,000`（全量） | `0` | EOS前は未発生、EOS後に発生 |
+| `OmgDseeHxFilter.ax` `mode=0/1`（入力`51,733`、塊`1,111`） | `48,640`（未出力`3,093` = `64.4ms`） | `51,733` | `51,733`（全量） | `0` | EOS前は未発生、EOS後に発生 |
+
+EQはEOSを受けるまで内部に約224〜317ms（`8,192`フレーム境界単位）を保持し、EOS時に残り全量とブロック境界までのゼロパディングをフラッシュして`EC_COMPLETE`を通知する。一方、DSEE HXはEOS時にパディングなしで入力フレーム数ちょうどを出力して`EC_COMPLETE`を通知する。この試験は独立グラフでのフィルター挙動と解析器の回帰確認であり、Music Center本体での波形測定や実楽曲の自動曲送りを置き換えるものではない。
+
+```powershell
+cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
+cmake --build build-Win32 --config Release --target track_tail_tests
+# 解析器テスト（216ケース）＋Sonyフィルター独立グラフ比較（利用可能な場合）
+./build-Win32/Release/track_tail_tests.exe
+# 末尾全量（終了コード0）と約300ms欠落（終了コード1）の個別判定
+./build-Win32/Release/track_tail_tests.exe full 24 48000 1152 9600
+./build-Win32/Release/track_tail_tests.exe drop300ms 24 48000
+./build-Win32/Release/track_tail_tests.exe eq-no-eos 24 48000
+```
