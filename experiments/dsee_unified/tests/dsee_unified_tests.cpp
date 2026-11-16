@@ -273,6 +273,16 @@ public:
         if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
     }
 
+    void setFormat(DWORD rate, WORD bits) {
+        if (mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
+            auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
+            w->nSamplesPerSec = rate;
+            w->wBitsPerSample = bits;
+            w->nBlockAlign = (bits / 8) * 2;
+            w->nAvgBytesPerSec = rate * w->nBlockAlign;
+        }
+    }
+
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
@@ -2028,6 +2038,227 @@ void testIssue54Flac44k24bInputAndTrackTransitions() {
     }
 }
 
+// Test 17: Issue #56 Verification Suite - DSEE OFF Reset, Stale Format Clearance, and EQ Route Restoration
+void testIssue56DseeOffResetAndEqRestoration() {
+    std::printf("[TEST 17] Issue #56: DSEE OFF Format Reset & EQ Route Restoration...\n");
+
+    // 17A: DSEE Config Reset Logic (makeOffResetDseeConfig)
+    // Scenario: Track previously had DSEE ON (96k/24b). Now UI is OFF or request is mode=0.
+    {
+        // 48kHz / 16bit FLAC: incoming req has stale 96k/24b output parameters
+        dseeUnified::DseeConfig staleReq48{0, 2, 16, 48000, 96000, 16, 24, 0, 0};
+        dseeUnified::DseeConfig reset48 = dseeUnified::makeOffResetDseeConfig(staleReq48);
+        CHECK(reset48.mode == 0);
+        CHECK(reset48.channels == 2);
+        CHECK(reset48.inputRate == 48000);
+        CHECK(reset48.outputRate == 48000); // Cleared stale 96k!
+        CHECK(reset48.inputBits == 16);
+        CHECK(reset48.outputBits == 16);   // Cleared stale 24b!
+        CHECK(reset48.format == 16);
+
+        // Even if Music Center sends initial mode=1 during song open,
+        // when UI is OFF, makeOffResetDseeConfig forces mode=0 and exact input parameters:
+        dseeUnified::DseeConfig initialMode1{1, 2, 16, 48000, 96000, 16, 24, 0, 0};
+        dseeUnified::DseeConfig resetInitial = dseeUnified::makeOffResetDseeConfig(initialMode1);
+        CHECK(resetInitial.mode == 0);
+        CHECK(resetInitial.outputRate == 48000);
+        CHECK(resetInitial.outputBits == 16);
+
+        // 44.1kHz / 16bit
+        dseeUnified::DseeConfig staleReq44{0, 2, 16, 44100, 88200, 16, 24, 0, 0};
+        dseeUnified::DseeConfig reset44 = dseeUnified::makeOffResetDseeConfig(staleReq44);
+        CHECK(reset44.mode == 0);
+        CHECK(reset44.outputRate == 44100);
+        CHECK(reset44.outputBits == 16);
+
+        // 44.1kHz / 24bit FLAC (DSEE OFF -> bit-perfect native format matching)
+        dseeUnified::DseeConfig req44_24{0, 2, 16, 44100, 88200, 24, 24, 0, 0};
+        dseeUnified::DseeConfig reset44_24 = dseeUnified::makeOffResetDseeConfig(req44_24);
+        CHECK(reset44_24.mode == 0);
+        CHECK(reset44_24.outputRate == 44100);
+        CHECK(reset44_24.outputBits == 24);
+        CHECK(reset44_24.format == 24);
+    }
+
+    // 17B: DirectShow Mock Graph EQ Restoration (ON -> OFF Transition)
+    // Setup a graph that was left in the DSEE ON state (EQ bypassed: seamOut directly connected to dsIn at 96k/24b)
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dec = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* decOut = new MockPin(PINDIR_OUTPUT, dec, 48000, 16, L"Out");
+        dec->addPin(decOut);
+        graph->addFilter(dec);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 48000, 16, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 48000, 16, L"Out"); // Reset to 48k/16b
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 48000, 16, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 48000, 16, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 48000, 16, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 48000, 16, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 96000, 24, L"In"); // Left in 96k/24b from previous track!
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        // Currently bypassed: dec -> dsee -> seam -> dsIn (eq bypassed/disconnected)
+        graph->ConnectDirect(decOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, dsIn, nullptr);
+
+        // Verify it is currently reported as bypassed:
+        dseeUnified::GraphInspection inspBefore{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), inspBefore));
+        CHECK(inspBefore.eqBypassed);
+        CHECK(inspBefore.isDirectSeamless);
+
+        // Now user turned DSEE OFF: call applyEqBypass with dseeActive = false
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get(), false);
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Restored);
+        CHECK(routeRes.change == S_OK);
+        CHECK(routeRes.outputRate == 48000); // Restored to 48kHz!
+        CHECK(routeRes.outputBits == 16);   // Restored to 16-bit!
+
+        // Inspect graph after restoration:
+        dseeUnified::GraphInspection inspAfter{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), inspAfter));
+        CHECK(!inspAfter.eqBypassed);        // EQ is NO LONGER bypassed!
+        CHECK(!inspAfter.isDirectSeamless);  // DirectSound is no longer directly on Seamless
+        CHECK(!inspAfter.isDirectDsee);
+        CHECK(inspAfter.eqIn.connected);     // EQ input is reconnected!
+        CHECK(inspAfter.eqOut.connected);    // EQ output is reconnected!
+        CHECK(inspAfter.renderIn.sampleRate == 48000); // Renderer received 48kHz/16bit!
+        CHECK(inspAfter.renderIn.bitDepth == 16);
+    }
+
+    // 17C: DirectShow Clean OFF State (Starting from OFF)
+    // Setup a clean standard graph (seamOut -> eqIn -> eqOut -> dsIn)
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dec = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* decOut = new MockPin(PINDIR_OUTPUT, dec, 48000, 16, L"Out");
+        dec->addPin(decOut);
+        graph->addFilter(dec);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 48000, 16, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 48000, 16, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 48000, 16, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 48000, 16, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 48000, 16, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 48000, 16, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 48000, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        // Standard route: dec -> dsee -> seam -> eq -> ds
+        graph->ConnectDirect(decOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        // Call applyEqBypass with dseeActive = false:
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get(), false);
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Skipped);
+        CHECK(routeRes.outputRate == 48000);
+        CHECK(routeRes.outputBits == 16);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(!insp.eqBypassed);
+        CHECK(insp.renderIn.sampleRate == 48000);
+        CHECK(insp.renderIn.bitDepth == 16);
+
+        // 17D: OFF -> ON Transition (User turns DSEE ON on next track)
+        // DSEE now outputs 96k/24b, and seamOut is 96k/24b:
+        dseeOut->setFormat(96000, 24);
+        seamOut->setFormat(96000, 24);
+        auto routeResOn = dseeUnified::applyEqBypass(graph.Get(), true);
+        CHECK(routeResOn.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeResOn.outputRate == 96000);
+        CHECK(routeResOn.outputBits == 24);
+
+        dseeUnified::GraphInspection inspOn{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), inspOn));
+        CHECK(inspOn.eqBypassed);
+        CHECK(inspOn.renderIn.sampleRate == 96000);
+        CHECK(inspOn.renderIn.bitDepth == 24);
+    }
+
+    // 17E: 96kHz / 192kHz Native Hi-Res Path Non-Interference
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+
+        auto* dec = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* decOut = new MockPin(PINDIR_OUTPUT, dec, 192000, 24, L"Out");
+        dec->addPin(decOut);
+        graph->addFilter(dec);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 192000, 24, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 192000, 24, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 192000, 24, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 192000, 24, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 192000, 24, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(decOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, dsIn, nullptr);
+
+        // Hi-Res track with DSEE OFF (no EQ in graph):
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get(), false);
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Skipped);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.renderIn.sampleRate == 192000);
+        CHECK(insp.renderIn.bitDepth == 24);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -2066,6 +2297,8 @@ int main() {
     testIssue49CodecEligibilityAndRouteMatrix();
     std::fflush(stdout);
     testIssue54Flac44k24bInputAndTrackTransitions();
+    std::fflush(stdout);
+    testIssue56DseeOffResetAndEqRestoration();
     std::fflush(stdout);
 
     CoUninitialize();

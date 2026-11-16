@@ -72,14 +72,34 @@ static HRESULT STDMETHODCALLTYPE dseeUnifiedSetterHook(IUnknown* self, DseeConfi
     record("DSEE_REQ_IN", config.inputRate, config.inputBits, HRESULT(config.mode));
     record("DSEE_REQ_OUT", config.outputRate, config.outputBits, HRESULT(codec));
 
-    bool eligible = bridgeStatus::directSoundSelected() &&
-                    (config.mode == 1) &&
+    bool dsSelected = bridgeStatus::directSoundSelected();
+    bool dseeRequested = bridgeStatus::dseeSharedRequested();
+
+    // Hi-Res input (>= 88.2k) or non-DirectSound: pass through untouched to preserve bit-perfect Hi-Res
+    if (!dsSelected || isHiResRate(config.inputRate)) {
+        auto hr = originalDsee(self, config);
+        rememberSource(self, false);
+        record("DSEE_PASS_THROUGH", config.outputRate, config.outputBits, hr);
+        return hr;
+    }
+
+    // Issue #56: If UI DSEE setting is OFF or incoming request is mode == 0,
+    // do NOT accept initial mode=1 and do NOT inherit stale upsampled formats (e.g. 96k/24b).
+    // Reset outputRate and outputBits to match inputRate and inputBits (bit-perfect bypass).
+    if (!dseeRequested || config.mode == 0) {
+        DseeConfig offConfig = makeOffResetDseeConfig(config);
+        auto hr = originalDsee(self, offConfig);
+        rememberSource(self, false);
+        record("DSEE_OFF_RESET", offConfig.outputRate, offConfig.outputBits, hr);
+        return hr;
+    }
+
+    bool eligible = (config.mode == 1) &&
                     isTargetInputRate(config.inputRate) &&
                     isTargetInputBits(config.inputBits) &&
                     (config.channels == 2);
 
     if (!eligible) {
-        // DSEE HX OFF (mode == 0) or Hi-Res rate (>= 88.2k): pass through untouched to preserve bit-perfect Hi-Res
         auto hr = originalDsee(self, config);
         rememberSource(self, false);
         record("DSEE_PASS_THROUGH", config.outputRate, config.outputBits, hr);
@@ -122,8 +142,11 @@ static HRESULT prepareDseeGraph(IUnknown* object) {
     ComPtr<IGraphBuilder> graph;
     if (FAILED(object->QueryInterface(IID_PPV_ARGS(&graph)))) return S_OK;
 
-    // Apply EQ bypass so 24-bit stream can reach DirectSound cleanly without EQ rejection
-    auto routeRes = applyEqBypass(graph.Get());
+    // Issue #56: Synchronize EQ bypass and restoration with UI DSEE setting.
+    // When DSEE is ON in UI, apply EQ bypass for 24-bit stream.
+    // When DSEE is OFF in UI, restore standard EQ routing (seamOut -> eqIn -> eqOut -> dsIn).
+    bool dseeActive = bridgeStatus::dseeSharedRequested();
+    auto routeRes = applyEqBypass(graph.Get(), dseeActive);
     const char* eventName = (routeRes.outcome == RouteOutcome::Bypassed) ? "DSEE_EQ_BYPASS" :
                             (routeRes.outcome == RouteOutcome::AlreadyBypassed) ? "DSEE_EQ_ALREADY_BYPASSED" :
                             (routeRes.outcome == RouteOutcome::Restored) ? "DSEE_EQ_RESTORED" :

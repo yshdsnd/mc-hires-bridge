@@ -174,6 +174,17 @@ inline bool computeUnifiedDseeConfig(const DseeConfig& req, DseeConfig& adjusted
     return true;
 }
 
+// Issue #56: Resets DseeConfig to pure OFF/bypass matching decoded PCM input format.
+// Prevents inheriting stale upsampled output rate (e.g. 96k) or 24-bit output when DSEE is OFF.
+inline DseeConfig makeOffResetDseeConfig(const DseeConfig& req) {
+    DseeConfig off = req;
+    off.mode = 0;
+    off.outputRate = req.inputRate;
+    off.outputBits = req.inputBits;
+    off.format = (req.inputBits == 24) ? 24 : 16;
+    return off;
+}
+
 // Graph switch & recreation tracking (Issue #42 Requirement 8)
 enum class GraphTransitionType {
     None,

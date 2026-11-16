@@ -288,7 +288,9 @@ inline bool inspectGraphFormats(IGraphBuilder* graph, GraphInspection& out) {
 //    - Otherwise (e.g. 88.2k in 44.1k FLAC where Seamless/downsampler rejects/downsamples 88.2k),
 //      connects dseeOut -> dsIn directly, maintaining 88.2kHz/24bit (Issue #46).
 // 2. DSEE OFF or native Hi-Res: preserves seamless transitions via seamOut -> dsIn.
-inline RouteResult applyEqBypass(IGraphBuilder* graph) {
+// Issue #56: Supports explicit dseeActive parameter. When DSEE HX is OFF (dseeActive == false),
+// restores standard EQ routing (seamOut -> eqIn, eqOut -> dsIn) if previously bypassed.
+inline RouteResult applyEqBypass(IGraphBuilder* graph, bool dseeActive = true) {
     RouteResult result;
     if (!graph) return result;
 
@@ -321,6 +323,97 @@ inline RouteResult applyEqBypass(IGraphBuilder* graph) {
     FormatStage dseeOutFmt{}, seamOutFmt{};
     if (dseeOut) readPinAudioFormat(dseeOut.Get(), dseeOutFmt);
     if (seamOut) readPinAudioFormat(seamOut.Get(), seamOutFmt);
+
+    // Issue #56: If DSEE HX is OFF, EQ bypass is NOT required.
+    // Restore the standard EQ route (seamOut -> eqIn and eqOut -> dsIn) if it was previously bypassed.
+    if (!dseeActive) {
+        if (!eqFilter || !eqIn || !eqOut || !seamOut) {
+            // No EQ filter in graph (e.g. native Hi-Res) or missing pins: keep existing state.
+            result.outcome = RouteOutcome::Skipped;
+            return result;
+        }
+
+        ComPtr<IPin> currentDsPeer;
+        if (SUCCEEDED(dsIn->ConnectedTo(&currentDsPeer)) && currentDsPeer) {
+            if (currentDsPeer.Get() == eqOut.Get()) {
+                // DirectSound is already connected to eqOut: perfectly normal unbypassed state.
+                result.outcome = RouteOutcome::Skipped;
+                result.change = S_OK;
+
+                AM_MEDIA_TYPE mt{};
+                if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
+                    auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
+                    result.outputRate = w->nSamplesPerSec;
+                    result.outputBits = w->wBitsPerSample;
+                    result.outputChannels = w->nChannels;
+                    if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+                    if (mt.pUnk) mt.pUnk->Release();
+                }
+                return result;
+            }
+        }
+
+        // DirectSound was bypassed (connected directly to seamOut or dseeOut).
+        // Rewire to restore standard EQ route: seamOut -> eqIn and eqOut -> dsIn.
+        ComPtr<IMediaControl> control;
+        OAFilterState state = State_Stopped;
+        if (SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&control)))) {
+            control->GetState(0, &state);
+        }
+        bool wasPaused = (state == State_Paused);
+        if (wasPaused) {
+            control->Stop();
+        } else if (state != State_Stopped) {
+            return result;
+        }
+
+        ComPtr<IMediaSeeking> seeking;
+        LONGLONG position = 0;
+        if (SUCCEEDED(graph->QueryInterface(IID_PPV_ARGS(&seeking)))) {
+            seeking->GetCurrentPosition(&position);
+        }
+
+        graph->Disconnect(dsIn.Get());
+        if (currentDsPeer) graph->Disconnect(currentDsPeer.Get());
+
+        ComPtr<IPin> p;
+        if (SUCCEEDED(eqIn->ConnectedTo(&p)) && p) {
+            graph->Disconnect(eqIn.Get());
+            graph->Disconnect(p.Get());
+        }
+        if (SUCCEEDED(eqOut->ConnectedTo(&p)) && p) {
+            graph->Disconnect(eqOut.Get());
+            graph->Disconnect(p.Get());
+        }
+
+        HRESULT hr1 = graph->ConnectDirect(seamOut.Get(), eqIn.Get(), nullptr);
+        HRESULT hr2 = graph->ConnectDirect(eqOut.Get(), dsIn.Get(), nullptr);
+
+        if (SUCCEEDED(hr1) && SUCCEEDED(hr2)) {
+            AM_MEDIA_TYPE mt{};
+            if (SUCCEEDED(dsIn->ConnectionMediaType(&mt)) && mt.pbFormat && mt.cbFormat >= sizeof(WAVEFORMATEX)) {
+                auto* w = reinterpret_cast<WAVEFORMATEX*>(mt.pbFormat);
+                result.outputRate = w->nSamplesPerSec;
+                result.outputBits = w->wBitsPerSample;
+                result.outputChannels = w->nChannels;
+                if (mt.cbFormat) CoTaskMemFree(mt.pbFormat);
+                if (mt.pUnk) mt.pUnk->Release();
+            }
+            if (seeking) {
+                seeking->SetPositions(&position, AM_SEEKING_AbsolutePositioning, nullptr, AM_SEEKING_NoPositioning);
+            }
+            if (wasPaused) {
+                control->Pause();
+            }
+            result.outcome = RouteOutcome::Restored;
+            result.change = S_OK;
+            return result;
+        }
+
+        result.outcome = RouteOutcome::RestoreFailed;
+        result.change = FAILED(hr1) ? hr1 : hr2;
+        return result;
+    }
 
     ComPtr<IPin> upstreamEqOut;
     if (eqIn) {
