@@ -215,9 +215,9 @@ static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::Dse
         dseeUnified::resetActiveDecoderBits();
     }
 
+    dseeUnified::HarmonizeMode mode = dseeUnified::initHarmonizeMode();
     dseeUnified::DseeConfig adjusted{};
-    // Family2x integer upsampling: 44.1k -> 88.2kHz/24b, 48k -> 96kHz/24b
-    if (!dseeUnified::computeUnifiedDseeConfig(config, adjusted, dseeUnified::HarmonizeMode::Family2x, decBits)) {
+    if (!dseeUnified::computeUnifiedDseeConfig(config, adjusted, mode, decBits)) {
         auto hr = originalDsee(self, config);
         rememberSource(self, false);
         record("DSEE_PASS_THROUGH", config.outputRate, config.outputBits, hr);
@@ -225,7 +225,8 @@ static HRESULT STDMETHODCALLTYPE dseeSetterHook(IUnknown* self, dseeUnified::Dse
     }
 
     auto hr = originalDsee(self, adjusted);
-    record("DSEE_UNIFIED_SET", adjusted.outputRate, adjusted.outputBits, hr);
+    record(mode == dseeUnified::HarmonizeMode::Family4x ? "DSEE_UNIFIED_SET_4X" : "DSEE_UNIFIED_SET_2X",
+           adjusted.outputRate, adjusted.outputBits, hr);
 
     if (FAILED(hr)) {
         auto fallback = originalDsee(self, config);
@@ -335,7 +336,7 @@ static void updateStatus(IUnknown* object, HRESULT result) {
                 playback.input = {insp.decodePcm.sampleRate, insp.decodePcm.bitDepth, insp.decodePcm.channels};
             }
 
-            dseeActive = dseeUnified::hasDsee2xOutput(insp);
+            dseeActive = dseeUnified::hasDseeOutput(insp);
         }
 
         if (dseeActive) {

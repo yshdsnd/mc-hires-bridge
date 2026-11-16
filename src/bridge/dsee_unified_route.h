@@ -103,6 +103,38 @@ inline bool hasDsee2xOutput(const GraphInspection& graph) {
            output.bitDepth == 24 && renderer.bitDepth == 24;
 }
 
+inline bool hasDsee4xOutput(const GraphInspection& graph) {
+    const auto& input = graph.dseeIn;
+    const auto& output = graph.dseeOut;
+    const auto& renderer = graph.renderIn;
+    return graph.eqBypassed && input.connected && output.connected && renderer.connected &&
+           isTargetInputRate(input.sampleRate) && isTargetInputBits(input.bitDepth) &&
+           input.channels == 2 && output.channels == 2 && renderer.channels == 2 &&
+           output.sampleRate == input.sampleRate * 4 && renderer.sampleRate == output.sampleRate &&
+           output.bitDepth == 24 && renderer.bitDepth == 24;
+}
+
+inline bool hasDseeOutput(const GraphInspection& graph) {
+    return hasDsee2xOutput(graph) || hasDsee4xOutput(graph);
+}
+
+enum class DseeRouteKind {
+    None,       // Negotiation failed / unbypassed / DSEE OFF
+    Dsee2x,     // 44.1k -> 88.2k or 48k -> 96k (24-bit stereo)
+    Dsee4x,     // 44.1k -> 176.4k or 48k -> 192k (24-bit stereo)
+    NativeHiRes // Native 96k/192k direct passthrough
+};
+
+inline DseeRouteKind classifyDseeRoute(const GraphInspection& graph) {
+    if (hasDsee2xOutput(graph)) return DseeRouteKind::Dsee2x;
+    if (hasDsee4xOutput(graph)) return DseeRouteKind::Dsee4x;
+    if (graph.renderIn.sampleRate >= 88200 &&
+        (!graph.dseeIn.connected || graph.dseeIn.sampleRate >= 88200)) {
+        return DseeRouteKind::NativeHiRes;
+    }
+    return DseeRouteKind::None;
+}
+
 inline ComPtr<IPin> findUniquePin(IBaseFilter* filter, PIN_DIRECTION wanted) {
     if (!filter) return {};
     ComPtr<IEnumPins> pins;

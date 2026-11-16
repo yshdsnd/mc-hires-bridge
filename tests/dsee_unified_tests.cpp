@@ -2281,6 +2281,205 @@ static void testDseeStatusRejectsNative96k() {
     CHECK(dseeUnified::hasDsee2xOutput(graph));
 }
 
+// Test 18: Issue #61 Persistent Config Storage, Context Menu Multiplier, & 4x Route Classification
+void testIssue61ConfigStorageAndDsee4x() {
+    std::printf("[TEST 18] Issue #61: Config Storage, Multiplier Selection, & 4x Route...\n");
+
+    // 18A: JSON parsing and validation
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson("") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson("{}") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"other": 123})") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": 2})") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": 4})") == 4);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": "4"})") == 4);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": "4x"})") == 4);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": 99})") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": -1})") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": "invalid"})") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": null})") == 2);
+    CHECK(bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier":)") == 2);
+
+    // 18B: File load/save roundtrip and directory creation
+    wchar_t tempDir[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring testCfg = std::wstring(tempDir) + L"mc_bridge_test_cfg_" + std::to_wstring(GetCurrentProcessId()) + L".json";
+    DeleteFileW(testCfg.c_str());
+
+    // Non-existent file defaults to 2
+    CHECK(bridgeConfig::loadDseeMultiplierFromDisk(testCfg) == 2);
+
+    // Save 4 and load back
+    CHECK(bridgeConfig::saveDseeMultiplier(4, testCfg));
+    CHECK(bridgeConfig::loadDseeMultiplierFromDisk(testCfg) == 4);
+
+    // Save 2 and load back
+    CHECK(bridgeConfig::saveDseeMultiplier(2, testCfg));
+    CHECK(bridgeConfig::loadDseeMultiplierFromDisk(testCfg) == 2);
+
+    // Invalid multiplier clamps to 2
+    CHECK(bridgeConfig::saveDseeMultiplier(99, testCfg));
+    CHECK(bridgeConfig::loadDseeMultiplierFromDisk(testCfg) == 2);
+
+    DeleteFileW(testCfg.c_str());
+
+    // 18C: initHarmonizeMode integration (Env vs Config)
+    {
+        // Unset env var
+        SetEnvironmentVariableW(L"MC_BRIDGE_DSEE_MODE", nullptr);
+
+        bridgeConfig::activeDseeMultiplier().store(2);
+        CHECK(dseeUnified::initHarmonizeMode() == dseeUnified::HarmonizeMode::Family2x);
+
+        bridgeConfig::activeDseeMultiplier().store(4);
+        CHECK(dseeUnified::initHarmonizeMode() == dseeUnified::HarmonizeMode::Family4x);
+
+        // Env var override takes precedence if set
+        SetEnvironmentVariableW(L"MC_BRIDGE_DSEE_MODE", L"2x");
+        CHECK(dseeUnified::initHarmonizeMode() == dseeUnified::HarmonizeMode::Family2x);
+
+        SetEnvironmentVariableW(L"MC_BRIDGE_DSEE_MODE", L"4x");
+        CHECK(dseeUnified::initHarmonizeMode() == dseeUnified::HarmonizeMode::Family4x);
+
+        SetEnvironmentVariableW(L"MC_BRIDGE_DSEE_MODE", nullptr);
+        bridgeConfig::activeDseeMultiplier().store(2);
+        CHECK(dseeUnified::initHarmonizeMode() == dseeUnified::HarmonizeMode::Family2x);
+    }
+
+    // 18D: Route classification (2x, 4x, Native Hi-Res, Failure)
+    {
+        // 2x Route (44.1k -> 88.2k)
+        dseeUnified::GraphInspection g2x{};
+        g2x.eqBypassed = true;
+        g2x.dseeIn = {true, true, 44100, 16, 2};
+        g2x.dseeOut = {true, true, 88200, 24, 2};
+        g2x.renderIn = {true, true, 88200, 24, 2};
+        CHECK(dseeUnified::hasDsee2xOutput(g2x));
+        CHECK(!dseeUnified::hasDsee4xOutput(g2x));
+        CHECK(dseeUnified::hasDseeOutput(g2x));
+        CHECK(dseeUnified::classifyDseeRoute(g2x) == dseeUnified::DseeRouteKind::Dsee2x);
+
+        // 4x Route (44.1k -> 176.4k)
+        dseeUnified::GraphInspection g4x_44{};
+        g4x_44.eqBypassed = true;
+        g4x_44.dseeIn = {true, true, 44100, 16, 2};
+        g4x_44.dseeOut = {true, true, 176400, 24, 2};
+        g4x_44.renderIn = {true, true, 176400, 24, 2};
+        CHECK(!dseeUnified::hasDsee2xOutput(g4x_44));
+        CHECK(dseeUnified::hasDsee4xOutput(g4x_44));
+        CHECK(dseeUnified::hasDseeOutput(g4x_44));
+        CHECK(dseeUnified::classifyDseeRoute(g4x_44) == dseeUnified::DseeRouteKind::Dsee4x);
+
+        // 4x Route (48k -> 192k)
+        dseeUnified::GraphInspection g4x_48{};
+        g4x_48.eqBypassed = true;
+        g4x_48.dseeIn = {true, true, 48000, 24, 2};
+        g4x_48.dseeOut = {true, true, 192000, 24, 2};
+        g4x_48.renderIn = {true, true, 192000, 24, 2};
+        CHECK(!dseeUnified::hasDsee2xOutput(g4x_48));
+        CHECK(dseeUnified::hasDsee4xOutput(g4x_48));
+        CHECK(dseeUnified::hasDseeOutput(g4x_48));
+        CHECK(dseeUnified::classifyDseeRoute(g4x_48) == dseeUnified::DseeRouteKind::Dsee4x);
+
+        // Native 96kHz FLAC
+        dseeUnified::GraphInspection gNative96{};
+        gNative96.eqBypassed = true;
+        gNative96.dseeIn = {true, true, 96000, 24, 2};
+        gNative96.dseeOut = {true, true, 96000, 24, 2};
+        gNative96.renderIn = {true, true, 96000, 24, 2};
+        CHECK(!dseeUnified::hasDsee2xOutput(gNative96));
+        CHECK(!dseeUnified::hasDsee4xOutput(gNative96));
+        CHECK(!dseeUnified::hasDseeOutput(gNative96));
+        CHECK(dseeUnified::classifyDseeRoute(gNative96) == dseeUnified::DseeRouteKind::NativeHiRes);
+
+        // Native 192kHz FLAC
+        dseeUnified::GraphInspection gNative192{};
+        gNative192.eqBypassed = true;
+        gNative192.dseeIn = {true, true, 192000, 24, 2};
+        gNative192.dseeOut = {true, true, 192000, 24, 2};
+        gNative192.renderIn = {true, true, 192000, 24, 2};
+        CHECK(!dseeUnified::hasDsee2xOutput(gNative192));
+        CHECK(!dseeUnified::hasDsee4xOutput(gNative192));
+        CHECK(!dseeUnified::hasDseeOutput(gNative192));
+        CHECK(dseeUnified::classifyDseeRoute(gNative192) == dseeUnified::DseeRouteKind::NativeHiRes);
+
+        // Negotiation failure (DSEE output 176.4k, but renderer downsampled to 44.1k/16b)
+        dseeUnified::GraphInspection gFailed4x{};
+        gFailed4x.eqBypassed = false;
+        gFailed4x.dseeIn = {true, true, 44100, 16, 2};
+        gFailed4x.dseeOut = {true, true, 176400, 24, 2};
+        gFailed4x.renderIn = {true, true, 44100, 16, 2};
+        CHECK(!dseeUnified::hasDsee2xOutput(gFailed4x));
+        CHECK(!dseeUnified::hasDsee4xOutput(gFailed4x));
+        CHECK(!dseeUnified::hasDseeOutput(gFailed4x));
+        CHECK(dseeUnified::classifyDseeRoute(gFailed4x) == dseeUnified::DseeRouteKind::None);
+
+        // DSEE OFF
+        dseeUnified::GraphInspection gOff{};
+        gOff.eqBypassed = false;
+        gOff.dseeIn = {true, true, 44100, 16, 2};
+        gOff.dseeOut = {true, true, 44100, 16, 2};
+        gOff.renderIn = {true, true, 44100, 16, 2};
+        CHECK(!dseeUnified::hasDsee2xOutput(gOff));
+        CHECK(!dseeUnified::hasDsee4xOutput(gOff));
+        CHECK(!dseeUnified::hasDseeOutput(gOff));
+        CHECK(dseeUnified::classifyDseeRoute(gOff) == dseeUnified::DseeRouteKind::None);
+    }
+
+    // 18E: Mock DirectShow Graph Rewiring at 176.4kHz & Rollback
+    {
+        Microsoft::WRL::ComPtr<MockGraph> graph = new MockGraph();
+        auto* src = new MockFilter(dseeUnified::flacId, L"OmgFlacSrc");
+        auto* srcOut = new MockPin(PINDIR_OUTPUT, src, 44100, 24, L"Out");
+        src->addPin(srcOut);
+        graph->addFilter(src);
+
+        auto* dsee = new MockFilter(dseeUnified::dseeId, L"OmgDseeHxFilter");
+        auto* dseeIn = new MockPin(PINDIR_INPUT, dsee, 44100, 24, L"In");
+        auto* dseeOut = new MockPin(PINDIR_OUTPUT, dsee, 176400, 24, L"Out");
+        dsee->addPin(dseeIn);
+        dsee->addPin(dseeOut);
+        graph->addFilter(dsee);
+
+        auto* seam = new MockFilter(dseeUnified::seamlessId, L"SeamlessFilter");
+        auto* seamIn = new MockPin(PINDIR_INPUT, seam, 44100, 16, L"In");
+        auto* seamOut = new MockPin(PINDIR_OUTPUT, seam, 44100, 16, L"Out");
+        seam->addPin(seamIn);
+        seam->addPin(seamOut);
+        graph->addFilter(seam);
+
+        auto* eq = new MockFilter(dseeUnified::eqId, L"OmgEqxlFilter");
+        auto* eqIn = new MockPin(PINDIR_INPUT, eq, 44100, 16, L"In");
+        auto* eqOut = new MockPin(PINDIR_OUTPUT, eq, 44100, 16, L"Out");
+        eq->addPin(eqIn);
+        eq->addPin(eqOut);
+        graph->addFilter(eq);
+
+        auto* ds = new MockFilter(CLSID_DSoundRender, L"DirectSoundRender");
+        auto* dsIn = new MockPin(PINDIR_INPUT, ds, 44100, 16, L"In");
+        ds->addPin(dsIn);
+        graph->addFilter(ds);
+
+        graph->ConnectDirect(srcOut, dseeIn, nullptr);
+        graph->ConnectDirect(dseeOut, seamIn, nullptr);
+        graph->ConnectDirect(seamOut, eqIn, nullptr);
+        graph->ConnectDirect(eqOut, dsIn, nullptr);
+
+        auto routeRes = dseeUnified::applyEqBypass(graph.Get());
+        CHECK(routeRes.outcome == dseeUnified::RouteOutcome::Bypassed);
+        CHECK(routeRes.outputRate == 176400);
+        CHECK(routeRes.outputBits == 24);
+
+        dseeUnified::GraphInspection insp{};
+        CHECK(dseeUnified::inspectGraphFormats(graph.Get(), insp));
+        CHECK(insp.isDirectDsee);
+        CHECK(!insp.isDirectSeamless);
+        CHECK(insp.eqBypassed);
+        CHECK(insp.renderIn.sampleRate == 176400 && insp.renderIn.bitDepth == 24);
+        CHECK(dseeUnified::hasDsee4xOutput(insp));
+        CHECK(dseeUnified::classifyDseeRoute(insp) == dseeUnified::DseeRouteKind::Dsee4x);
+    }
+}
+
 int main() {
     std::printf("Starting dsee_unified_tests...\n");
     std::fflush(stdout);
@@ -2320,6 +2519,7 @@ int main() {
     std::fflush(stdout);
     testIssue56DseeOffResetAndEqRestoration();
     testDseeStatusRejectsNative96k();
+    testIssue61ConfigStorageAndDsee4x();
     std::fflush(stdout);
 
     CoUninitialize();

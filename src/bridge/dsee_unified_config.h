@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <atomic>
+#include "bridge_config.h"
 
 namespace dseeUnified {
 
@@ -115,7 +116,7 @@ inline void resetActiveDecoderBits() {
     getActiveDecoderBits().store(0);
 }
 
-inline HarmonizeMode initHarmonizeModeFromEnv() {
+inline HarmonizeMode initHarmonizeMode() {
     wchar_t buf[32]{};
     DWORD n = GetEnvironmentVariableW(L"MC_BRIDGE_DSEE_MODE", buf, 32);
     if (n > 0) {
@@ -130,14 +131,15 @@ inline HarmonizeMode initHarmonizeModeFromEnv() {
             return HarmonizeMode::Family2x;
         }
     }
-    // Issue #44: Family2x is the standard baseline (44.1k -> 88.2kHz/24b, 48k -> 96kHz/24b).
-    // Windows Shared Mode handles device mix conversion.
+    // Normal launch: read persistent bridge config (default: 2x, fallback on missing/invalid: 2x)
+    uint32_t mult = bridgeConfig::getDseeMultiplier();
+    if (mult == 4) return HarmonizeMode::Family4x;
     return HarmonizeMode::Family2x;
 }
 
 // Computes adjusted DseeConfig for 44.1kHz/48kHz PCM when DSEE HX is ON
 inline bool computeUnifiedDseeConfig(const DseeConfig& req, DseeConfig& adjusted,
-                                     HarmonizeMode mode = HarmonizeMode::Target96k,
+                                     HarmonizeMode mode = HarmonizeMode::Family2x,
                                      WORD actualInputBits = 0) {
     // Only adjust when DSEE HX is ON and input is 44.1kHz or 48kHz
     if (req.mode != 1) return false;

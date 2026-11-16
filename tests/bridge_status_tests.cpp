@@ -35,5 +35,9 @@ int main(){
     if(details.find(L"ALAC  44.1 kHz / 16 bit / 2 ch")==std::wstring::npos ||
        details.find(L"DirectSound  176.4 kHz / 24 bit / 2 ch")==std::wstring::npos ||
        bridgeStatus::formatText({48000,24,2})!=L"48 kHz / 24 bit / 2 ch")return 4;
+    if (bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": 4})") != 4 ||
+        bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": 2})") != 2 ||
+        bridgeConfig::parseDseeMultiplierFromJson(R"({"dsee-multiplier": "invalid"})") != 2 ||
+        bridgeConfig::parseDseeMultiplierFromJson("") != 2) return 5;
     puts("Output-mode, DSEE preference, status label, and tooltip checks passed");return 0;
 }
