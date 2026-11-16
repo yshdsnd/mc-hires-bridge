@@ -1,48 +1,54 @@
 # MC HiRes Bridge
 
-**MC HiRes Bridgeは、Sonyとは関係のない非公式ツールです。独自の調査結果に基づいて開発しており、Sonyが提供・承認・サポートするものではありません。**
+MC HiRes Bridgeは、Music Center for PCの **DirectSound（共有）モード** で、ハイレゾFLACとDSEE HXを使うためのWindows用ツールです。
 
-Music Center for PCのDirectSound共有出力で、対応するハイレゾFLACの24bit出力を維持する非公式ツールです。
+**Sonyとは関係のない非公式ツールです。独自の調査結果に基づいて開発しており、Sonyによる提供・承認・サポートはありません。**
 
-## 使い方
+## できること
 
-1. ZIPをフォルダーごと展開します。
-2. `MC HiRes Bridge.exe`をダブルクリックします。
-3. Music Centerが起動し、`HR-BR RDY`と表示されたら準備完了です。
+### ハイレゾFLACを元の形式で出力する
 
-確認画面はありません。対応音源の再生時は`HR-BR ON`、対象外の音源や別の出力モードでは`HR-BR OFF`になります。
+対応する48／96／192 kHz・24 bitのステレオFLACを、元のサンプリング周波数と24 bitのままDirectSoundへ渡します。Music Centerの共有モードで44.1 kHzや48 kHzの16 bitに変換されるのを防ぎます。この機能はDSEE HXの設定に関係なく使えます。
 
-EXEと`flac24_override.dll`は同じフォルダーのまま使用してください。EXEのショートカットからも起動できます。Music Centerの終了でブリッジも解除されるため、以後はこのEXEから起動してください。
+### DirectSound（共有）でDSEE HXを使う
 
-Music Centerが起動済みなら、そのプロセスへロードします。ロード前から再生中の曲へは遡って適用しません。次曲または曲を選び直したときから適用されます。更新時はMusic Centerを完全終了してからファイルを入れ替えてください。
+Music Centerでは通常WASAPI排他またはASIOで使うDSEE HXを、DirectSound（共有）でも利用できます。CD品質やMP3・AACなどの対応音源を再生するときに、Music Centerの **DSEE HX** をオンにしてください。出力は24 bitで、サンプリング周波数は2倍または4倍を選べます。
 
-HR-BRにマウスを置くと、取得できた入力形式、処理経路、DirectSoundの接続形式を表示します。DirectSound欄はWindows共有ミキサーに入る前の形式です。
+| 入力のサンプリング周波数 | 2倍（初期設定） | 4倍 |
+| --- | --- | --- |
+| 44.1 kHz | 88.2 kHz／24 bit | 176.4 kHz／24 bit |
+| 48 kHz | 96 kHz／24 bit | 192 kHz／24 bit |
 
-## 対応範囲・エラー
+表に示した形式は、BridgeがDirectSoundへ渡す形式です。Windows共有ミキサーは必要に応じて、出力デバイスの既定の形式へ変換します。
 
-Windows 11、Music Center for PC 2.7.4（32bit、標準インストール先）、DirectSound共有出力。48・96・192 kHz／24 bitのステレオFLACが対象です。DSDとハイレゾWAVは対象外です。
+## 起動する
 
-音源のサンプルレートをWindows共有出力まで維持するには、Windows側のオーディオデバイス設定と機器もそのレートに対応している必要があります。
+1. 配布ZIPを展開し、同梱ファイルを同じフォルダーに置きます。
+2. `MC HiRes Bridge.exe` をダブルクリックします。
+3. Music Centerで **DirectSound（共有）** を選びます。再生操作部に `HR-BR RDY` が表示されたら準備完了です。
 
-通常の権限で起動してください。失敗したときだけ理由とエラー番号を表示します。旧版がロード済みの場合はMusic Centerを完全終了して再実行してください。Music Center本体や音源ファイルは変更しません。
+Music Centerが起動済みの場合は、次に曲を選び直したときからBridgeが適用されます。普段の起動にはこのEXEまたはそのショートカットを使ってください。更新するときはMusic Centerを完全に終了してから、展開したファイルを入れ替えてください。
 
-## DSEE HXの試聴（開発版）
+## 倍率を変える・出力を確認する
 
-Music CenterでDirectSound出力を選び、DSEE HXをオンにしてから曲を再生してください。試聴した範囲は44.1 kHzのステレオ音源で、16 bit WAV／FLAC／ALAC、96／256 kbps AAC、96／192／320 kbps MP3です。設定の切り替えは、曲を選び直すなどして再生経路が作り直されたときに反映されます。EQを外した経路を使用します。
+- **倍率の変更** — `HR-BR` を右クリックし、「DSEE HX 出力倍率」から2倍または4倍を選びます。選択は再起動後も保持されます。メニューは領域外クリックで閉じられます。サブメニューでEscを押すと、Music Centerが一覧へ戻る場合があります。
+- **適用のタイミング** — 倍率やDSEE HXのオン／オフを再生中に変えても、現在の曲はそのまま再生されます。変更は次に新しく開く曲から反映されます。すでに先読み済みの曲は準備済みの設定で再生されます。
+- **出力の確認** — `HR-BR` にマウスを置くと、現在の入力形式、処理経路、DirectSoundに渡している形式が表示されます。Music CenterのDSEE HXボタンは次に適用する設定を示すため、切り替え直後はツールチップと表示が異なることがあります。
 
-DSEEをオフにするとCD品質・圧縮音源は通常経路で再生されます。ハイレゾFLACの24 bit処理はDSEE設定に関係なく有効です。
+| 表示 | 意味 |
+| --- | --- |
+| `HR-BR RDY` | Bridgeの起動準備ができています |
+| `HR-BR ON` | ハイレゾFLACの形式維持、またはDSEE HX経由で再生しています |
+| `HR-BR OFF` | 対象外の音源や出力モードなどで、Bridgeの音声処理が適用されていません |
 
-### 出力倍率の切り替え（右クリックメニュー）
-`HR-BR` バッジを右クリックすると、DSEE HX出力倍率メニューが表示されます。
-- **2倍 (88.2 / 96 kHz)**: 既定値。
-- **4倍 (176.4 / 192 kHz)**: 176.4 / 192 kHzへアップスケーリング。
+## 対応環境
 
-選択内容は `%APPDATA%\Sony\Music Center\config\mc_hires_bridge.json` に自動保存されます。再生中の音声は中断せず、次に新しく開く曲から適用されます（次曲が先読みされている場合はその次の曲から適用）。4倍接続が失敗した場合は自動的に通常経路へフォールバックします。
+Windows 11と、標準の場所にインストールしたMusic Center for PC 2.7.4（32 bit）で確認しています。DSEE HXの対象は44.1／48 kHzのステレオ音源です。実機では44.1 kHzのWAV・FLAC・ALAC・AAC・MP3と、48 kHzのFLACを確認しています。ハイレゾWAVとDSDの原音形式維持は対象外です。
 
-再生中に Music Center 本体の DSEE HX ボタンを ON / OFF 切り替えした場合も同様に、再生中の音声を途切れさせたりノイズを発生させないため、次に新しく開く曲から安全に適用されます。曲が切り替わるまでの間、Music Center のボタン表示（次の設定）と HR-BR のツールチップ（現在の実経路）が一時的に異なる表示になりますが、これは安全に再生を継続するための正常な動作です。
+起動時にエラーが出る場合は、Music Centerを完全に終了し、ZIPを展開したフォルダーにEXEと `flac24_override.dll` が揃っていることを確認してから起動してください。
 
-## ライセンス・詳細
+不具合は [GitHub Issues](https://github.com/yshdsnd/mc-hires-bridge/issues) へ。開発・診断資料は [GitHubリポジトリ](https://github.com/yshdsnd/mc-hires-bridge) にあります。
 
-独自部分は同梱の`LICENSE`（BSD 2-Clause）、MinHookは`licenses/MinHook.txt`を参照してください。
+## ライセンス
 
-ソース・詳細・不具合報告：https://github.com/yshdsnd/mc-hires-bridge
+Bridgeは同梱の `LICENSE`（BSD 2-Clause）、MinHookは `licenses/MinHook.txt` を参照してください。
