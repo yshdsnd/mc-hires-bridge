@@ -4,167 +4,27 @@
 
 MC HiRes Bridgeは、Music Center for PC本体のファイルを改変することなく、Music Center使用時に音源の高域を保ったハイレゾ出力ができるようにすることを目的としています。
 
-Windows上のMusic Center for PCの再生経路を調査し、経過時間表示を維持しながら96kHz音声の44.1kHz変換を迂回する、実験段階のC++ツールです。
+**Sonyとは関係のない非公式ツールです。独自の調査結果に基づいて開発しており、Sonyによる提供・承認・サポートはありません。**
 
-**MC HiRes Bridgeは、Sonyとは関係のない非公式ツールです。独自の調査結果に基づいて開発しており、Sonyが提供・承認・サポートするものではありません。**
+## v0.2.0でできること
 
-対象アプリのインストール済みバイナリや音源ファイルは変更しません。実行中のプロセスにDLLをロードし、一時的にDirectShowの接続を変更します。
+- **ハイレゾFLACの形式を維持** — 対応する48／96／192 kHz・24 bitのステレオFLACを、元のレートと24 bitのままDirectSoundへ渡します。
+- **共有モードでDSEE HXを利用** — 44.1／48 kHzの対応音源を24 bitで出力します。HR-BRの右クリックで2倍（88.2／96 kHz）または4倍（176.4／192 kHz）を選べます。
+- **現在の出力を確認** — HR-BRにマウスを置くと、入力形式、処理経路、DirectSoundへ渡す形式が表示されます。
 
-その後の調査では、標準のWASAPI排他出力なら迂回なしで96kHz/有効24bitと高域を確認できました。本ツールの迂回機能は、共有出力を使いながら高域を保ちたい場合を対象とします。[排他モードの検証結果](docs/wasapi-exclusive-investigation.md)も参照してください。
+Windows共有ミキサーは必要に応じてデバイスの既定形式へ変換します。対応環境、対象形式、設定変更の適用タイミングは[利用ガイド](docs/package-readme.md)を参照してください。
 
-48kHzおよび96kHz/24bit FLACについては、sourceへの16bit指定だけを24bitへ変更すると、Music Center自身がSeamless・EQを通る元のサンプルレートの24bit共有出力を構築することも確認できました。[共有24bit化の試験結果](docs/shared-24bit-investigation.md)と実験用`flac24_override`を追加しています。[48kHz/24bitの追加検証](docs/shared-48k-24bit.md)も参照してください。対応範囲は限定されています。
+## ダウンロードと起動
 
-192kHz/24bit・ステレオFLACも通常版の対象に追加しました。1ファイルでDirectSoundの192kHz/24bit出力、レンダラー入力PCMと原音の一致、時間表示・シーク・曲末・繰り返し・同一ファイルの自動次曲を確認しています。[192kHz FLACの検証結果](docs/shared-192k-24bit.md)を参照してください。Windows共有出力も192kHzに設定した環境での結果です。WAVは別の試験版、DSDは引き続き調査対象です。
+[Releases](https://github.com/yshdsnd/mc-hires-bridge/releases)から配布ZIPを取得し、展開したフォルダーの **MC HiRes Bridge.exe** をダブルクリックします。Music CenterでDirectSoundを選び、DSEE HXを使う場合はオンにしてください。更新時はMusic Centerを完全に終了してからファイルを入れ替えてください。
 
-`flac24_override`には、DSEE HX左側の文字表示 **HR-BR RDY / ON / OFF** を追加しています。44.1kHz/16bitなど対象外の音源は設定を変更せずOFFと表示します。[状態表示の使い方と検証](docs/status-ui.md)を参照してください。状態表示付き版は従来のグラフ観測・迂回DLLと併用しないでください。
+再生中にDSEE HXのオン／オフや倍率を変えると、次に新しく開く曲から適用されます。先読み済みの曲は準備済みの設定で再生します。倍率メニューは領域外クリックで閉じてください。EscでMusic Centerが一覧へ戻り、メニューが残る制限があります。
 
-曲末が数秒欠ける問題は、次曲先読み用の16bit指定が変更対象から漏れていたことが原因でした。適用漏れを修正し、同一形式の曲間で出力が継続することを確認しました。[曲末の調査結果](docs/track-tail-investigation.md)を参照してください。
+## ドキュメント
 
-## DSEE HX 出力倍率の切り替え（右クリックメニュー）
+- [利用ガイド・配布用README](docs/package-readme.md)
+- [v0.2.0 リリースノート](docs/releases/v0.2.0.md)
+- [開発・診断・ビルド方法](docs/development.md)
+- [状態表示の仕組みと検証記録](docs/status-ui.md)
 
-Music Center画面上の `HR-BR` バッジを右クリックすると、DSEE HXの出力倍率メニューが表示されます。
-
-- **2倍 (88.2 / 96 kHz)**: 既定値。44.1 kHz音源を88.2 kHz、48 kHz音源を96 kHzへアップサンプリングしてDirectSoundに出力します。
-- **4倍 (176.4 / 192 kHz)**: 44.1 kHz音源を176.4 kHz、48 kHz音源を192 kHzへアップサンプリングしてDirectSoundに出力します。
-
-### 設定の保存と適用タイミング
-- **設定保存**: 選択内容は `%APPDATA%\Sony\Music Center\config\mc_hires_bridge.json` に保存され、Music Centerを再起動しても保持されます。設定ファイルが存在しない場合や破損している場合は安全のため自動的に2倍（既定値）で動作します。
-- **適用タイミング（安全な切り替え）**: 再生中に倍率を変更しても、再生中の音声を途切れさせたり DirectShow グラフを強制破棄したりすることはありません。変更は**次に新しく開く曲**から適用されます（※次の曲が既に先読みされている場合は、その次の曲から適用されます）。
-- **再生中の DSEE HX 切り替えと表示の動き**: Music Center 画面の DSEE HX ボタンの ON / OFF 切り替えも同様に、再生中の音声を途切れさせたりノイズ・位置ジャンプを発生させないため、**次に新しく開く曲から安全に適用**されます（現在の曲は再生終了まで現在の経路・サンプリングレートを維持して継続します。次曲が既に先読みされている場合は、その次の曲から適用されます）。再生中に切り替えた場合、Music Center のボタン表示は「次に適用される設定」を示し、HR-BR バッジのホバーツールチップは「現在出力中の実経路」を示します。曲が切り替わるまでの間、両者の表示が一時的に異なる状態（例: ボタンは OFF だがツールチップは DSEE HX 実行中）となりますが、これは再生の安全を維持するための正常な動作です。
-- **接続失敗時の自動フォールバック**: DirectSound やオーディオデバイス側の制約等で4倍接続が失敗した場合は、再生を停止させることなく通常経路へ自動で安全にフォールバックします。HR-BRのツールチップにも実際の接続経路（失敗時は通常経路）が表示されます。
-
-## 普段の起動
-
-同じフォルダーにある **`MC HiRes Bridge.exe`をダブルクリック**すると、Music Centerの起動とブリッジのロードを自動で行います。成功時は確認画面もコンソールも出ません。`HR-BR RDY`が準備完了の目印です。
-
-Music Centerが起動済みなら、そのプロセスへ適用します。ロード済みなら二重にロードしません。EXEと`flac24_override.dll`は同じフォルダーに置いてください。[ランチャーの使い方・ビルド方法](docs/launcher.md)を参照してください。
-
-## GitHub Actionsの配布ZIP
-
-[ActionsのBuild Windows ZIP](https://github.com/yshdsnd/mc-hires-bridge/actions/workflows/build-windows.yml)で、成功した実行のArtifactsから`mc-hires-bridge-windows-x86.zip`を取得できます。mainへのpush・Pull Request・Run workflowによる手動実行に対応します。成果物の保存期間は30日です。
-
-ZIPは展開用の1フォルダーにREADME、ランチャーEXE、ブリッジDLL、BSDライセンス、MinHookライセンスだけを含みます。診断ツール・ソース・PDB・別途のアイコン画像は含みません。配布用READMEは短い使い方に絞っています。
-
-`v0.1.0`のようなバージョンタグをpushすると、同じビルドとテストの成功後にドラフトリリースを作成し、バージョン付きZIPとSHA256ファイルを添付します。公開はGitHubのReleases画面から行います。`docs/releases/<タグ>.md`があれば説明文に使い、なければ変更履歴を自動生成します。再実行では既存ドラフトの添付を更新し、公開済みリリースの添付は変更しません。
-
-```powershell
-git tag -a v0.1.0 -m "MC HiRes Bridge v0.1.0"
-git push origin v0.1.0
-```
-
-## ソースの配置
-
-| ディレクトリ | 用途 |
-| --- | --- |
-| `src/bridge/` | 配布するブリッジDLLと状態表示 |
-| `src/launcher/` | 配布するランチャーEXE・リソース |
-| `src/common/` | DLLとランチャーで共有する起動通知 |
-| `tests/` | 通常版の状態表示・設定解析の確認 |
-| `diagnostics/` | API・形式・PCM・曲末の観測、手動ロード、解析補助 |
-| `diagnostics/tests/` | 診断ツールの動作確認 |
-| `experiments/legacy/` | 従来の16bit迂回方式の接続試験 |
-| `experiments/wav192/` | WAV 192kHz試験用処理と独立検証 |
-| `assets/`, `tools/` | アイコン素材とアイコン生成スクリプト |
-| `docs/`, `vendor/` | 調査記録・説明書、第三者ライブラリー |
-
-通常のビルドは配布用DLLとランチャーだけを生成します。診断・実験用は下記のオプションで明示的に有効化します。WAV試験DLLは通常版FLAC処理のソースを再利用し、実験用マクロを指定した別ターゲットとしてビルドします。旧迂回DLLも診断用DirectShowソースを再利用します。
-
-## 従来の16bit迂回方式
-
-確認した環境では、96kHz FLACの再生中にSonyのDSEEフィルターの出力が44.1kHzとなっていました。DSEE、Seamless、EQを完全に外すと96kHz再生はできましたが、経過時間表示が停止しました。
-
-修正版は次の2経路を作ります。
-
-```text
-FLAC source (96kHz/16bit) → Infinite Pin Tee
-  ├→ DirectSound renderer (96kHz/16bit) → 音声出力
-  └→ DSEE → Seamless → EQ (44.1kHz/16bit) → Null Renderer
-```
-
-Sonyの位置管理用経路を無音で残します。可聴音声にはDSEE・EQが適用されません。ネイティブの位置取得に必要な内部関数は未特定です。
-
-## ビルド
-
-Windows 11、Visual StudioのC++デスクトップ開発環境、Windows SDK、CMake 3.20以降が必要です。Visual Studioの開発者PowerShellで実行してください。
-
-```powershell
-cmake -S . -B build-Win32 -A Win32
-cmake --build build-Win32 --config Release
-```
-
-Music Center for PCは検証したバージョンでは32bitなので、Win32版DLLとインジェクターを使用します。x64対象の診断には別ビルドを使用します。
-
-```powershell
-cmake -S . -B build-x64 -A x64 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON
-cmake --build build-x64 --config Release
-```
-
-診断ツールと実験ターゲットも使う場合は次を実行します。EXE・DLLの出力先とターゲット名は従来どおりです。配布ZIPには通常版だけが入ります。
-
-```powershell
-cmake -S . -B build-Win32 -A Win32 -DMC_BRIDGE_BUILD_DIAGNOSTICS=ON -DMC_BRIDGE_BUILD_EXPERIMENTS=ON
-cmake --build build-Win32 --config Release
-# 通常版の確認は必要なときだけ実行
-cmake --build build-Win32 --config Release --target bridge_status_tests track_tail_tests
-./build-Win32/Release/bridge_status_tests.exe
-./build-Win32/Release/track_tail_tests.exe
-```
-
-WAV試験用ターゲットはオプションを有効にしたうえで個別指定します。[試験版のビルド手順](docs/wav192-experiment.md)を参照してください。
-
-## 試験適用
-
-1. Music Centerを完全終了して再起動し、再生を始める前に対象PIDを確認します。
-2. 次を実行します。PIDは実際の値に置き換えてください。
-
-```powershell
-$targetPid = 1234
-$dll = (Resolve-Path .\build-Win32\Release\dshow_bypass_timing.dll).Path
-& .\build-Win32\Release\inject.exe $targetPid $dll
-```
-
-3. `%TEMP%\DirectShowTimingBypass-PID.tsv`で初期化結果を確認し、96kHz音源を再生します。`TIMING_BRANCH_APPLIED`と実際の接続形式を確認してください。DLLのロード成功だけでは迂回成功を意味しません。
-4. Music Centerを完全終了して再起動すると解除されます。自動ロードは実装していません。
-
-`dshow_probe.dll`、`dshow_bypass.dll`、`dshow_bypass_timing.dll`は同じ関数をフックします。同一プロセスへ重ねてロードせず、切り替える際はアプリを再起動してください。
-
-## 検証済みの範囲
-
-2026-11-01、Windows 11 / Music Center for PC 2.7.4 x86で確認。
-
-- DirectSoundの96kHz/16bit/stereo出力、経過時間更新、一時停止、シーク後の再開、自動次曲。
-- 先頭20秒のPCMが旧迂回版とバイト単位で一致し、FFTで24–40kHzの成分を確認。
-- 最終ソースのフィルター種類確認ガードはビルド検証済み。実再生試験はガード追加直前の同じ接続処理で実施。
-
-従来の`dshow_bypass_timing`単体は24bit出力への改善ではありません。全形式、ギャップレス、長時間安定性、出力デバイス変更、枝間の厳密な同期は未検証です。無音のSony経路も動作するため追加負荷があります。この従来方式はランチャーの自動適用対象ではありません。
-
-## 診断用ソース
-
-| ターゲット / ファイル | 役割 |
-| --- | --- |
-| `dshow_bypass_timing` | 位置管理を維持する修正版 |
-| `flac24_override` | 確認済み48・96・192kHz/24bit FLACの事前16bit指定を24へ変更（x86のみ） |
-| `dshow_bypass` | 旧迂回版。経過時間が停止する比較用 |
-| `dshow_probe` | DirectShowグラフ・接続形式の観測 |
-| `probe` | DirectSound / WASAPIの形式観測 |
-| `position_probe` | 標準位置取得APIの観測 |
-| `negotiation_probe` | 接続前の形式交渉とSony FLACの出力設定の観測（検証済みx86用） |
-| `pcm_tap` | DirectSound PCMをストリームごと最大20秒取得 |
-| `wasapi_pcm_probe` | WASAPI形式の観測と出力直前PCMの取得（最大20秒、通常の`probe`とは併用不可） |
-| `inject` | 同じアーキテクチャのDLLを対象プロセスへロード |
-| `smoke`, `dshow_smoke`, `bypass_test` | 診断・接続試験 |
-| `diagnostics/analyze-pcm.mjs` | PCMのFFT解析（Node.js） |
-
-`diagnostics/observe.ps1`は形式観測用の補助スクリプトです。既定では`build-Win32/Release`または`build-x64/Release`のinjectとprobeを使い、`-BinPath`で別の出力先も指定できます。診断ツールのビルドには`MC_BRIDGE_BUILD_DIAGNOSTICS=ON`が必要です。
-
-24bit音源が16bitになる箇所については、Music Centerの`OpcFlac.dll`が接続前にSony FLACフィルターへ16を指定する呼び出しを捕捉しました。[形式交渉の調査結果](docs/bit-depth-investigation.md)を参照してください。これは原因の切り分けであり、24bit出力への修正ではありません。`negotiation_probe.dll`も他の観測版・迂回版と同時にロードしないでください。
-
-ログにはファイルパスや音源名が含まれる場合があります。PCM取得ツールは音声データを保存します。Issueへ添付する前に個人情報と共有範囲を確認してください。このリポジトリには個人の実測ログや音声データを含めていません。
-
-## 開発・Issue
-
-不具合、改善案、検証結果は[このリポジトリのIssues](https://github.com/yshdsnd/mc-hires-bridge/issues)で管理します。OS・アプリのバージョン、対象形式、操作手順、期待した結果と実際の結果を記載してください。
-
-本プロジェクト独自部分は[BSD 2-Clause License](LICENSE)で公開しています。
-
-MinHook v1.3.4（commit `c3fcafdc10146beb5919319d0683e44e3c30d537`）を`vendor/minhook`に同梱しています。第三者ライセンスは同ディレクトリの`LICENSE.txt`を参照してください。
+[GitHub Issues](https://github.com/yshdsnd/mc-hires-bridge/issues)で不具合・改善案・検証結果を管理します。ソースの独自部分は[BSD 2-Clause License](LICENSE)、同梱のMinHookは[MinHookのライセンス](vendor/minhook/LICENSE.txt)に従います。
